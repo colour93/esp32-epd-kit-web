@@ -134,6 +134,7 @@ type PendingRequest = {
   id: number
   op: string
   startedAt: number
+  responseSettled: boolean
   resolve: (value: unknown) => void
   reject: (reason: Error) => void
   timer: ReturnType<typeof setTimeout>
@@ -185,6 +186,7 @@ export class ToolkitBleClient {
   private incoming = new Uint8Array()
   private nextId = (Date.now() >>> 0) || 1
   private manuallyDisconnecting = false
+  private writeChunkSize = 20
 
   get connected() {
     return Boolean(this.device?.gatt?.connected && this.rx && this.tx)
@@ -196,6 +198,7 @@ export class ToolkitBleClient {
     }
 
     this.manuallyDisconnecting = false
+    this.writeChunkSize = 20
     this.emit('system', '选择设备')
     debugLog('device.request', { service: BLE_UUIDS.toolkitService })
     const device = await navigator.bluetooth.requestDevice({
@@ -245,7 +248,9 @@ export class ToolkitBleClient {
     const timeout = timeoutMs ?? (op === 'wifi.scan' || op === 'wifi.test' ? 20_000 : 15_000)
     for (let attempt = 0; attempt < 2; attempt += 1) {
       try {
-        return await this.requestOnce<T>(op, args, timeout)
+        const result = await this.requestOnce<T>(op, args, timeout)
+        if (op === 'hello') this.applyNegotiatedMtu(result)
+        return result
       } catch (error) {
         const retryable = error instanceof ToolkitError && (error.code === 'busy' || error.code === 'timeout')
         if (!retryable || attempt === 1) throw error
@@ -272,45 +277,83 @@ export class ToolkitBleClient {
       id,
       op,
       bytes: body.byteLength,
-      fragments: Math.ceil(wire.byteLength / 20),
+      chunkSize: this.writeChunkSize,
+      fragments: Math.ceil(wire.byteLength / this.writeChunkSize),
       timeoutMs,
     })
     this.emit('request', op)
 
-    return new Promise<T>((resolve, reject) => {
+    let request!: PendingRequest
+    const response = new Promise<T>((resolve, reject) => {
       const timer = window.setTimeout(() => {
-        if (this.pending?.id !== id) return
-        this.pending = undefined
+        if (this.pending !== request || request.responseSettled) return
+        request.responseSettled = true
         const error = new ToolkitError('client_timeout', `${op} 响应超时`)
         this.emit('error', `${op} · 响应超时`)
         reject(error)
       }, timeoutMs)
 
-      this.pending = {
+      request = {
         id,
         op,
         startedAt: performance.now(),
+        responseSettled: false,
         timer,
         resolve: (value) => resolve(value as T),
         reject,
       }
-
-      void this.writeFragments(wire).catch((error: unknown) => {
-        if (this.pending?.id !== id) return
-        this.rejectPending(error instanceof Error ? error : new Error(String(error)))
-      })
+      this.pending = request
     })
+
+    const write = this.writeFragments(wire).catch((error: unknown) => {
+      const normalized = error instanceof Error ? error : new Error(String(error))
+      if (this.pending === request) {
+        if (!request.responseSettled) {
+          this.rejectPending(normalized)
+        } else {
+          warningLog('request.write_failed_after_response', {
+            id,
+            op,
+            name: normalized.name,
+            message: normalized.message,
+            elapsedMs: Math.round(performance.now() - request.startedAt),
+          })
+        }
+      }
+      throw normalized
+    })
+
+    // A peripheral can send its indication from inside the callback that
+    // handles the final ATT write, before Chromium has settled that write.
+    // Keep the request slot occupied until both sides have finished so the
+    // next transaction cannot overlap the previous GATT operation.
+    const [writeResult, responseResult] = await Promise.allSettled([write, response])
+    window.clearTimeout(request.timer)
+    if (this.pending === request) {
+      this.pending = undefined
+    }
+    if (writeResult.status === 'rejected') throw writeResult.reason
+    if (responseResult.status === 'rejected') throw responseResult.reason
+    return responseResult.value
   }
 
   private async writeFragments(wire: Uint8Array) {
     if (!this.rx) throw new ToolkitError('disconnected', 'RX 不可用')
-    const chunkSize = 20
+    const chunkSize = this.writeChunkSize
     const fragments = Math.ceil(wire.byteLength / chunkSize)
     for (let offset = 0; offset < wire.byteLength; offset += chunkSize) {
       const chunk = wire.slice(offset, offset + chunkSize)
       await this.rx.writeValueWithResponse(chunk)
     }
     debugLog('request.written', { bytes: wire.byteLength, fragments })
+  }
+
+  private applyNegotiatedMtu(result: unknown) {
+    if (!result || typeof result !== 'object') return
+    const mtu = (result as Partial<HelloResult>).mtu
+    if (typeof mtu !== 'number' || !Number.isFinite(mtu)) return
+    this.writeChunkSize = Math.min(244, Math.max(20, Math.trunc(mtu) - 3))
+    debugLog('gatt.mtu.applied', { mtu, writeChunkSize: this.writeChunkSize })
   }
 
   private handleIndication = (event: Event) => {
@@ -348,9 +391,9 @@ export class ToolkitBleClient {
     }
 
     const pending = this.pending
-    if (!pending || (response.id !== pending.id && response.id !== 0)) return
+    if (!pending || pending.responseSettled || (response.id !== pending.id && response.id !== 0)) return
     window.clearTimeout(pending.timer)
-    this.pending = undefined
+    pending.responseSettled = true
 
     if (response.v !== 1) {
       warningLog('response.version_mismatch', { id: response.id, version: response.v })
@@ -381,14 +424,15 @@ export class ToolkitBleClient {
   }
 
   private rejectPending(error: Error) {
-    if (!this.pending) return
+    if (!this.pending || this.pending.responseSettled) return
     const pending = this.pending
     window.clearTimeout(pending.timer)
-    this.pending = undefined
+    pending.responseSettled = true
     warningLog('request.failed', {
       id: pending.id,
       op: pending.op,
       name: error.name,
+      message: error.message,
       elapsedMs: Math.round(performance.now() - pending.startedAt),
     })
     pending.reject(error)

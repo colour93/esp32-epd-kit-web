@@ -5,7 +5,10 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:agent": "bun scripts/dev-agent.ts",
     "build": "tsc -b && vite build",
+    "build:agent": "cargo build --release --manifest-path agent/Cargo.toml",
+    "package:agent": "cargo packager --release --manifest-path agent/Cargo.toml",
     "lint": "oxlint",
     "preview": "vite preview"
   },
@@ -30,7 +33,6 @@
     "@types/node": "^24.13.3",
     "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.3",
-    "@types/web-bluetooth": "^0.0.21",
     "@vitejs/plugin-react": "^6.0.4",
     "babel-plugin-react-compiler": "^1.0.0",
     "oxlint": "^1.75.0",

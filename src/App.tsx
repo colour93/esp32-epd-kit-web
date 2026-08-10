@@ -1,41 +1,44 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import {
   Activity,
-  AppWindow,
   BatteryCharging,
   Bluetooth,
-  Check,
+  BluetoothSearching,
+  Bot,
+  Braces,
   ChevronRight,
-  Circle,
+  CircleAlert,
   Clock3,
   Cpu,
+  Database,
   Eye,
-  EyeOff,
   Gauge,
+  HardDrive,
   KeyRound,
   LayoutDashboard,
   LoaderCircle,
-  LockKeyhole,
-  LogOut,
-  Network,
+  MonitorCog,
+  Pause,
+  Play,
+  Power,
   Radio,
   RefreshCw,
   RotateCcw,
   Save,
-  ScanLine,
+  ScanSearch,
   Settings2,
   ShieldCheck,
   SignalHigh,
+  SignalLow,
+  SignalMedium,
   SlidersHorizontal,
-  Server,
   Trash2,
-  Wifi,
-  WifiOff,
+  Unplug,
+  Users,
   Zap,
   type LucideIcon,
 } from 'lucide-react'
 import { Toaster, toast } from 'sonner'
-import { Badge } from './components/ui/badge'
 import { Button } from './components/ui/button'
 import {
   Dialog,
@@ -45,903 +48,697 @@ import {
   DialogFooter,
   DialogHeader,
   DialogTitle,
-  DialogTrigger,
 } from './components/ui/dialog'
 import { Input } from './components/ui/input'
-import { Label } from './components/ui/label'
-import { Progress } from './components/ui/progress'
 import { Switch } from './components/ui/switch'
 import {
-  ToolkitBleClient,
-  ToolkitError,
-  type BleActivity,
+  AgentApiError,
+  agentApi,
+  establishSession,
+  subscribeSnapshots,
+  type BleCandidate,
+  type DeviceConfig,
   type DeviceStatus,
-  type HelloResult,
-  type StandardDeviceInfo,
-  type ToolkitApp,
-  type ToolkitConfig,
-  type WifiNetwork,
-  type WifiTestResult,
-} from './lib/ble'
-import { cn } from './lib/utils'
+  type JsonObject,
+  type ResourceSummary,
+  type Snapshot,
+} from './lib/agent'
 
-type View = 'overview' | 'network' | 'codex' | 'system'
-type ConnectionPhase = 'idle' | 'connecting' | 'connected'
+type View = 'overview' | 'hardware' | 'resources' | 'codex' | 'security' | 'diagnostics'
+type LogLevel = 'all' | 'info' | 'warn' | 'error'
 
-const DEFAULT_CONFIG: ToolkitConfig = {
-  version: 1,
-  device: {
-    name: 'epd-kit',
-    locale: 'zh-CN',
-    timezone: { iana: 'Asia/Shanghai', posix: 'CST-8' },
-  },
-  wifi: {
-    ssid: '',
-    password_set: false,
-    ipv4: { mode: 'dhcp', address: '', gateway: '', subnet: '', dns1: '', dns2: '' },
-  },
-  power: {
-    poll_interval_sec: 300,
-    ble_window_sec: 180,
-    offline_backoff_sec: [300, 900, 1800, 3600],
-  },
-  display: {
-    full_after_partial_count: 12,
-    full_max_age_sec: 86400,
-    full_area_threshold_percent: 40,
-  },
-  battery: { low_mv: 3550, critical_mv: 3400, recovery_mv: 3650 },
-  active_app: 'codex_usage',
-  apps: {
-    codex_usage: {
-      account_id: '',
-      expires_at: 0,
-      access_token_set: false,
-      proxy: {
-        enabled: false,
-        host: '',
-        port: 8080,
-        username: '',
-        password_set: false,
-      },
-    },
-  },
-}
-
-const NAV_ITEMS: Array<{ id: View; label: string; shortLabel: string; icon: LucideIcon }> = [
-  { id: 'overview', label: '设备概览', shortLabel: '概览', icon: LayoutDashboard },
-  { id: 'network', label: '网络配置', shortLabel: '网络', icon: Wifi },
-  { id: 'codex', label: 'Codex 应用', shortLabel: 'Codex', icon: AppWindow },
-  { id: 'system', label: '系统参数', shortLabel: '系统', icon: SlidersHorizontal },
+const NAV_ITEMS: Array<{ id: View; label: string; icon: LucideIcon }> = [
+  { id: 'overview', label: '概览', icon: LayoutDashboard },
+  { id: 'hardware', label: '硬件与功耗', icon: SlidersHorizontal },
+  { id: 'resources', label: '资源与视图', icon: Database },
+  { id: 'codex', label: 'Codex', icon: Bot },
+  { id: 'security', label: '受信主机', icon: ShieldCheck },
+  { id: 'diagnostics', label: '诊断', icon: Activity },
 ]
 
-const ERROR_LABELS: Record<string, string> = {
-  unsupported_version: '协议版本不兼容',
-  invalid_request: '请求无效',
-  unauthorized: '需要重新配对或物理确认',
-  invalid_config: '配置不合法',
-  busy: '设备正忙',
-  timeout: '分片接收超时',
-  client_timeout: '设备响应超时',
-  too_large: '消息过大',
-  wifi_failed: 'Wi-Fi 连接失败',
-  auth_expired: 'Codex 凭据已过期',
-  internal_error: '设备内部错误',
-  disconnected: '设备已断开',
-  unsupported_browser: '浏览器不支持 Web Bluetooth',
+const PHASE_LABELS: Record<string, string> = {
+  connected: '已连接', connecting: '连接中', scanning: '扫描中', disconnected: '已断开',
+  disconnecting: '断开中', idle: '待命', unavailable: '不可用', paused: '已暂停',
+  ready: '正常', starting: '启动中', missing: '未安装',
+  auth_required: '未登录', degraded: '同步异常',
 }
 
-function errorMessage(error: unknown) {
-  if (error instanceof ToolkitError) {
-    const title = ERROR_LABELS[error.code] ?? error.code
-    return error.message && error.message !== title ? `${title} · ${error.message}` : title
-  }
+const CONNECTION_MODE_LABELS: Record<DeviceStatus['connection_mode'], string> = {
+  auto: '自动连接',
+  scan: '手动扫描',
+  manual: '指定设备',
+  idle: '手动停止',
+}
+
+function errorText(error: unknown) {
+  if (error instanceof AgentApiError) return error.message
   return error instanceof Error ? error.message : String(error)
 }
 
-function formatUptime(milliseconds?: number) {
-  if (milliseconds === undefined) return '—'
-  const totalMinutes = Math.floor(milliseconds / 60_000)
-  if (totalMinutes < 60) return `${totalMinutes}m`
-  const hours = Math.floor(totalMinutes / 60)
-  return `${hours}h ${totalMinutes % 60}m`
+function formatTime(seconds?: number) {
+  if (!seconds) return '—'
+  return new Intl.DateTimeFormat('zh-CN', {
+    month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit',
+  }).format(new Date(seconds * 1000))
 }
 
-function formatExpiry(seconds: number) {
-  if (!seconds) return '未知'
-  return new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }).format(new Date(seconds * 1000))
+function formatAge(seconds?: number) {
+  if (!seconds) return '从未'
+  const distance = Math.max(0, Math.floor(Date.now() / 1000) - seconds)
+  if (distance < 60) return `${distance} 秒前`
+  if (distance < 3600) return `${Math.floor(distance / 60)} 分钟前`
+  return `${Math.floor(distance / 3600)} 小时前`
 }
 
-function toDateTimeInput(seconds: number) {
-  if (!seconds) return ''
-  const date = new Date(seconds * 1000)
-  const shifted = new Date(date.getTime() - date.getTimezoneOffset() * 60_000)
-  return shifted.toISOString().slice(0, 16)
+function phaseTone(phase: string) {
+  if (phase === 'connected' || phase === 'ready') return 'good'
+  if (phase === 'connecting' || phase === 'disconnecting' || phase === 'scanning' || phase === 'starting') return 'working'
+  if (phase === 'paused' || phase === 'idle' || phase === 'disconnected') return 'muted'
+  return 'bad'
 }
 
-function fromDateTimeInput(value: string) {
-  return value ? Math.floor(new Date(value).getTime() / 1000) : 0
+function StatusPill({ phase }: { phase: string }) {
+  return <span className={`status-pill ${phaseTone(phase)}`}><i />{PHASE_LABELS[phase] ?? phase}</span>
 }
 
-function rssiBars(rssi: number) {
-  if (rssi >= -55) return 4
-  if (rssi >= -67) return 3
-  if (rssi >= -75) return 2
-  return 1
-}
-
-function Panel({ children, className }: { children: ReactNode; className?: string }) {
-  return <section className={cn('panel', className)}>{children}</section>
-}
-
-function PanelTitle({ icon: Icon, title, action }: { icon: LucideIcon; title: string; action?: ReactNode }) {
+function SectionTitle({ icon: Icon, title, detail, action }: {
+  icon: LucideIcon; title: string; detail?: string; action?: ReactNode
+}) {
   return (
-    <div className="flex items-center justify-between gap-3 border-b border-border px-4 py-3.5 sm:px-5">
-      <div className="flex items-center gap-2.5">
-        <span className="grid size-7 place-items-center rounded-sm border border-border bg-muted">
-          <Icon className="size-3.5" />
-        </span>
-        <h2 className="font-display text-sm font-black tracking-[.04em]">{title}</h2>
+    <header className="section-title">
+      <div className="section-heading">
+        <span className="section-icon"><Icon /></span>
+        <div><h2>{title}</h2>{detail ? <p>{detail}</p> : null}</div>
       </div>
       {action}
-    </div>
+    </header>
   )
 }
 
-function Field({ label, htmlFor, children, hint }: { label: string; htmlFor: string; children: ReactNode; hint?: string }) {
+function Metric({ label, value, detail, icon: Icon, tone = 'default' }: {
+  label: string; value: string; detail: string; icon: LucideIcon; tone?: string
+}) {
   return (
-    <div>
-      <Label htmlFor={htmlFor}>{label}</Label>
-      {children}
-      {hint ? <p className="mt-1.5 text-[11px] text-muted-foreground">{hint}</p> : null}
-    </div>
+    <article className={`metric ${tone}`}>
+      <div className="metric-label"><Icon />{label}</div>
+      <strong>{value}</strong>
+      <span>{detail}</span>
+    </article>
   )
 }
 
-function PageIntro({ eyebrow, title, action }: { eyebrow: string; title: string; action?: ReactNode }) {
+function EmptyState({ children }: { children: ReactNode }) {
+  return <div className="empty-state"><CircleAlert /> <span>{children}</span></div>
+}
+
+function shortDeviceId(id?: string) {
+  if (!id) return '—'
+  return id.length > 18 ? `${id.slice(0, 8)}…${id.slice(-6)}` : id
+}
+
+function connectionErrorText(error: string) {
+  if (error.includes('Bluetooth access unavailable') || error.includes('Permission denied')) {
+    return '蓝牙权限不可用，请在「系统设置 > 隐私与安全性 > 蓝牙」中允许 EPD Agent。'
+  }
+  if (error.includes('Peer removed pairing information')) {
+    return '设备已清除旧配对信息，Agent 已刷新 macOS 蓝牙状态并重试。设备显示配对码时请完成确认。'
+  }
+  if (error.includes('BLE connection timed out')) {
+    return '连接超过 12 秒未完成，本轮已结束，可停止或重新选择设备。'
+  }
+  if (error.includes('selected EPD-KIT device') && error.includes('was not found')) {
+    return '所选设备已离开广播范围，请重新扫描。'
+  }
+  if (error.includes('no EPD-KIT BLE v3 device found')) {
+    return '本轮扫描未发现 EPD-KIT 设备，请确认设备供电；若刚发生配对错误，请重启设备后重新扫描。'
+  }
+  return error
+}
+
+function SignalIcon({ rssi }: { rssi?: number }) {
+  if (rssi === undefined || rssi < -85) return <SignalLow />
+  if (rssi < -67) return <SignalMedium />
+  return <SignalHigh />
+}
+
+function CandidateRow({ candidate, selected, connecting, disabled, onConnect }: {
+  candidate: BleCandidate
+  selected: boolean
+  connecting: boolean
+  disabled: boolean
+  onConnect: () => void
+}) {
   return (
-    <div className="mb-5 flex items-end justify-between gap-4 sm:mb-6">
-      <div>
-        <p className="mb-1 font-mono text-[10px] font-bold tracking-[.2em] text-muted-foreground uppercase">{eyebrow}</p>
-        <h1 className="font-display text-3xl font-black tracking-[-.035em] sm:text-4xl">{title}</h1>
+    <div className={`candidate-row ${selected ? 'selected' : ''}`}>
+      <div className="candidate-signal"><SignalIcon rssi={candidate.rssi} /></div>
+      <div className="candidate-identity">
+        <b>{candidate.name}</b>
+        <span>{shortDeviceId(candidate.id)}</span>
       </div>
-      {action}
+      <div className="candidate-meta">
+        <b>{candidate.rssi === undefined ? '—' : `${candidate.rssi} dBm`}</b>
+        <span>{candidate.owned === true ? '已有 Owner' : candidate.owned === false ? '待设置 Owner' : candidate.advertises_service ? 'v3 service' : 'name match'}</span>
+      </div>
+      <Button variant={selected ? 'signal' : 'outline'} size="sm" disabled={disabled} onClick={onConnect}>
+        {connecting ? <LoaderCircle className="spin" /> : <Bluetooth />}
+        {connecting ? '连接中' : selected ? '已选择' : '连接'}
+      </Button>
     </div>
   )
 }
 
-function LoadingIcon({ active }: { active: boolean }) {
-  return active ? <LoaderCircle className="animate-spin" /> : null
+function DeviceConnectionPanel({ device, operation, onScan, onConnect, onDisconnect, onAutoConnect }: {
+  device: DeviceStatus
+  operation: string | null
+  onScan: () => void
+  onConnect: (candidate: BleCandidate) => void
+  onDisconnect: () => void
+  onAutoConnect: () => void
+}) {
+  const connected = device.phase === 'connected'
+  const connecting = device.phase === 'connecting'
+  const scanning = device.phase === 'scanning'
+  const active = device.connection_mode !== 'idle'
+  const busy = operation?.startsWith('ble.') ?? false
+  const mode = CONNECTION_MODE_LABELS[device.connection_mode] ?? device.connection_mode
+
+  return (
+    <section className={`connection-console ${connected ? 'connected' : ''}`}>
+      <header className="connection-header">
+        <div className="connection-title">
+          <span className="connection-icon">
+            {scanning ? <BluetoothSearching className="scan-pulse" /> : <Bluetooth />}
+          </span>
+          <div>
+            <span>BLE CONNECTION</span>
+            <h2>设备连接</h2>
+          </div>
+          <StatusPill phase={device.phase} />
+        </div>
+        <div className="connection-actions">
+          <Button className="connection-action" variant="outline" size="sm" disabled={busy || connected || connecting} onClick={onScan}>
+            <ScanSearch className={scanning ? 'spin' : ''} />{scanning ? '扫描中' : '扫描'}
+          </Button>
+          <Button className="connection-action" variant="outline" size="sm" disabled={busy || connected || (scanning && device.connection_mode === 'auto')} onClick={onAutoConnect}>
+            <RotateCcw />自动连接
+          </Button>
+          <Button className="connection-stop" variant="ghost" size="sm" disabled={busy || !active} onClick={onDisconnect}>
+            <Unplug />停止
+          </Button>
+        </div>
+      </header>
+
+      <div className="connection-body">
+        <div className="connection-current">
+          <div className="connection-current-head">
+            <span className={`connection-beacon ${connected ? 'online' : scanning || connecting ? 'working' : ''}`}><i /></span>
+            <div>
+              <span>{connected ? 'CURRENT DEVICE' : 'CONNECTION STATE'}</span>
+              <strong>{connected ? device.name ?? 'EPD-KIT' : PHASE_LABELS[device.phase] ?? device.phase}</strong>
+            </div>
+          </div>
+          <dl className="connection-facts">
+            <div><dt>模式</dt><dd>{mode}</dd></div>
+            <div><dt>目标</dt><dd title={device.selected_device_id ?? device.preferred_device_id}>{shortDeviceId(device.selected_device_id ?? device.preferred_device_id)}</dd></div>
+            <div><dt>广播</dt><dd>{device.scan_observed}</dd></div>
+            <div><dt>候选</dt><dd>{device.candidates.length}</dd></div>
+          </dl>
+          {device.last_error ? <div className="connection-error"><CircleAlert /><span>{connectionErrorText(device.last_error)}</span></div> : null}
+        </div>
+
+        <div className="candidate-list">
+          <div className="candidate-list-head">
+            <div><b>可连接设备</b><span>{scanning ? '实时更新' : `最近扫描 ${formatTime(device.scan_started_at)}`}</span></div>
+            <span>{device.candidates.length.toString().padStart(2, '0')}</span>
+          </div>
+          <div className="candidate-scroll">
+            {device.candidates.map((candidate) => (
+              <CandidateRow
+                key={candidate.id}
+                candidate={candidate}
+                selected={candidate.id === device.selected_device_id}
+                connecting={connecting && candidate.id === device.selected_device_id}
+                disabled={busy || connected || (connecting && candidate.id === device.selected_device_id)}
+                onConnect={() => onConnect(candidate)}
+              />
+            ))}
+            {!device.candidates.length ? (
+              <div className="candidate-empty">
+                {scanning ? <LoaderCircle className="spin" /> : <BluetoothSearching />}
+                <div><b>{scanning ? '正在监听 EPD-KIT 广播' : '未发现可连接设备'}</b><span>已观察 {device.scan_observed} 个 BLE 广播</span></div>
+              </div>
+            ) : null}
+          </div>
+        </div>
+      </div>
+    </section>
+  )
+}
+
+interface WindowLimit { usedPercent?: number; windowDurationMins?: number; resetsAt?: number }
+interface LimitBucket {
+  limitId?: string; limitName?: string; planType?: string
+  primary?: WindowLimit | null; secondary?: WindowLimit | null
+  rateLimitReachedType?: string | null
+}
+
+function getCodexBucket(snapshot: Snapshot | null): LimitBucket | null {
+  const raw = snapshot?.codex.rate_limits
+  if (!raw) return null
+  const byId = raw.rateLimitsByLimitId as Record<string, LimitBucket> | undefined
+  return byId?.codex ?? raw.rateLimits as LimitBucket | undefined ?? null
+}
+
+function formatPlanName(value?: string) {
+  if (!value) return 'GPT —'
+  const normalized = value.toLowerCase().replace(/[\s_-]/g, '')
+  if (normalized.includes('plus')) return 'GPT Plus'
+  if (normalized === 'pro' || normalized.includes('chatgptpro')) return 'GPT Pro'
+  if (normalized.includes('free')) return 'GPT Free'
+  if (normalized.includes('business')) return 'GPT Business'
+  if (normalized.includes('enterprise')) return 'GPT Enterprise'
+  if (normalized.includes('team')) return 'GPT Team'
+  if (normalized === 'unknown') return 'GPT —'
+  return value
+}
+
+function formatWindowName(window?: WindowLimit | null) {
+  if (!window?.windowDurationMins) return '未知'
+  if (window.windowDurationMins === 5 * 60) return '5 小时'
+  if (window.windowDurationMins === 7 * 24 * 60) return '7 天'
+  return '未知'
+}
+
+function QuotaWindow({ title, window }: { title: string; window?: WindowLimit | null }) {
+  const used = Math.max(0, Math.min(100, window?.usedPercent ?? 0))
+  const remaining = window ? 100 - used : null
+  return (
+    <div className="quota-window">
+      <div className="quota-head"><span>{title}</span><small>{window?.windowDurationMins ? `${window.windowDurationMins} min` : '—'}</small></div>
+      <div className="quota-number">{remaining === null ? '—' : remaining}<small>{remaining === null ? '' : '%'}</small></div>
+      <div className="quota-track"><i style={{ width: `${remaining ?? 0}%` }} /></div>
+      <div className="quota-foot"><span>剩余</span><span>重置 {formatTime(window?.resetsAt)}</span></div>
+    </div>
+  )
+}
+
+function NumberField({ label, value, min, max, onChange, disabled }: {
+  label: string; value: number; min: number; max: number; onChange: (value: number) => void; disabled?: boolean
+}) {
+  return (
+    <label className="field"><span>{label}</span><Input type="number" min={min} max={max} value={value} disabled={disabled}
+      onChange={(event) => onChange(Number(event.target.value))} /></label>
+  )
 }
 
 function App() {
-  const clientRef = useRef<ToolkitBleClient | null>(null)
-  if (!clientRef.current) clientRef.current = new ToolkitBleClient()
-  const client = clientRef.current
-
   const [view, setView] = useState<View>('overview')
-  const [phase, setPhase] = useState<ConnectionPhase>('idle')
+  const [snapshot, setSnapshot] = useState<Snapshot | null>(null)
+  const [configDraft, setConfigDraft] = useState<DeviceConfig | null>(null)
+  const [bootError, setBootError] = useState<string | null>(null)
+  const [streamDown, setStreamDown] = useState(false)
   const [operation, setOperation] = useState<string | null>(null)
-  const [standardInfo, setStandardInfo] = useState<StandardDeviceInfo | null>(null)
-  const [hello, setHello] = useState<HelloResult | null>(null)
-  const [status, setStatus] = useState<DeviceStatus | null>(null)
-  const [config, setConfig] = useState<ToolkitConfig>(DEFAULT_CONFIG)
-  const [apps, setApps] = useState<ToolkitApp[]>([])
-  const [networks, setNetworks] = useState<WifiNetwork[]>([])
-  const [wifiTestResult, setWifiTestResult] = useState<WifiTestResult | null>(null)
-  const [activities, setActivities] = useState<BleActivity[]>([])
-  const [staged, setStaged] = useState(false)
-  const [wifiPassword, setWifiPassword] = useState('')
-  const [clearWifiPassword, setClearWifiPassword] = useState(false)
-  const [showWifiPassword, setShowWifiPassword] = useState(false)
-  const [accessToken, setAccessToken] = useState('')
-  const [clearAccessToken, setClearAccessToken] = useState(false)
-  const [showAccessToken, setShowAccessToken] = useState(false)
-  const [proxyPassword, setProxyPassword] = useState('')
-  const [clearProxyPassword, setClearProxyPassword] = useState(false)
-  const [showProxyPassword, setShowProxyPassword] = useState(false)
+  const [viewRenderer, setViewRenderer] = useState('')
+  const [viewResource, setViewResource] = useState('')
+  const [resourceDetail, setResourceDetail] = useState<JsonObject | null>(null)
+  const [detailOpen, setDetailOpen] = useState(false)
+  const [enrollmentUntil, setEnrollmentUntil] = useState(0)
   const [resetOpen, setResetOpen] = useState(false)
-  const [resetNonce, setResetNonce] = useState<number | null>(null)
-  const [resetDeadline, setResetDeadline] = useState(0)
-  const [resetTick, setResetTick] = useState(Date.now())
-
-  const connected = phase === 'connected'
-  const busy = operation !== null
-  const supportsBluetooth = 'bluetooth' in navigator
-  const pageName = NAV_ITEMS.find((item) => item.id === view)?.label ?? '设备概览'
-  const resetSeconds = Math.max(0, Math.ceil((resetDeadline - resetTick) / 1000))
+  const [resetCode, setResetCode] = useState('')
+  const [logLevel, setLogLevel] = useState<LogLevel>('all')
+  const [logScope, setLogScope] = useState('all')
+  const [followLogs, setFollowLogs] = useState(true)
+  const logTableRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
-    client.onActivity = (entry) => setActivities((current) => [entry, ...current].slice(0, 12))
-    client.onBattery = (battery) => setStandardInfo((current) => current ? { ...current, battery } : current)
-    client.onDisconnected = () => {
-      setPhase('idle')
-      setOperation(null)
-      setStaged(false)
-      toast.info('设备已断开')
+    let unsubscribe = () => {}
+    let cancelled = false
+    async function boot() {
+      try {
+        await establishSession()
+        const initial = await agentApi.snapshot()
+        if (cancelled) return
+        setSnapshot(initial)
+        unsubscribe = subscribeSnapshots((next) => {
+          setSnapshot(next)
+          setStreamDown(false)
+        }, () => setStreamDown(true))
+      } catch (error) {
+        if (!cancelled) setBootError(errorText(error))
+      }
     }
-  }, [client])
+    void boot()
+    return () => { cancelled = true; unsubscribe() }
+  }, [])
 
+  const config = snapshot?.device.config
   useEffect(() => {
-    if (!resetNonce) return
-    const timer = window.setInterval(() => setResetTick(Date.now()), 1000)
-    return () => window.clearInterval(timer)
-  }, [resetNonce])
+    if (!config) return
+    setConfigDraft(structuredClone(config))
+    setViewRenderer(config.view.renderer_id)
+    setViewResource(config.view.resource_key)
+  }, [config?.revision])
 
-  async function perform<T>(key: string, work: () => Promise<T>, success?: string): Promise<T | null> {
-    if (busy) return null
+  async function perform(key: string, action: () => Promise<unknown>, success: string, refresh = false) {
+    if (operation) return false
     setOperation(key)
     try {
-      const result = await work()
-      if (success) toast.success(success)
-      return result
+      await action()
+      if (refresh) setSnapshot(await agentApi.snapshot())
+      toast.success(success)
+      return true
     } catch (error) {
-      toast.error(errorMessage(error))
-      return null
+      toast.error(errorText(error))
+      return false
     } finally {
       setOperation(null)
     }
   }
 
-  async function connect() {
-    if (!supportsBluetooth) {
-      toast.error('请使用 Chrome 或 Edge')
-      return
-    }
-    setPhase('connecting')
-    setOperation('connect')
-    try {
-      const info = await client.connect()
-      setStandardInfo(info)
-      const helloResult = await client.transact<HelloResult>('hello')
-      if (helloResult.protocol !== 1) throw new ToolkitError('unsupported_version', `设备协议为 v${helloResult.protocol}`)
-      setHello(helloResult)
-      const statusResult = await client.transact<DeviceStatus>('device.status')
-      setStatus(statusResult)
-      const configResult = await client.transact<{ config: ToolkitConfig }>('config.get')
-      setConfig(configResult.config)
-      const appResult = await client.transact<{ apps: ToolkitApp[] }>('app.list')
-      setApps(appResult.apps)
-      setPhase('connected')
-      toast.success('设备已连接')
-    } catch (error) {
-      client.disconnect()
-      setPhase('idle')
-      toast.error(errorMessage(error))
-    } finally {
-      setOperation(null)
-    }
+  const bucket = useMemo(() => getCodexBucket(snapshot), [snapshot?.codex.rate_limits])
+  const connected = snapshot?.device.phase === 'connected'
+  const owner = snapshot?.device.role === 'owner'
+  const renderers = snapshot?.device.capabilities?.renderers ?? []
+  const resources = snapshot?.device.resources ?? []
+  const page = NAV_ITEMS.find((item) => item.id === view) ?? NAV_ITEMS[0]
+  const logScopes = useMemo(
+    () => Array.from(new Set((snapshot?.logs ?? []).map((entry) => entry.scope))).sort(),
+    [snapshot?.logs],
+  )
+  const visibleLogs = useMemo(
+    () => (snapshot?.logs ?? []).filter((entry) => (
+      (logLevel === 'all' || entry.level === logLevel) &&
+      (logScope === 'all' || entry.scope === logScope)
+    )),
+    [snapshot?.logs, logLevel, logScope],
+  )
+
+  useEffect(() => {
+    if (followLogs) logTableRef.current?.scrollTo({ top: 0, behavior: 'smooth' })
+  }, [snapshot?.logs[0]?.at, snapshot?.logs[0]?.message, followLogs])
+
+  async function saveConfiguration() {
+    if (!configDraft) return
+    const before = snapshot?.device.config
+    const changedHardware = before && (
+      before.hardware.battery.enabled !== configDraft.hardware.battery.enabled ||
+      before.hardware.io12.mode !== configDraft.hardware.io12.mode ||
+      before.power.profile !== configDraft.power.profile
+    )
+    const ok = await perform('config', () => agentApi.patchConfig({
+      device: configDraft.device,
+      hardware: configDraft.hardware,
+      power: configDraft.power,
+      display: configDraft.display,
+    } as unknown as JsonObject), '配置已提交', true)
+    if (ok && changedHardware) toast.info('硬件与功耗配置将在设备重启后生效')
   }
 
-  function disconnect() {
-    client.disconnect()
-    setPhase('idle')
-    setOperation(null)
-    setStaged(false)
-    toast.info('已断开')
+  async function inspectResource(resource: ResourceSummary) {
+    if (!await perform(`inspect:${resource.key}`, async () => {
+      const response = await agentApi.getResource(resource.key)
+      setResourceDetail(response.result.resource)
+      setDetailOpen(true)
+    }, '资源已读取')) return
   }
 
-  async function reloadDevice() {
-    const result = await perform('reload', async () => {
-      const nextStatus = await client.transact<DeviceStatus>('device.status')
-      const nextConfig = await client.transact<{ config: ToolkitConfig }>('config.get')
-      const nextApps = await client.transact<{ apps: ToolkitApp[] }>('app.list')
-      return { nextStatus, nextConfig, nextApps }
-    }, '已同步')
-    if (!result) return
-    setStatus(result.nextStatus)
-    setConfig(result.nextConfig.config)
-    setApps(result.nextApps.apps)
-    setStaged(false)
-    setWifiPassword('')
-    setAccessToken('')
-    setProxyPassword('')
-    setWifiTestResult(null)
-  }
-
-  async function patchNetwork(testAfterPatch = false) {
-    const ipv4 = config.wifi.ipv4.mode === 'dhcp'
-      ? { mode: 'dhcp' }
-      : config.wifi.ipv4
-    const wifi: Record<string, unknown> = { ssid: config.wifi.ssid, ipv4 }
-    if (wifiPassword) wifi.password = wifiPassword
-    if (clearWifiPassword) wifi.password = ''
-    const result = await perform(testAfterPatch ? 'wifi.test' : 'wifi.patch', async () => {
-      const patched = await client.transact<{ staged: boolean; configured: boolean }>('config.patch', { patch: { wifi } })
-      const test = testAfterPatch ? await client.transact<WifiTestResult>('wifi.test') : null
-      return { patched, test }
-    }, testAfterPatch ? 'Wi-Fi 可用' : '网络配置已暂存')
-    if (!result) return
-    setStaged(true)
-    setWifiTestResult(result.test)
-    setWifiPassword('')
-    setClearWifiPassword(false)
-  }
-
-  async function scanWifi() {
-    const result = await perform('wifi.scan', () => client.transact<{ networks: WifiNetwork[] }>('wifi.scan'), '扫描完成')
-    if (result) setNetworks(result.networks)
-  }
-
-  async function patchCodex() {
-    const proxy = config.apps.codex_usage.proxy.enabled
-      ? {
-          enabled: true,
-          host: config.apps.codex_usage.proxy.host,
-          port: config.apps.codex_usage.proxy.port,
-          username: config.apps.codex_usage.proxy.username,
-          ...(
-            config.apps.codex_usage.proxy.username
-              ? proxyPassword
-                ? { password: proxyPassword }
-                : clearProxyPassword
-                  ? { password: '' }
-                  : {}
-              : { password: '' }
-          ),
-        }
-      : { enabled: false }
-    const codex: Record<string, unknown> = {
-      account_id: config.apps.codex_usage.account_id,
-      expires_at: config.apps.codex_usage.expires_at,
-      proxy,
-    }
-    if (accessToken) codex.access_token = accessToken
-    if (clearAccessToken) codex.access_token = ''
-    const result = await perform('codex.patch', () => client.transact<{ staged: boolean; configured: boolean }>('config.patch', {
-      patch: { apps: { codex_usage: codex } },
-    }), 'Codex 配置已暂存')
-    if (!result) return
-    setStaged(true)
-    setAccessToken('')
-    setClearAccessToken(false)
-    setProxyPassword('')
-    setClearProxyPassword(false)
-  }
-
-  async function activateCodex() {
-    const result = await perform('app.activate', () => client.transact<{ staged: boolean }>('app.activate', { id: 'codex_usage' }), '应用已暂存')
-    if (!result) return
-    setStaged(true)
-    setConfig((current) => ({ ...current, active_app: 'codex_usage' }))
-    setApps((current) => current.map((app) => ({ ...app, active: app.id === 'codex_usage' })))
-  }
-
-  async function patchSystem() {
-    const patch = {
-      version: 1,
-      device: config.device,
-      power: config.power,
-      display: config.display,
-      battery: config.battery,
-    }
-    const result = await perform('system.patch', () => client.transact<{ staged: boolean; configured: boolean }>('config.patch', { patch }), '系统参数已暂存')
-    if (result) setStaged(true)
-  }
-
-  async function commitConfig() {
-    const result = await perform('config.commit', () => client.transact<Record<string, unknown>>('config.commit'), '配置已保存')
-    if (!result) return
-    setStaged(false)
-    const nextStatus = await perform('status.after.commit', () => client.transact<DeviceStatus>('device.status'))
-    if (nextStatus) setStatus(nextStatus)
-  }
-
-  async function refreshNow() {
-    const result = await perform('refresh.now', () => client.transact<{ scheduled: boolean }>('refresh.now'), '刷新已排队')
-    if (result?.scheduled) setActivities((current) => [{ at: Date.now(), kind: 'system' as const, label: '设备即将刷新并休眠' }, ...current].slice(0, 12))
+  async function openEnrollment() {
+    await perform('enrollment', async () => {
+      const response = await agentApi.setEnrollment(true)
+      setEnrollmentUntil(Date.now() + (response.result.expires_in_sec ?? 120) * 1000)
+    }, 'Enrollment 已开放')
   }
 
   async function prepareReset() {
-    const result = await perform('factory.prepare', () => client.transact<{ nonce: number; expires_in_sec: number; physical_confirmation_required: boolean }>('factory_reset.prepare'))
-    if (!result) return
-    setResetNonce(result.nonce)
-    setResetDeadline(Date.now() + result.expires_in_sec * 1000)
-    setResetTick(Date.now())
+    await perform('reset.prepare', async () => {
+      await agentApi.prepareFactoryReset()
+      setResetCode('')
+      setResetOpen(true)
+    }, '确认码已显示在设备上')
   }
 
-  async function commitReset() {
-    if (!resetNonce || resetSeconds <= 0) return
-    const result = await perform('factory.commit', () => client.transact<Record<string, unknown>>('factory_reset.commit', { nonce: resetNonce }), '设备已恢复出厂')
-    if (!result) return
-    setResetOpen(false)
-    setResetNonce(null)
-    setStaged(false)
+  function scanDevices() {
+    void perform('ble.scan', agentApi.scanDevices, '设备扫描已开始')
   }
 
-  const setPower = (key: keyof ToolkitConfig['power'], value: number | [number, number, number, number]) => {
-    setConfig((current) => ({ ...current, power: { ...current.power, [key]: value } }))
+  function connectDevice(candidate: BleCandidate) {
+    void perform(
+      `ble.connect:${candidate.id}`,
+      () => agentApi.connectDevice(candidate.id),
+      `正在连接 ${candidate.name}`,
+    )
   }
-  const setIpv4 = (key: keyof ToolkitConfig['wifi']['ipv4'], value: string) => {
-    setConfig((current) => ({ ...current, wifi: { ...current.wifi, ipv4: { ...current.wifi.ipv4, [key]: value } } }))
-    setWifiTestResult(null)
+
+  function disconnectDevice() {
+    void perform('ble.disconnect', agentApi.disconnectDevice, '设备连接已停止')
   }
-  const setProxy = (key: keyof ToolkitConfig['apps']['codex_usage']['proxy'], value: string | number | boolean) => {
-    setConfig((current) => ({
-      ...current,
-      apps: { codex_usage: { ...current.apps.codex_usage, proxy: { ...current.apps.codex_usage.proxy, [key]: value } } },
-    }))
+
+  function autoConnectDevice() {
+    void perform('ble.auto', agentApi.autoConnectDevice, '自动连接已启动')
   }
-  const setDisplay = (key: keyof ToolkitConfig['display'], value: number) => {
-    setConfig((current) => ({ ...current, display: { ...current.display, [key]: value } }))
+
+  if (bootError) {
+    return (
+      <main className="boot-screen">
+        <div className="brand-mark"><span /><span /><span /></div>
+        <p>EPD AGENT / LOCAL</p>
+        <h1>无法建立本机会话</h1>
+        <div className="boot-error">{bootError}</div>
+      </main>
+    )
   }
-  const setBattery = (key: keyof ToolkitConfig['battery'], value: number) => {
-    setConfig((current) => ({ ...current, battery: { ...current.battery, [key]: value } }))
+
+  if (!snapshot) {
+    return <main className="boot-screen"><LoaderCircle className="boot-spinner" /><p>EPD AGENT / LOCAL</p><h1>正在连接工作台</h1></main>
   }
 
   return (
-    <div className="min-h-svh text-foreground">
-      <aside className="fixed inset-y-0 left-0 z-30 hidden w-[252px] flex-col overflow-hidden border-r border-white/12 bg-ink text-paper lg:flex">
-        <div className="flex h-[74px] items-center gap-3 border-b border-white/12 px-5">
-          <div className="epd-mark"><span /><span /><span /></div>
-          <div>
-            <p className="font-display text-lg font-black leading-none tracking-[-.02em]">EPD KIT</p>
-            <p className="mt-1 font-mono text-[9px] tracking-[.2em] text-white/46">CONTROL / V1</p>
-          </div>
+    <div className="workbench">
+      <aside className="sidebar">
+        <div className="brand">
+          <div className="brand-mark"><span /><span /><span /></div>
+          <div><strong>EPD KIT</strong><small>BLE v3 AGENT</small></div>
         </div>
-
-        <nav className="flex-1 space-y-1 p-3 pt-6">
-          {NAV_ITEMS.map((item, index) => {
-            const Icon = item.icon
-            const active = view === item.id
-            return (
-              <button
-                key={item.id}
-                type="button"
-                onClick={() => setView(item.id)}
-                className={cn('group flex h-11 w-full cursor-pointer items-center gap-3 rounded-md px-3 text-left text-sm font-semibold transition-colors', active ? 'bg-paper text-ink' : 'text-white/58 hover:bg-white/7 hover:text-white')}
-              >
-                <span className="font-mono text-[9px] opacity-45">0{index + 1}</span>
-                <Icon className="size-4" />
-                <span>{item.label}</span>
-                {active ? <ChevronRight className="ml-auto size-4" /> : null}
-              </button>
-            )
-          })}
-        </nav>
-
-        <div className="m-3 rounded-lg border border-white/12 bg-white/4 p-3.5">
-          <div className="flex items-center gap-2">
-            <span className={cn('size-2 rounded-full', connected ? 'bg-signal shadow-[0_0_10px_#c8ff2f]' : 'bg-white/25')} />
-            <span className="truncate font-mono text-[10px] font-bold tracking-[.08em]">{connected ? standardInfo?.name : 'NO DEVICE'}</span>
-          </div>
-          <p className="mt-2 truncate text-xs text-white/45">{standardInfo?.serial ?? '等待蓝牙连接'}</p>
-          {connected ? (
-            <button type="button" onClick={disconnect} className="mt-3 flex cursor-pointer items-center gap-1.5 text-[11px] font-semibold text-white/55 hover:text-white">
-              <LogOut className="size-3" /> 断开
+        <nav aria-label="工作台导航">
+          {NAV_ITEMS.map(({ id, label, icon: Icon }) => (
+            <button key={id} className={view === id ? 'active' : ''} onClick={() => setView(id)} title={label}>
+              <Icon /><span>{label}</span><ChevronRight />
             </button>
-          ) : null}
+          ))}
+        </nav>
+        <div className="sidebar-state">
+          <div><Bluetooth /><span>DEVICE</span><StatusPill phase={snapshot.device.phase} /></div>
+          <div><Bot /><span>CODEX</span><StatusPill phase={snapshot.codex.phase} /></div>
         </div>
+        <div className="agent-version">AGENT {snapshot.agent.version}<br />{snapshot.agent.platform.toUpperCase()}</div>
       </aside>
 
-      <div className="lg:pl-[252px]">
-        <header className="sticky top-0 z-20 flex h-[66px] items-center justify-between border-b border-border bg-background/88 px-4 backdrop-blur-md sm:px-6 lg:h-[74px] lg:px-8">
-          <div className="flex items-center gap-3">
-            <div className="epd-mark epd-mark-dark lg:hidden"><span /><span /><span /></div>
-            <div>
-              <p className="font-mono text-[9px] font-bold tracking-[.16em] text-muted-foreground uppercase lg:hidden">EPD KIT / V1</p>
-              <p className="font-display text-base font-black sm:text-lg">{pageName}</p>
-            </div>
-          </div>
-          <div className="flex items-center gap-2.5">
-            {connected ? (
-              <>
-                <div className="hidden items-center gap-2 border-r border-border pr-3 sm:flex">
-                  <BatteryCharging className="size-4" />
-                  <span className="font-mono text-xs font-bold">{standardInfo?.battery ?? '—'}%</span>
-                </div>
-                <Badge variant="signal" className="hidden sm:inline-flex"><span className="size-1.5 rounded-full bg-signal-foreground" /> CONNECTED</Badge>
-                <Button variant="outline" size="sm" onClick={disconnect}><LogOut /> <span className="hidden sm:inline">断开</span></Button>
-              </>
-            ) : (
-              <Button variant="signal" size="sm" onClick={connect} disabled={phase === 'connecting' || !supportsBluetooth}>
-                {phase === 'connecting' ? <LoaderCircle className="animate-spin" /> : <Bluetooth />}
-                {phase === 'connecting' ? '连接中' : '连接设备'}
-              </Button>
-            )}
+      <main className="workspace">
+        <header className="topbar">
+          <div><page.icon /><span>{page.label}</span></div>
+          <div className="top-actions">
+            {streamDown ? <span className="stream-warning"><Radio />事件流重连中</span> : null}
+            <Button variant="ghost" size="icon" title="重新读取设备" disabled={!connected || !!operation}
+              onClick={() => void perform('reload', agentApi.reloadDevice, '设备状态已更新', true)}>
+              <RefreshCw className={operation === 'reload' ? 'spin' : ''} />
+            </Button>
+            <Button variant={snapshot.agent.paused ? 'signal' : 'outline'} size="sm" disabled={!!operation}
+              onClick={() => void perform('pause', () => agentApi.setPaused(!snapshot.agent.paused), snapshot.agent.paused ? '同步已恢复' : '同步已暂停', true)}>
+              {snapshot.agent.paused ? <Play /> : <Pause />}{snapshot.agent.paused ? '恢复' : '暂停'}
+            </Button>
           </div>
         </header>
 
-        {!supportsBluetooth ? (
-          <div className="border-b border-destructive/25 bg-destructive/8 px-4 py-2.5 text-center text-xs font-semibold text-destructive">
-            Web Bluetooth 不可用 · 请使用 Chrome / Edge（Android 或桌面）
-          </div>
-        ) : null}
+        <div className="page-body">
+          <div className="page-heading"><div><span>LOCAL DEVICE WORKBENCH</span><h1>{page.label}</h1></div></div>
 
-        <main className="mx-auto max-w-[1240px] px-4 py-6 pb-32 sm:px-6 sm:py-8 lg:px-8 lg:pb-24">
-          {view === 'overview' ? (
-            <>
-              <PageIntro
-                eyebrow="01 / Device pulse"
-                title={connected ? config.device.name : '等待设备'}
-                action={connected ? (
-                  <Button variant="outline" size="sm" onClick={reloadDevice} disabled={busy}>
-                    <LoadingIcon active={operation === 'reload'} /><RefreshCw /> 同步
-                  </Button>
-                ) : undefined}
-              />
-
-              <div className="grid gap-4 xl:grid-cols-[1.25fr_.75fr]">
-                <Panel className="overflow-hidden bg-ink p-0 text-paper">
-                  <div className="grid min-h-[350px] items-center gap-7 p-5 sm:p-7 md:grid-cols-[minmax(0,1fr)_210px]">
-                    <div className="epd-shell mx-auto w-full max-w-[560px]">
-                      <div className="epd-display">
-                        <div className="flex items-start justify-between border-b-[3px] border-black pb-2">
-                          <div>
-                            <p className="font-mono text-[9px] font-black tracking-[.24em]">CODEX USAGE</p>
-                            <p className="font-display text-xl font-black leading-tight">{connected ? 'REMAINING' : 'STANDBY'}</p>
-                          </div>
-                          <div className="text-right font-mono text-[8px] font-bold leading-4">
-                            <p>{connected ? 'SYNC READY' : 'BLE OFF'}</p>
-                            <p>{new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date())}</p>
-                          </div>
-                        </div>
-                        <div className="grid grid-cols-2 gap-4 pt-3">
-                          <div>
-                            <div className="flex items-baseline justify-between"><b className="font-display text-2xl">5H</b><b className="font-mono text-lg">{connected ? '—' : '00'}%</b></div>
-                            <div className="mt-2 h-3 border-2 border-black p-[2px]"><div className="h-full w-[68%] bg-black" /></div>
-                          </div>
-                          <div>
-                            <div className="flex items-baseline justify-between"><b className="font-display text-2xl">7D</b><b className="font-mono text-lg">{connected ? '—' : '00'}%</b></div>
-                            <div className="mt-2 h-3 border-2 border-black p-[2px]"><div className="h-full w-[42%] bg-black" /></div>
-                          </div>
-                        </div>
-                      </div>
+          {view === 'overview' ? <>
+            <DeviceConnectionPanel
+              device={snapshot.device}
+              operation={operation}
+              onScan={scanDevices}
+              onConnect={connectDevice}
+              onDisconnect={disconnectDevice}
+              onAutoConnect={autoConnectDevice}
+            />
+            <div className="metrics-grid">
+              <Metric label="BLE 设备" value={PHASE_LABELS[snapshot.device.phase] ?? snapshot.device.phase}
+                detail={snapshot.device.name ?? '等待发现 EPD-KIT'} icon={Bluetooth} tone={connected ? 'green' : 'red'} />
+              <Metric label="Codex" value={PHASE_LABELS[snapshot.codex.phase] ?? snapshot.codex.phase}
+                detail={snapshot.codex.plan_type ? formatPlanName(snapshot.codex.plan_type) : snapshot.codex.last_error ?? '等待账号状态'} icon={Bot} tone={snapshot.codex.phase === 'ready' ? 'cyan' : 'default'} />
+              <Metric label="同步" value={formatAge(snapshot.codex.last_sync_at)}
+                detail={`下一次 ${formatTime(snapshot.codex.next_sync_at)}`} icon={Clock3} />
+              <Metric label="资源" value={String(resources.length)}
+                detail={`${config?.view.renderer_id ?? '无 renderer'} / rev ${config?.revision ?? '—'}`} icon={Database} />
+            </div>
+            <div className="overview-grid">
+              <section className="surface epd-module">
+                <SectionTitle icon={MonitorCog} title="当前墨水屏视图" detail={config?.view.resource_key ?? '未选择资源'}
+                  action={<Button size="sm" disabled={!connected || !!operation} onClick={() => void perform('display', () => agentApi.refreshDisplay('auto'), '刷新已排队')}><RefreshCw />刷新</Button>} />
+                <div className="epd-frame">
+                  <div className="epd-screen">
+                    <div className="epd-top">
+                      <div className="epd-brand"><b>Codex</b><i>-</i><span>{formatPlanName(bucket?.planType ?? snapshot.codex.plan_type)}</span></div>
+                      <div className="epd-indicators">{configDraft?.hardware.battery.enabled ? <small>--%</small> : null}<i className={connected ? 'connected' : ''} /></div>
                     </div>
-                    <div className="space-y-5 border-t border-white/12 pt-5 md:border-t-0 md:border-l md:pt-0 md:pl-7">
-                      <div>
-                        <p className="micro-label text-white/38">FIRMWARE</p>
-                        <p className="mt-1.5 font-mono text-sm font-bold">{hello?.firmware ?? standardInfo?.firmware ?? '—'}</p>
-                      </div>
-                      <div>
-                        <p className="micro-label text-white/38">PROTOCOL</p>
-                        <p className="mt-1.5 font-mono text-sm font-bold">{hello ? `v${hello.protocol} / MTU ${hello.mtu}` : 'v1 / —'}</p>
-                      </div>
-                      <div>
-                        <p className="micro-label text-white/38">RADIO</p>
-                        <p className="mt-1.5 flex items-center gap-2 font-mono text-sm font-bold"><Radio className="size-3.5" /> {connected ? `UP ${formatUptime(status?.uptime_ms)}` : 'OFFLINE'}</p>
-                      </div>
-                    </div>
+                    <div className="epd-rule" />
+                    <div className="epd-quotas"><QuotaWindow title={formatWindowName(bucket?.primary)} window={bucket?.primary} /><QuotaWindow title={formatWindowName(bucket?.secondary)} window={bucket?.secondary} /></div>
+                    <div className="epd-bottom"><b>{snapshot.codex.phase === 'ready' ? '同步正常' : '数据保留'}</b><span>更新 {formatTime(snapshot.codex.last_sync_at)}</span></div>
                   </div>
-                </Panel>
+                </div>
+                <div className="command-row">
+                  <Button variant="outline" size="sm" disabled={!connected || !!operation} onClick={() => void perform('full', () => agentApi.refreshDisplay('full'), '全刷已排队')}><RotateCcw />全刷</Button>
+                  <Button variant="outline" size="sm" disabled={!!operation} onClick={() => void perform('codex', agentApi.refreshCodex, 'Codex 读取已排队')}><Bot />同步额度</Button>
+                  <Button variant="outline" size="sm" disabled={!owner || !!operation} onClick={() => void perform('restart', agentApi.restartDevice, '设备即将重启')}><Power />重启设备</Button>
+                </div>
+              </section>
+              <section className="surface event-module">
+                <SectionTitle icon={Activity} title="最近活动" detail="Agent 与设备事件" />
+                <div className="activity-list">
+                  {snapshot.logs.slice(0, 8).map((entry, index) => <div key={`${entry.at}:${index}`}>
+                    <i className={entry.level} /><time>{formatTime(entry.at)}</time><b>{entry.scope}</b><span>{entry.message}</span>
+                  </div>)}
+                  {!snapshot.logs.length ? <EmptyState>暂无活动记录</EmptyState> : null}
+                </div>
+              </section>
+            </div>
+          </> : null}
 
-                <div className="grid grid-cols-2 gap-4 xl:grid-cols-1">
-                  <Panel className="stat-card">
-                    <div className="flex items-start justify-between"><BatteryCharging className="size-5" /><span className="micro-label">BATTERY</span></div>
-                    <p className="stat-value">{standardInfo?.battery ?? '—'}<small>{standardInfo?.battery !== undefined ? '%' : ''}</small></p>
-                    <Progress value={standardInfo?.battery ?? 0} />
-                  </Panel>
-                  <Panel className="stat-card">
-                    <div className="flex items-start justify-between"><Wifi className="size-5" /><span className="micro-label">WI-FI</span></div>
-                    <p className="mt-5 truncate font-display text-lg font-black">{status?.wifi_ssid || config.wifi.ssid || '未配置'}</p>
-                    <p className="mt-1 font-mono text-[10px] text-muted-foreground">2.4 GHZ / {config.wifi.ipv4.mode.toUpperCase()}</p>
-                  </Panel>
+          {view === 'hardware' && configDraft ? <>
+            <div className="page-actions"><Button className="save-button" disabled={!owner || !!operation} onClick={() => void saveConfiguration()}><Save />保存配置</Button></div>
+            <section className="surface settings-section">
+              <SectionTitle icon={BatteryCharging} title="电池与 IO" detail="硬件字段提交后重启生效" />
+              <div className="settings-rows">
+                <div className="setting-toggle"><div><b>电池输入</b><span>ADC、电池服务与低电量保护</span></div><Switch checked={configDraft.hardware.battery.enabled}
+                  onCheckedChange={(enabled) => setConfigDraft({ ...configDraft, hardware: { ...configDraft.hardware, battery: { ...configDraft.hardware.battery, enabled } } })} /></div>
+                <div className="field-grid three">
+                  <NumberField label="低电量 / mV" min={3001} max={4298} value={configDraft.hardware.battery.low_mv} disabled={!configDraft.hardware.battery.enabled}
+                    onChange={(low_mv) => setConfigDraft({ ...configDraft, hardware: { ...configDraft.hardware, battery: { ...configDraft.hardware.battery, low_mv } } })} />
+                  <NumberField label="临界电量 / mV" min={3000} max={4297} value={configDraft.hardware.battery.critical_mv} disabled={!configDraft.hardware.battery.enabled}
+                    onChange={(critical_mv) => setConfigDraft({ ...configDraft, hardware: { ...configDraft.hardware, battery: { ...configDraft.hardware.battery, critical_mv } } })} />
+                  <NumberField label="恢复电量 / mV" min={3002} max={4300} value={configDraft.hardware.battery.recovery_mv} disabled={!configDraft.hardware.battery.enabled}
+                    onChange={(recovery_mv) => setConfigDraft({ ...configDraft, hardware: { ...configDraft.hardware, battery: { ...configDraft.hardware.battery, recovery_mv } } })} />
+                </div>
+                <div className="setting-toggle"><div><b>IO12 按键</b><span>{configDraft.hardware.io12.mode === 'key' ? '短按触发立即同步' : '引脚保持高阻输入'}</span></div><Switch checked={configDraft.hardware.io12.mode === 'key'}
+                  onCheckedChange={(enabled) => setConfigDraft({ ...configDraft, hardware: { ...configDraft.hardware, io12: { mode: enabled ? 'key' : 'disabled' } } })} /></div>
+              </div>
+            </section>
+            <section className="surface settings-section">
+              <SectionTitle icon={Zap} title="功耗与显示" detail="广播策略及电子纸全刷阈值" />
+              <div className="settings-rows">
+                <label className="field"><span>功耗档位</span><select value={configDraft.power.profile} onChange={(event) => setConfigDraft({ ...configDraft, power: { ...configDraft.power, profile: event.target.value as 'mains' | 'battery' } })}><option value="mains">mains / 常在线</option><option value="battery">battery / 同步后休眠</option></select></label>
+                <NumberField label="休眠唤醒周期 / 秒" min={60} max={86400} value={configDraft.power.wake_interval_sec} disabled={configDraft.power.profile !== 'battery'}
+                  onChange={(wake_interval_sec) => setConfigDraft({ ...configDraft, power: { ...configDraft.power, wake_interval_sec } })} />
+                <div className="field-grid three">
+                  <NumberField label="局刷后全刷 / 次" min={1} max={100} value={configDraft.display.full_after_partial_count}
+                    onChange={(full_after_partial_count) => setConfigDraft({ ...configDraft, display: { ...configDraft.display, full_after_partial_count } })} />
+                  <NumberField label="全刷最大间隔 / 秒" min={3600} max={604800} value={configDraft.display.full_max_age_sec}
+                    onChange={(full_max_age_sec) => setConfigDraft({ ...configDraft, display: { ...configDraft.display, full_max_age_sec } })} />
+                  <NumberField label="全刷面积阈值 / %" min={10} max={100} value={configDraft.display.full_area_threshold_percent}
+                    onChange={(full_area_threshold_percent) => setConfigDraft({ ...configDraft, display: { ...configDraft.display, full_area_threshold_percent } })} />
                 </div>
               </div>
-
-              <div className="mt-4 grid gap-4 lg:grid-cols-[.9fr_1.1fr]">
-                <Panel>
-                  <PanelTitle icon={Zap} title="快速操作" />
-                  <div className="grid gap-2 p-4 sm:grid-cols-2">
-                    <Button variant="outline" className="h-12 justify-start" onClick={refreshNow} disabled={!connected || busy}><RefreshCw /> 立即刷新</Button>
-                    <Button variant="outline" className="h-12 justify-start" onClick={() => setView('network')}><Wifi /> 配置网络</Button>
-                    <Button variant="outline" className="h-12 justify-start" onClick={() => setView('codex')}><KeyRound /> 更新凭据</Button>
-                    <Button variant="outline" className="h-12 justify-start" onClick={() => setView('system')}><Settings2 /> 系统参数</Button>
-                  </div>
-                </Panel>
-                <Panel>
-                  <PanelTitle icon={Activity} title="会话记录" action={<Badge variant="outline">{activities.length} EVENTS</Badge>} />
-                  <div className="divide-y divide-border">
-                    {activities.length ? activities.slice(0, 4).map((entry, index) => (
-                      <div key={`${entry.at}-${index}`} className="flex items-center gap-3 px-4 py-3 text-xs sm:px-5">
-                        <span className={cn('size-2 rounded-full', entry.kind === 'error' ? 'bg-destructive' : entry.kind === 'response' ? 'bg-signal-foreground' : 'bg-foreground/28')} />
-                        <span className="min-w-0 flex-1 truncate font-medium">{entry.label}</span>
-                        <span className="font-mono text-[10px] text-muted-foreground">{new Date(entry.at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })}</span>
-                      </div>
-                    )) : (
-                      <div className="grid min-h-36 place-items-center p-5 text-center">
-                        <div><Circle className="mx-auto mb-2 size-4 text-muted-foreground/45" /><p className="text-xs text-muted-foreground">暂无会话</p></div>
-                      </div>
-                    )}
-                  </div>
-                </Panel>
+            </section>
+            <section className="surface settings-section">
+              <SectionTitle icon={Settings2} title="区域与标识" />
+              <div className="field-grid three settings-fields">
+                <label className="field"><span>设备名称</span><Input value={configDraft.device.name} onChange={(event) => setConfigDraft({ ...configDraft, device: { ...configDraft.device, name: event.target.value } })} /></label>
+                <label className="field"><span>Locale</span><Input value={configDraft.device.locale} onChange={(event) => setConfigDraft({ ...configDraft, device: { ...configDraft.device, locale: event.target.value } })} /></label>
+                <label className="field"><span>IANA 时区</span><Input value={configDraft.device.timezone_iana} onChange={(event) => setConfigDraft({ ...configDraft, device: { ...configDraft.device, timezone_iana: event.target.value } })} /></label>
               </div>
+            </section>
+          </> : null}
 
-            </>
-          ) : null}
-
-          {view === 'network' ? (
-            <>
-              <PageIntro
-                eyebrow="02 / Connectivity"
-                title="网络配置"
-                action={<Button variant="outline" size="sm" onClick={scanWifi} disabled={!connected || busy}><LoadingIcon active={operation === 'wifi.scan'} /><ScanLine /> 扫描</Button>}
-              />
-              <div className="grid gap-4 lg:grid-cols-[1fr_.72fr]">
-                <Panel>
-                  <PanelTitle icon={Wifi} title="2.4 GHz Wi-Fi" action={config.wifi.password_set ? <Badge variant="signal"><LockKeyhole /> SAVED</Badge> : <Badge variant="outline">NO SECRET</Badge>} />
-                  <div className="space-y-5 p-4 sm:p-5">
-                    <Field label="SSID" htmlFor="wifi-ssid">
-                      <Input id="wifi-ssid" maxLength={32} value={config.wifi.ssid} onChange={(event) => setConfig((current) => ({ ...current, wifi: { ...current.wifi, ssid: event.target.value } }))} placeholder="选择或输入网络" />
-                    </Field>
-                    <Field label="密码" htmlFor="wifi-password" hint={config.wifi.password_set && !wifiPassword ? '留空保留已存密码' : undefined}>
-                      <div className="relative">
-                        <Input id="wifi-password" type={showWifiPassword ? 'text' : 'password'} maxLength={64} value={wifiPassword} onChange={(event) => { setWifiPassword(event.target.value); setClearWifiPassword(false) }} placeholder={config.wifi.password_set ? '••••••••••••' : '开放网络可留空'} className="pr-11" />
-                        <button type="button" onClick={() => setShowWifiPassword((value) => !value)} className="absolute top-1/2 right-3 -translate-y-1/2 cursor-pointer text-muted-foreground hover:text-foreground" aria-label="显示或隐藏密码">
-                          {showWifiPassword ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
-                        </button>
-                      </div>
-                    </Field>
-                    <div className="flex items-center justify-between rounded-md border border-border bg-muted/45 px-3.5 py-3">
-                      <div><p className="text-xs font-semibold">清除已存密码</p><p className="mt-0.5 text-[10px] text-muted-foreground">发送空字符串</p></div>
-                      <Switch checked={clearWifiPassword} onCheckedChange={(checked) => { setClearWifiPassword(checked); if (checked) setWifiPassword('') }} />
-                    </div>
-                    <div className="grid gap-2 sm:grid-cols-2">
-                      <Button variant="outline" onClick={() => patchNetwork(false)} disabled={!connected || busy}><LoadingIcon active={operation === 'wifi.patch'} /><Save /> 暂存</Button>
-                      <Button variant="signal" onClick={() => patchNetwork(true)} disabled={!connected || busy}><LoadingIcon active={operation === 'wifi.test'} /><SignalHigh /> 暂存并测试</Button>
-                    </div>
-                  </div>
-                </Panel>
-
-                <Panel>
-                  <PanelTitle icon={Radio} title="附近网络" action={<span className="font-mono text-[10px] text-muted-foreground">{networks.length}/10</span>} />
-                  <div className="max-h-[430px] divide-y divide-border overflow-y-auto">
-                    {networks.length ? networks.map((network) => (
-                      <button
-                        type="button"
-                        key={`${network.ssid}-${network.channel}`}
-                        onClick={() => setConfig((current) => ({ ...current, wifi: { ...current.wifi, ssid: network.ssid } }))}
-                        className={cn('flex w-full cursor-pointer items-center gap-3 px-4 py-3.5 text-left transition-colors hover:bg-muted/70 sm:px-5', config.wifi.ssid === network.ssid && 'bg-signal/13')}
-                      >
-                        <div className="flex h-7 w-8 items-end gap-[2px]">
-                          {[1, 2, 3, 4].map((bar) => <span key={bar} className={cn('w-1 rounded-t-[1px] bg-foreground/14', bar <= rssiBars(network.rssi) && 'bg-foreground')} style={{ height: `${bar * 4 + 2}px` }} />)}
-                        </div>
-                        <div className="min-w-0 flex-1"><p className="truncate text-sm font-semibold">{network.ssid || '隐藏网络'}</p><p className="font-mono text-[9px] text-muted-foreground">CH {network.channel} · {network.rssi} DBM</p></div>
-                        {network.open ? <WifiOff className="size-3.5 text-muted-foreground" /> : <LockKeyhole className="size-3.5" />}
-                      </button>
-                    )) : (
-                      <div className="grid min-h-64 place-items-center p-6 text-center"><div><ScanLine className="mx-auto mb-3 size-6 text-muted-foreground/40" /><p className="text-xs font-semibold text-muted-foreground">连接后扫描</p></div></div>
-                    )}
-                  </div>
-                </Panel>
+          {view === 'resources' ? <>
+            <section className="surface settings-section">
+              <SectionTitle icon={MonitorCog} title="当前视图" detail={`配置 revision ${config?.revision ?? '—'}`}
+                action={<Button size="sm" disabled={!owner || !viewRenderer || !viewResource || !!operation}
+                  onClick={() => void perform('view', () => agentApi.setView(viewRenderer, viewResource), '视图已切换', true)}><Save />应用</Button>} />
+              <div className="field-grid two settings-fields">
+                <label className="field"><span>Renderer</span><select value={viewRenderer} onChange={(event) => setViewRenderer(event.target.value)}>{renderers.map((renderer) => <option key={renderer.id} value={renderer.id}>{renderer.id} · {renderer.schema_id}/v{renderer.schema_version}</option>)}</select></label>
+                <label className="field"><span>Resource key</span><select value={viewResource} onChange={(event) => setViewResource(event.target.value)}>{resources.map((resource) => <option key={resource.key} value={resource.key}>{resource.key}</option>)}</select></label>
               </div>
+            </section>
+            <section className="surface table-section">
+              <SectionTitle icon={HardDrive} title="资源存储" detail={`${resources.length} / ${snapshot.device.capabilities?.max_resources ?? 8}`} />
+              <div className="data-table resource-table">
+                <div className="table-head"><span>KEY / SCHEMA</span><span>REVISION</span><span>FRESHNESS</span><span>ACTIONS</span></div>
+                {resources.map((resource) => <div className="table-row" key={resource.key}>
+                  <span><b>{resource.key}</b><small>{resource.schema_id}/v{resource.schema_version} · {resource.persistence}</small></span>
+                  <span className="mono">{resource.revision}</span><span>{formatAge(resource.updated_at)}<small>TTL {resource.ttl_sec}s</small></span>
+                  <span className="row-actions"><Button variant="ghost" size="icon" title="查看资源" disabled={!!operation} onClick={() => void inspectResource(resource)}><Eye /></Button><Button variant="ghost" size="icon" title="删除资源" disabled={!owner || !!operation || resource.key === config?.view.resource_key} onClick={() => void perform(`delete:${resource.key}`, () => agentApi.deleteResource(resource.key), '资源已删除', true)}><Trash2 /></Button></span>
+                </div>)}
+                {!resources.length ? <EmptyState>设备中没有资源</EmptyState> : null}
+              </div>
+            </section>
+          </> : null}
 
-              <Panel className="mt-4">
-                <PanelTitle
-                  icon={Network}
-                  title="IPv4"
-                  action={wifiTestResult ? <Badge variant="signal"><Check /> {wifiTestResult.ipv4_mode.toUpperCase()}</Badge> : undefined}
-                />
-                <div className="p-4 sm:p-5">
-                  <div className="mb-5 grid grid-cols-2 gap-1 rounded-md border border-border bg-muted p-1 sm:w-72">
-                    {(['dhcp', 'static'] as const).map((mode) => (
-                      <button
-                        key={mode}
-                        type="button"
-                        onClick={() => setIpv4('mode', mode)}
-                        className={cn('h-8 cursor-pointer rounded-sm font-mono text-[10px] font-bold tracking-[.12em] uppercase transition-colors', config.wifi.ipv4.mode === mode ? 'bg-foreground text-background shadow-sm' : 'text-muted-foreground hover:text-foreground')}
-                      >
-                        {mode === 'dhcp' ? '自动 / DHCP' : '手动 / STATIC'}
-                      </button>
-                    ))}
-                  </div>
-                  <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-5">
-                    <Field label="IP 地址" htmlFor="ipv4-address"><Input id="ipv4-address" inputMode="decimal" value={config.wifi.ipv4.address} onChange={(event) => setIpv4('address', event.target.value)} placeholder="192.168.1.42" disabled={config.wifi.ipv4.mode === 'dhcp'} /></Field>
-                    <Field label="网关" htmlFor="ipv4-gateway"><Input id="ipv4-gateway" inputMode="decimal" value={config.wifi.ipv4.gateway} onChange={(event) => setIpv4('gateway', event.target.value)} placeholder="192.168.1.1" disabled={config.wifi.ipv4.mode === 'dhcp'} /></Field>
-                    <Field label="子网掩码" htmlFor="ipv4-subnet"><Input id="ipv4-subnet" inputMode="decimal" value={config.wifi.ipv4.subnet} onChange={(event) => setIpv4('subnet', event.target.value)} placeholder="255.255.255.0" disabled={config.wifi.ipv4.mode === 'dhcp'} /></Field>
-                    <Field label="DNS 1" htmlFor="ipv4-dns1"><Input id="ipv4-dns1" inputMode="decimal" value={config.wifi.ipv4.dns1} onChange={(event) => setIpv4('dns1', event.target.value)} placeholder="1.1.1.1" disabled={config.wifi.ipv4.mode === 'dhcp'} /></Field>
-                    <Field label="DNS 2 / 可选" htmlFor="ipv4-dns2"><Input id="ipv4-dns2" inputMode="decimal" value={config.wifi.ipv4.dns2} onChange={(event) => setIpv4('dns2', event.target.value)} placeholder="8.8.8.8" disabled={config.wifi.ipv4.mode === 'dhcp'} /></Field>
-                  </div>
-                  {wifiTestResult ? (
-                    <div className="mt-5 grid gap-3 rounded-md border border-signal-foreground/20 bg-signal/12 p-3 sm:grid-cols-3 xl:grid-cols-6">
-                      {[
-                        ['IP', wifiTestResult.ip],
-                        ['GATEWAY', wifiTestResult.gateway],
-                        ['SUBNET', wifiTestResult.subnet],
-                        ['DNS 1', wifiTestResult.dns1],
-                        ['DNS 2', wifiTestResult.dns2 || '—'],
-                        ['RSSI', `${wifiTestResult.rssi} dBm`],
-                      ].map(([label, value]) => <div key={label}><p className="micro-label">{label}</p><p className="mt-1 truncate font-mono text-[11px] font-bold">{value}</p></div>)}
-                    </div>
-                  ) : null}
+          {view === 'codex' ? <>
+            <section className="surface codex-status">
+              <SectionTitle icon={Bot} title="Codex app-server" detail="本机 stdio JSON-RPC"
+                action={<Button size="sm" disabled={!!operation} onClick={() => void perform('codex', agentApi.refreshCodex, '额度读取已排队')}><RefreshCw />立即读取</Button>} />
+              <div className="account-line"><StatusPill phase={snapshot.codex.phase} /><div><b>{snapshot.codex.email ?? '未识别账号'}</b><span>{snapshot.codex.plan_type ? formatPlanName(snapshot.codex.plan_type) : snapshot.codex.account_type ?? '—'}</span></div><div><small>最近同步</small><b>{formatTime(snapshot.codex.last_sync_at)}</b></div></div>
+              {snapshot.codex.last_error ? <div className="inline-error"><CircleAlert />{snapshot.codex.last_error}</div> : null}
+            </section>
+            <section className="surface quota-section">
+              <SectionTitle icon={Gauge} title={bucket?.limitName ?? 'Codex 额度'} detail={bucket?.rateLimitReachedType ? `LIMIT: ${bucket.rateLimitReachedType}` : '当前计量窗口'} />
+              <div className="quota-grid"><QuotaWindow title="主窗口" window={bucket?.primary} /><QuotaWindow title="次窗口" window={bucket?.secondary} /></div>
+              {!bucket ? <EmptyState>暂无额度快照，设备会保留最后一次成功数据</EmptyState> : null}
+            </section>
+            <section className="surface facts-section"><div><span>Codex 路径</span><code>{snapshot.codex.codex_path ?? '未找到'}</code></div><div><span>资源 schema</span><code>codex.rate_limits/v1</code></div><div><span>轮询间隔</span><code>60s / backoff max 900s</code></div></section>
+          </> : null}
+
+          {view === 'security' ? <>
+            <section className="surface trust-intro">
+              <SectionTitle icon={KeyRound} title="Owner 与 Enrollment" detail={`当前连接角色：${snapshot.device.role ?? '—'}`}
+                action={<Button size="sm" disabled={!owner || !!operation} onClick={() => void openEnrollment()}><Users />开放 120 秒</Button>} />
+              {enrollmentUntil > Date.now() ? <div className="enrollment-active"><Radio />ENROLLMENT ACTIVE <span>{formatTime(Math.floor(enrollmentUntil / 1000))}</span><Button variant="ghost" size="sm" onClick={() => void perform('enrollment.close', () => agentApi.setEnrollment(false), 'Enrollment 已关闭')}>关闭</Button></div> : null}
+            </section>
+            <section className="surface table-section">
+              <SectionTitle icon={Users} title="Bond 列表" detail={`${snapshot.device.bonds.length} / 4`} />
+              <div className="data-table bonds-table">
+                <div className="table-head"><span>HOST ID</span><span>ROLE</span><span>ACTIONS</span></div>
+                {snapshot.device.bonds.map((bond) => <div className="table-row" key={bond.id}><span><b>{bond.id}</b></span><span><span className={`role ${bond.role}`}>{bond.role}</span></span><span className="row-actions">{bond.role !== 'owner' ? <Button variant="outline" size="sm" disabled={!owner || !!operation} onClick={() => void perform(`owner:${bond.id}`, () => agentApi.transferOwner(bond.id), 'Owner 已转移', true)}>设为 Owner</Button> : null}<Button variant="ghost" size="icon" title="撤销 bond" disabled={!owner || bond.role === 'owner' || !!operation} onClick={() => void perform(`revoke:${bond.id}`, () => agentApi.revokeBond(bond.id), 'Bond 已撤销', true)}><Trash2 /></Button></span></div>)}
+                {!snapshot.device.bonds.length ? <EmptyState>暂无已保存的 bond</EmptyState> : null}
+              </div>
+            </section>
+          </> : null}
+
+          {view === 'diagnostics' ? <>
+            <section className="surface agent-controls">
+              <SectionTitle icon={Cpu} title="Agent" detail={`v${snapshot.agent.version} · ${snapshot.agent.platform}`} />
+              <div className="settings-rows">
+                <div className="setting-toggle"><div><b>登录时启动</b><span>{snapshot.agent.autostart_enabled ? '当前用户启动项已启用' : '当前用户启动项已关闭'}</span></div><Switch checked={snapshot.agent.autostart_enabled} disabled={!!operation} onCheckedChange={(enabled) => void perform('autostart', () => agentApi.setAutostart(enabled), enabled ? '自启动已启用' : '自启动已关闭', true)} /></div>
+                <div className="setting-toggle"><div><b>BLE 同步</b><span>{snapshot.agent.paused ? '扫描与同步已暂停' : '自动发现与同步运行中'}</span></div><Switch checked={!snapshot.agent.paused} disabled={!!operation} onCheckedChange={(enabled) => void perform('pause', () => agentApi.setPaused(!enabled), enabled ? '同步已恢复' : '同步已暂停', true)} /></div>
+              </div>
+            </section>
+            <section className="surface diagnostics-section">
+              <SectionTitle icon={Braces} title="设备诊断" />
+              <pre>{JSON.stringify(snapshot.device.diagnostics ?? { phase: snapshot.device.phase, error: snapshot.device.last_error ?? null }, null, 2)}</pre>
+            </section>
+            <section className="surface log-section">
+              <SectionTitle icon={Activity} title="核心服务日志" detail={`${visibleLogs.length} / ${snapshot.logs.length}`}
+                action={<span className={`console-live ${streamDown ? 'down' : ''}`}><i />{streamDown ? 'RECONNECTING' : 'LIVE'}</span>} />
+              <div className="console-toolbar">
+                <div className="log-levels" aria-label="日志级别">
+                  {(['all', 'info', 'warn', 'error'] as const).map((level) => <button type="button" key={level} className={logLevel === level ? 'active' : ''} onClick={() => setLogLevel(level)}>{level}</button>)}
                 </div>
-              </Panel>
-            </>
-          ) : null}
-
-          {view === 'codex' ? (
-            <>
-              <PageIntro eyebrow="03 / Application" title="Codex 应用" />
-              <div className="grid gap-4 lg:grid-cols-[1fr_.72fr]">
-                <Panel>
-                  <PanelTitle icon={KeyRound} title="访问凭据" action={config.apps.codex_usage.access_token_set ? <Badge variant="signal"><ShieldCheck /> TOKEN SET</Badge> : <Badge variant="destructive">TOKEN EMPTY</Badge>} />
-                  <div className="space-y-5 p-4 sm:p-5">
-                    <Field label="Account ID" htmlFor="account-id">
-                      <Input id="account-id" maxLength={128} value={config.apps.codex_usage.account_id} onChange={(event) => setConfig((current) => ({ ...current, apps: { codex_usage: { ...current.apps.codex_usage, account_id: event.target.value } } }))} placeholder="account-id" />
-                    </Field>
-                    <Field label="Access Token" htmlFor="access-token" hint={config.apps.codex_usage.access_token_set && !accessToken ? '留空保留已存 Token' : '最多 4096 bytes'}>
-                      <div className="relative">
-                        <Input id="access-token" type={showAccessToken ? 'text' : 'password'} value={accessToken} onChange={(event) => { setAccessToken(event.target.value); setClearAccessToken(false) }} placeholder={config.apps.codex_usage.access_token_set ? '••••••••••••' : 'eyJ...'} className="pr-11 font-mono text-xs" />
-                        <button type="button" onClick={() => setShowAccessToken((value) => !value)} className="absolute top-1/2 right-3 -translate-y-1/2 cursor-pointer text-muted-foreground hover:text-foreground" aria-label="显示或隐藏 Token">
-                          {showAccessToken ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
-                        </button>
-                      </div>
-                    </Field>
-                    <Field label="到期时间" htmlFor="expires-at">
-                      <Input id="expires-at" type="datetime-local" value={toDateTimeInput(config.apps.codex_usage.expires_at)} onChange={(event) => setConfig((current) => ({ ...current, apps: { codex_usage: { ...current.apps.codex_usage, expires_at: fromDateTimeInput(event.target.value) } } }))} />
-                    </Field>
-                    <div className="flex items-center justify-between rounded-md border border-border bg-muted/45 px-3.5 py-3">
-                      <div><p className="text-xs font-semibold">清除已存 Token</p><p className="mt-0.5 text-[10px] text-muted-foreground">发送空字符串</p></div>
-                      <Switch checked={clearAccessToken} onCheckedChange={(checked) => { setClearAccessToken(checked); if (checked) setAccessToken('') }} />
-                    </div>
-                    <Button variant="signal" className="w-full" onClick={patchCodex} disabled={!connected || busy}><LoadingIcon active={operation === 'codex.patch'} /><Save /> 暂存凭据</Button>
-                  </div>
-                </Panel>
-
-                <div className="space-y-4">
-                  <Panel className="overflow-hidden">
-                    <div className="codex-card p-5">
-                      <div className="flex items-start justify-between">
-                        <div className="grid size-11 place-items-center rounded-lg bg-ink text-paper"><AppWindow className="size-5" /></div>
-                        <Badge variant={apps.some((app) => app.id === 'codex_usage' && app.active) || config.active_app === 'codex_usage' ? 'signal' : 'outline'}>ACTIVE</Badge>
-                      </div>
-                      <h2 className="mt-8 font-display text-2xl font-black">Codex Usage</h2>
-                      <p className="mt-1 font-mono text-[10px] tracking-[.14em] text-muted-foreground">{apps.find((app) => app.id === 'codex_usage')?.version ?? 'V1'} / STATIC APP</p>
-                      <div className="mt-6 grid grid-cols-2 gap-2 border-t border-border pt-4">
-                        <div><p className="micro-label">ACCOUNT</p><p className="mt-1 truncate text-xs font-semibold">{config.apps.codex_usage.account_id || '—'}</p></div>
-                        <div><p className="micro-label">EXPIRES</p><p className="mt-1 text-xs font-semibold">{formatExpiry(config.apps.codex_usage.expires_at)}</p></div>
-                      </div>
-                    </div>
-                  </Panel>
-                  <Button variant="outline" className="w-full" onClick={activateCodex} disabled={!connected || busy || config.active_app === 'codex_usage'}><Check /> 设为当前应用</Button>
-                  <Button variant="default" className="w-full" onClick={refreshNow} disabled={!connected || busy}><LoadingIcon active={operation === 'refresh.now'} /><RefreshCw /> 立即刷新屏幕</Button>
-                </div>
+                <label className="scope-filter"><span>SCOPE</span><select value={logScope} onChange={(event) => setLogScope(event.target.value)}><option value="all">all</option>{logScopes.map((scope) => <option key={scope} value={scope}>{scope}</option>)}</select></label>
+                <label className="console-follow"><span>自动跟随</span><Switch checked={followLogs} onCheckedChange={setFollowLogs} /></label>
               </div>
-
-              <Panel className="mt-4">
-                <PanelTitle
-                  icon={Server}
-                  title="HTTP CONNECT 代理"
-                  action={config.apps.codex_usage.proxy.enabled ? <Badge variant="signal">ENABLED</Badge> : <Badge variant="outline">OFF</Badge>}
-                />
-                <div className="space-y-5 p-4 sm:p-5">
-                  <div className="flex items-center justify-between rounded-md border border-border bg-muted/45 px-3.5 py-3">
-                    <div><p className="text-xs font-semibold">使用代理</p><p className="mt-0.5 font-mono text-[9px] text-muted-foreground">CHATGPT.COM:443</p></div>
-                    <Switch checked={config.apps.codex_usage.proxy.enabled} onCheckedChange={(checked) => setProxy('enabled', checked)} />
-                  </div>
-                  <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-                    <Field label="主机" htmlFor="proxy-host"><Input id="proxy-host" maxLength={253} value={config.apps.codex_usage.proxy.host} onChange={(event) => setProxy('host', event.target.value)} placeholder="proxy.lan" disabled={!config.apps.codex_usage.proxy.enabled} /></Field>
-                    <Field label="端口" htmlFor="proxy-port"><Input id="proxy-port" type="number" min={1} max={65535} value={config.apps.codex_usage.proxy.port} onChange={(event) => setProxy('port', Number(event.target.value))} disabled={!config.apps.codex_usage.proxy.enabled} /></Field>
-                    <Field label="用户名 / 可选" htmlFor="proxy-username"><Input id="proxy-username" maxLength={128} value={config.apps.codex_usage.proxy.username} onChange={(event) => { setProxy('username', event.target.value); if (!event.target.value) { setProxyPassword(''); setClearProxyPassword(true) } }} placeholder="epd-kit" disabled={!config.apps.codex_usage.proxy.enabled} /></Field>
-                    <Field label="密码 / 可选" htmlFor="proxy-password" hint={config.apps.codex_usage.proxy.password_set && !proxyPassword ? '留空保留已存密码' : undefined}>
-                      <div className="relative">
-                        <Input id="proxy-password" type={showProxyPassword ? 'text' : 'password'} maxLength={256} value={proxyPassword} onChange={(event) => { setProxyPassword(event.target.value); setClearProxyPassword(false) }} placeholder={config.apps.codex_usage.proxy.password_set ? '••••••••••••' : '无需认证可留空'} className="pr-11" disabled={!config.apps.codex_usage.proxy.enabled || !config.apps.codex_usage.proxy.username} />
-                        <button type="button" onClick={() => setShowProxyPassword((value) => !value)} disabled={!config.apps.codex_usage.proxy.enabled || !config.apps.codex_usage.proxy.username} className="absolute top-1/2 right-3 -translate-y-1/2 cursor-pointer text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40" aria-label="显示或隐藏代理密码">
-                          {showProxyPassword ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
-                        </button>
-                      </div>
-                    </Field>
-                  </div>
-                  {config.apps.codex_usage.proxy.username ? (
-                    <div className="flex items-center justify-between rounded-md border border-border bg-muted/45 px-3.5 py-3 sm:max-w-sm">
-                      <div><p className="text-xs font-semibold">清除代理密码</p><p className="mt-0.5 text-[10px] text-muted-foreground">发送空字符串</p></div>
-                      <Switch checked={clearProxyPassword} onCheckedChange={(checked) => { setClearProxyPassword(checked); if (checked) setProxyPassword('') }} disabled={!config.apps.codex_usage.proxy.enabled} />
-                    </div>
-                  ) : null}
-                  <Button variant="signal" className="w-full sm:w-auto" onClick={patchCodex} disabled={!connected || busy}><LoadingIcon active={operation === 'codex.patch'} /><Save /> 暂存 Codex 配置</Button>
-                </div>
-              </Panel>
-            </>
-          ) : null}
-
-          {view === 'system' ? (
-            <>
-              <PageIntro eyebrow="04 / Runtime" title="系统参数" />
-              <div className="grid gap-4 lg:grid-cols-2">
-                <Panel>
-                  <PanelTitle icon={Cpu} title="设备" />
-                  <div className="field-grid p-4 sm:p-5">
-                    <Field label="名称" htmlFor="device-name"><Input id="device-name" maxLength={24} value={config.device.name} onChange={(event) => setConfig((current) => ({ ...current, device: { ...current.device, name: event.target.value } }))} /></Field>
-                    <Field label="Locale" htmlFor="locale"><Input id="locale" maxLength={16} value={config.device.locale} onChange={(event) => setConfig((current) => ({ ...current, device: { ...current.device, locale: event.target.value } }))} /></Field>
-                    <Field label="IANA 时区" htmlFor="iana"><Input id="iana" maxLength={64} value={config.device.timezone.iana} onChange={(event) => setConfig((current) => ({ ...current, device: { ...current.device, timezone: { ...current.device.timezone, iana: event.target.value } } }))} /></Field>
-                    <Field label="POSIX TZ" htmlFor="posix"><Input id="posix" maxLength={96} value={config.device.timezone.posix} onChange={(event) => setConfig((current) => ({ ...current, device: { ...current.device, timezone: { ...current.device.timezone, posix: event.target.value } } }))} /></Field>
-                  </div>
-                </Panel>
-
-                <Panel>
-                  <PanelTitle icon={Clock3} title="功耗调度" />
-                  <div className="field-grid p-4 sm:p-5">
-                    <Field label="轮询间隔 / 秒" htmlFor="poll"><Input id="poll" type="number" min={60} max={86400} value={config.power.poll_interval_sec} onChange={(event) => setPower('poll_interval_sec', Number(event.target.value))} /></Field>
-                    <Field label="BLE 窗口 / 秒" htmlFor="ble-window"><Input id="ble-window" type="number" min={30} max={600} value={config.power.ble_window_sec} onChange={(event) => setPower('ble_window_sec', Number(event.target.value))} /></Field>
-                    {config.power.offline_backoff_sec.map((value, index) => (
-                      <Field key={index} label={`离线退避 ${index + 1} / 秒`} htmlFor={`backoff-${index}`}>
-                        <Input id={`backoff-${index}`} type="number" min={60} max={86400} value={value} onChange={(event) => {
-                          const next = [...config.power.offline_backoff_sec] as [number, number, number, number]
-                          next[index] = Number(event.target.value)
-                          setPower('offline_backoff_sec', next)
-                        }} />
-                      </Field>
-                    ))}
-                  </div>
-                </Panel>
-
-                <Panel>
-                  <PanelTitle icon={Gauge} title="刷新策略" />
-                  <div className="field-grid p-4 sm:p-5">
-                    <Field label="局刷次数上限" htmlFor="partial-count"><Input id="partial-count" type="number" min={1} max={100} value={config.display.full_after_partial_count} onChange={(event) => setDisplay('full_after_partial_count', Number(event.target.value))} /></Field>
-                    <Field label="全刷最大间隔 / 秒" htmlFor="full-age"><Input id="full-age" type="number" min={3600} value={config.display.full_max_age_sec} onChange={(event) => setDisplay('full_max_age_sec', Number(event.target.value))} /></Field>
-                    <Field label="全刷面积阈值 / %" htmlFor="area-threshold"><Input id="area-threshold" type="number" min={10} max={100} value={config.display.full_area_threshold_percent} onChange={(event) => setDisplay('full_area_threshold_percent', Number(event.target.value))} /></Field>
-                  </div>
-                </Panel>
-
-                <Panel>
-                  <PanelTitle icon={BatteryCharging} title="电池阈值" />
-                  <div className="field-grid p-4 sm:p-5">
-                    <Field label="临界 / mV" htmlFor="critical-mv"><Input id="critical-mv" type="number" min={3000} max={4300} value={config.battery.critical_mv} onChange={(event) => setBattery('critical_mv', Number(event.target.value))} /></Field>
-                    <Field label="低电量 / mV" htmlFor="low-mv"><Input id="low-mv" type="number" min={3000} max={4300} value={config.battery.low_mv} onChange={(event) => setBattery('low_mv', Number(event.target.value))} /></Field>
-                    <Field label="恢复 / mV" htmlFor="recovery-mv"><Input id="recovery-mv" type="number" min={3000} max={4300} value={config.battery.recovery_mv} onChange={(event) => setBattery('recovery_mv', Number(event.target.value))} /></Field>
-                  </div>
-                </Panel>
-              </div>
-
-              <div className="mt-4 grid gap-4 lg:grid-cols-[1fr_auto]">
-                <Button variant="signal" size="lg" onClick={patchSystem} disabled={!connected || busy}><LoadingIcon active={operation === 'system.patch'} /><Save /> 暂存系统参数</Button>
-                <Dialog open={resetOpen} onOpenChange={(open) => { setResetOpen(open); if (!open) setResetNonce(null) }}>
-                  <DialogTrigger asChild>
-                    <Button variant="outline" size="lg" disabled={!connected || busy}><Trash2 /> 恢复出厂</Button>
-                  </DialogTrigger>
-                  <DialogContent>
-                    <DialogHeader>
-                      <DialogTitle>恢复出厂</DialogTitle>
-                      <DialogDescription>清除配置、额度快照和全部 BLE bond。</DialogDescription>
-                    </DialogHeader>
-                    {resetNonce ? (
-                      <div className="rounded-lg border border-destructive/25 bg-destructive/7 p-4">
-                        <p className="micro-label text-destructive">PHYSICAL CONFIRMATION</p>
-                        <p className="mt-2 font-display text-lg font-black">按住设备 KEY 2 秒</p>
-                        <p className="mt-2 font-mono text-xs">NONCE {resetNonce} · {resetSeconds}s</p>
-                      </div>
-                    ) : (
-                      <div className="flex items-center gap-3 rounded-lg border border-border bg-muted/55 p-4 text-sm font-semibold"><RotateCcw className="size-5" /> 先生成 30 秒确认码</div>
-                    )}
-                    <DialogFooter>
-                      <DialogClose asChild><Button variant="outline">取消</Button></DialogClose>
-                      {resetNonce ? (
-                        <Button variant="destructive" onClick={commitReset} disabled={busy || resetSeconds <= 0}><LoadingIcon active={operation === 'factory.commit'} />确认擦除</Button>
-                      ) : (
-                        <Button variant="destructive" onClick={prepareReset} disabled={busy}><LoadingIcon active={operation === 'factory.prepare'} />生成确认码</Button>
-                      )}
-                    </DialogFooter>
-                  </DialogContent>
-                </Dialog>
-              </div>
-            </>
-          ) : null}
-        </main>
-      </div>
-
-      {staged ? (
-        <div className="fixed right-3 bottom-[76px] left-3 z-40 flex items-center justify-between gap-3 rounded-lg border border-signal-foreground/25 bg-ink px-4 py-3 text-paper shadow-[5px_5px_0_rgba(0,0,0,.18)] sm:right-5 sm:left-auto sm:min-w-[380px] lg:bottom-5">
-          <div className="flex items-center gap-2.5"><span className="size-2 rounded-full bg-signal" /><div><p className="text-xs font-bold">有未提交更改</p><p className="font-mono text-[9px] text-white/46">STAGING / RAM</p></div></div>
-          <Button variant="signal" size="sm" onClick={commitConfig} disabled={busy}><LoadingIcon active={operation === 'config.commit'} /><Save /> 写入设备</Button>
+              <div className="log-table" ref={logTableRef}>{visibleLogs.map((entry, index) => <div key={`${entry.at}:${entry.scope}:${entry.message}:${index}`}><time>{formatTime(entry.at)}</time><span className={entry.level}>{entry.level}</span><b>{entry.scope}</b><code>{entry.message}</code></div>)}{!visibleLogs.length ? <EmptyState>当前筛选没有日志</EmptyState> : null}</div>
+            </section>
+            <section className="danger-zone">
+              <div><Trash2 /><span><b>恢复出厂</b><small>清除 v3 配置、资源、owner 与全部 bond</small></span></div>
+              <Button variant="destructive" size="sm" disabled={!owner || !!operation} onClick={() => void prepareReset()}>准备恢复</Button>
+            </section>
+          </> : null}
         </div>
-      ) : null}
+      </main>
 
-      <nav className="fixed right-0 bottom-0 left-0 z-30 grid h-[66px] grid-cols-4 border-t border-border bg-background/94 px-1 pb-[env(safe-area-inset-bottom)] backdrop-blur-md lg:hidden">
-        {NAV_ITEMS.map((item) => {
-          const Icon = item.icon
-          const active = view === item.id
-          return (
-            <button key={item.id} type="button" onClick={() => setView(item.id)} className={cn('relative flex cursor-pointer flex-col items-center justify-center gap-1 text-[9px] font-bold transition-colors', active ? 'text-foreground' : 'text-muted-foreground')}>
-              {active ? <span className="absolute top-0 h-[3px] w-8 rounded-b-full bg-foreground" /> : null}
-              <Icon className="size-4" />
-              <span>{item.shortLabel}</span>
-            </button>
-          )
-        })}
-      </nav>
-
-      <Toaster position="top-center" richColors closeButton toastOptions={{ className: 'font-sans text-sm' }} />
+      <Dialog open={detailOpen} onOpenChange={setDetailOpen}><DialogContent><DialogHeader><DialogTitle>资源内容</DialogTitle><DialogDescription>设备返回的完整语义资源</DialogDescription></DialogHeader><pre className="dialog-json">{JSON.stringify(resourceDetail, null, 2)}</pre><DialogFooter><DialogClose asChild><Button variant="outline">关闭</Button></DialogClose></DialogFooter></DialogContent></Dialog>
+      <Dialog open={resetOpen} onOpenChange={setResetOpen}><DialogContent><DialogHeader><DialogTitle>确认恢复出厂</DialogTitle><DialogDescription>输入墨水屏显示的六位确认码。确认后设备会清除 v3 namespace 与全部 bond 并重启。</DialogDescription></DialogHeader><label className="field"><span>六位确认码</span><Input inputMode="numeric" maxLength={6} value={resetCode} onChange={(event) => setResetCode(event.target.value.replace(/\D/g, '').slice(0, 6))} /></label><DialogFooter><DialogClose asChild><Button variant="outline">取消</Button></DialogClose><Button variant="destructive" disabled={resetCode.length !== 6 || !!operation} onClick={() => void perform('reset.commit', () => agentApi.commitFactoryReset(Number(resetCode)), '设备已恢复出厂').then((ok) => ok && setResetOpen(false))}>确认清除</Button></DialogFooter></DialogContent></Dialog>
+      <Toaster position="bottom-right" richColors closeButton />
     </div>
   )
 }

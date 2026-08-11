@@ -18,7 +18,13 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio_stream::wrappers::BroadcastStream;
 
-use crate::{autostart, ble::BleGateway, producer::ProducerRegistry, state::SharedState};
+use crate::{
+    autostart,
+    ble::BleGateway,
+    feishu::{FeishuConfig, FeishuControl},
+    producer::ProducerRegistry,
+    state::SharedState,
+};
 
 include!(concat!(env!("OUT_DIR"), "/embedded_assets.rs"));
 
@@ -27,6 +33,7 @@ pub struct WebContext {
     pub state: Arc<SharedState>,
     pub ble: BleGateway,
     pub producers: ProducerRegistry,
+    pub feishu: FeishuControl,
     auth: Arc<Auth>,
 }
 
@@ -40,11 +47,13 @@ impl WebContext {
         state: Arc<SharedState>,
         ble: BleGateway,
         producers: ProducerRegistry,
+        feishu: FeishuControl,
     ) -> Result<Self> {
         Ok(Self {
             state,
             ble,
             producers,
+            feishu,
             auth: Arc::new(Auth {
                 install_token: load_install_token()?,
                 session_token: random_token(),
@@ -76,6 +85,14 @@ pub fn router(context: WebContext) -> Router {
         .route("/api/v1/device/refresh", post(display_refresh))
         .route("/api/v1/device/restart", post(device_restart))
         .route("/api/v1/producers/{id}/refresh", post(producer_refresh))
+        .route(
+            "/api/v1/producers/feishu.project/config",
+            get(feishu_config_get).put(feishu_config_put),
+        )
+        .route(
+            "/api/v1/producers/feishu.project/test",
+            post(feishu_config_test),
+        )
         .route("/api/v1/agent/pause", post(agent_pause))
         .route("/api/v1/agent/autostart", post(agent_autostart))
         .route("/api/v1/security/enrollment", post(enrollment))
@@ -411,6 +428,52 @@ async fn producer_refresh(
     Ok(Json(json!({ "ok": true, "queued": true })))
 }
 
+async fn feishu_config_get(
+    State(context): State<WebContext>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    authenticate(&context, &headers)?;
+    Ok(Json(
+        json!({ "ok": true, "config": context.feishu.config().await }),
+    ))
+}
+
+async fn feishu_config_put(
+    State(context): State<WebContext>,
+    headers: HeaderMap,
+    Json(config): Json<FeishuConfig>,
+) -> ApiResult<Json<Value>> {
+    mutation_auth(&context, &headers)?;
+    let config = context
+        .feishu
+        .save_config(config)
+        .await
+        .map_err(ApiError::invalid)?;
+    context
+        .state
+        .log("info", "web", "Feishu project configuration saved")
+        .await;
+    Ok(Json(json!({ "ok": true, "config": config })))
+}
+
+async fn feishu_config_test(
+    State(context): State<WebContext>,
+    headers: HeaderMap,
+    Json(config): Json<FeishuConfig>,
+) -> ApiResult<Json<Value>> {
+    mutation_auth(&context, &headers)?;
+    let preview = context
+        .feishu
+        .test_config(config)
+        .await
+        .map_err(ApiError::invalid)?;
+    context
+        .state
+        .log("info", "web", "Feishu project configuration tested")
+        .await;
+    Ok(Json(json!({ "ok": true, "preview": preview })))
+}
+
 #[derive(Deserialize)]
 struct ToggleInput {
     enabled: bool,
@@ -743,6 +806,12 @@ impl ApiError {
         Self {
             status: StatusCode::FORBIDDEN,
             message: message.into(),
+        }
+    }
+    fn invalid(error: impl std::fmt::Display) -> Self {
+        Self {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            message: error.to_string(),
         }
     }
     fn internal(error: impl std::fmt::Display) -> Self {

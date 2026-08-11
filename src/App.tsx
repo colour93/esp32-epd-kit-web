@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import {
   Activity,
   BatteryCharging,
@@ -12,11 +12,13 @@ import {
   Cpu,
   Database,
   Eye,
+  FlaskConical,
   Gauge,
   HardDrive,
   KeyRound,
   LayoutDashboard,
   LoaderCircle,
+  ListChecks,
   MonitorCog,
   Pause,
   Play,
@@ -59,6 +61,8 @@ import {
   type BleCandidate,
   type DeviceConfig,
   type DeviceStatus,
+  type FeishuProjectConfig,
+  type FeishuProjectPreview,
   type JsonObject,
   type PageCapability,
   type ResourceSummary,
@@ -81,6 +85,7 @@ const PHASE_LABELS: Record<string, string> = {
   connected: '已连接', connecting: '连接中', scanning: '扫描中', disconnected: '已断开',
   disconnecting: '断开中', idle: '待命', unavailable: '不可用', paused: '已暂停',
   ready: '正常', starting: '启动中', missing: '未安装',
+  syncing: '同步中', unconfigured: '未配置', disabled: '已停用',
   auth_required: '未登录', degraded: '同步异常',
 }
 
@@ -357,6 +362,88 @@ function NumberField({ label, value, min, max, onChange, disabled }: {
   return (
     <label className="field"><span>{label}</span><Input type="number" min={min} max={max} value={value} disabled={disabled}
       onChange={(event) => onChange(Number(event.target.value))} /></label>
+  )
+}
+
+function FeishuProjectConfigPanel() {
+  const [draft, setDraft] = useState<FeishuProjectConfig | null>(null)
+  const [preview, setPreview] = useState<FeishuProjectPreview | null>(null)
+  const [busy, setBusy] = useState<'load' | 'test' | 'save' | null>('load')
+
+  useEffect(() => {
+    let active = true
+    agentApi.getFeishuProjectConfig()
+      .then(({ config }) => { if (active) setDraft(config) })
+      .catch((error) => { if (active) toast.error(errorText(error)) })
+      .finally(() => { if (active) setBusy(null) })
+    return () => { active = false }
+  }, [])
+
+  async function testDraft() {
+    if (!draft || busy) return
+    setBusy('test')
+    try {
+      const result = await agentApi.testFeishuProjectConfig(draft)
+      setPreview(result.preview)
+      toast.success('Meegle 查询与表达式执行成功')
+    } catch (error) {
+      toast.error(errorText(error))
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  async function saveDraft() {
+    if (!draft || busy) return
+    setBusy('save')
+    try {
+      const result = await agentApi.saveFeishuProjectConfig(draft)
+      setDraft(result.config)
+      toast.success('飞书项目配置已保存')
+    } catch (error) {
+      toast.error(errorText(error))
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  return (
+    <section className="surface feishu-config">
+      <SectionTitle icon={ListChecks} title="飞书项目投影" detail="本机私有配置 · JMESPath"
+        action={<div className="feishu-actions">
+          <Button variant="outline" size="sm" disabled={!draft || !!busy} onClick={() => void testDraft()}>
+            {busy === 'test' ? <LoaderCircle className="spin" /> : <FlaskConical />}测试
+          </Button>
+          <Button size="sm" disabled={!draft || !!busy} onClick={() => void saveDraft()}>
+            {busy === 'save' ? <LoaderCircle className="spin" /> : <Save />}保存
+          </Button>
+        </div>} />
+      {draft ? <>
+        <div className="settings-rows">
+          <div className="setting-toggle"><div><b>启用同步</b><span>{draft.enabled ? '参与定时与电池自动同步' : '保留配置但不执行查询'}</span></div><Switch checked={draft.enabled}
+            onCheckedChange={(enabled) => setDraft({ ...draft, enabled })} /></div>
+        </div>
+        <div className="feishu-fields">
+          <label className="field"><span>展示名</span><Input maxLength={32} value={draft.display_name}
+            onChange={(event) => setDraft({ ...draft, display_name: event.target.value })} /></label>
+          <label className="field feishu-command-field"><span>Meegle CLI 命令</span><textarea spellCheck={false} value={draft.command}
+            placeholder="meegle workitem query ... --format json"
+            onChange={(event) => setDraft({ ...draft, command: event.target.value })} /></label>
+          <div className="field-grid two">
+            <label className="field"><span>主值 JMESPath</span><Input value={draft.value_expression} placeholder="length(data)"
+              onChange={(event) => setDraft({ ...draft, value_expression: event.target.value })} /></label>
+            <label className="field"><span>详情 JMESPath</span><Input value={draft.detail_expression} placeholder="session_id"
+              onChange={(event) => setDraft({ ...draft, detail_expression: event.target.value })} /></label>
+          </div>
+        </div>
+        <div className="feishu-preview">
+          <span>TEST OUTPUT</span>
+          <div><b>{preview?.display_name ?? '尚未测试'}</b><strong>{preview?.value ?? '--'}</strong></div>
+          <p>{preview?.detail ?? '—'}</p>
+          <code>{preview ? `${preview.elapsed_ms}ms · ${preview.output_bytes} bytes` : 'JMESPath preview'}</code>
+        </div>
+      </> : <EmptyState>正在读取飞书项目配置</EmptyState>}
+    </section>
   )
 }
 
@@ -748,13 +835,16 @@ function App() {
           </> : null}
 
           {view === 'producers' ? <>
-            {snapshot.producers.map((producer) => <section className="surface producer-status" key={producer.id}>
-              <SectionTitle icon={Bot} title={producer.title} detail={`${producer.id} · ${producer.resource_keys.join(', ')}`}
-                action={<Button size="sm" disabled={!!operation} onClick={() => void perform(`producer:${producer.id}`, () => agentApi.refreshProducer(producer.id), `${producer.title} 已排队`)}><RefreshCw />立即刷新</Button>} />
-              <div className="account-line"><StatusPill phase={producer.phase} /><div><b>{producer.id === 'codex.usage' ? codexEmail ?? '未识别账号' : producer.title}</b><span>{producer.id === 'codex.usage' ? formatPlanName(codexPlan) : producer.resource_keys.join(', ')}</span></div><div><small>最近同步</small><b>{formatTime(producer.last_sync_at)}</b></div></div>
-              {producer.last_error ? <div className="inline-error"><CircleAlert />{producer.last_error}</div> : null}
-              <pre className="producer-details">{JSON.stringify(producer.details, null, 2)}</pre>
-            </section>)}
+            {snapshot.producers.map((producer) => <Fragment key={producer.id}>
+              <section className="surface producer-status">
+                <SectionTitle icon={Bot} title={producer.title} detail={`${producer.id} · ${producer.resource_keys.join(', ')}`}
+                  action={<Button size="sm" disabled={!!operation} onClick={() => void perform(`producer:${producer.id}`, () => agentApi.refreshProducer(producer.id), `${producer.title} 已排队`)}><RefreshCw />立即刷新</Button>} />
+                <div className="account-line"><StatusPill phase={producer.phase} /><div><b>{producer.id === 'codex.usage' ? codexEmail ?? '未识别账号' : producer.title}</b><span>{producer.id === 'codex.usage' ? formatPlanName(codexPlan) : producer.resource_keys.join(', ')}</span></div><div><small>最近同步</small><b>{formatTime(producer.last_sync_at)}</b></div></div>
+                {producer.last_error ? <div className="inline-error"><CircleAlert />{producer.last_error}</div> : null}
+                <pre className="producer-details">{JSON.stringify(producer.details, null, 2)}</pre>
+              </section>
+              {producer.id === 'feishu.project' ? <FeishuProjectConfigPanel /> : null}
+            </Fragment>)}
             {!snapshot.producers.length ? <section className="surface"><EmptyState>没有已注册 Producer</EmptyState></section> : null}
             {codex ? <section className="surface quota-section">
               <SectionTitle icon={Gauge} title={bucket?.limitName ?? 'Codex 额度'} detail={bucket?.rateLimitReachedType ? `LIMIT: ${bucket.rateLimitReachedType}` : '当前计量窗口'} />

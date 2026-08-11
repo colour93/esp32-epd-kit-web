@@ -109,6 +109,23 @@ export interface ProducerStatus {
   details: JsonObject
 }
 
+export interface FeishuProjectConfig {
+  enabled: boolean
+  display_name: string
+  command: string
+  value_expression: string
+  detail_expression: string
+}
+
+export interface FeishuProjectPreview {
+  source_status: 'ok'
+  display_name: string
+  value: string
+  detail?: string
+  elapsed_ms: number
+  output_bytes: number
+}
+
 export interface LogEntry {
   at: number
   level: 'info' | 'warn' | 'error'
@@ -174,6 +191,17 @@ export const agentApi = {
   refreshProducer: (id: string) => request(`/api/v1/producers/${encodeURIComponent(id)}/refresh`, {
     method: 'POST', body: '{}',
   }),
+  getFeishuProjectConfig: () => request<{ config: FeishuProjectConfig }>(
+    '/api/v1/producers/feishu.project/config',
+  ),
+  saveFeishuProjectConfig: (config: FeishuProjectConfig) => request<{ config: FeishuProjectConfig }>(
+    '/api/v1/producers/feishu.project/config',
+    { method: 'PUT', body: JSON.stringify(config) },
+  ),
+  testFeishuProjectConfig: (config: FeishuProjectConfig) => request<{ preview: FeishuProjectPreview }>(
+    '/api/v1/producers/feishu.project/test',
+    { method: 'POST', body: JSON.stringify(config) },
+  ),
   setPaused: (enabled: boolean) => request('/api/v1/agent/pause', {
     method: 'POST', body: JSON.stringify({ enabled }),
   }),

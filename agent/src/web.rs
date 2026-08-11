@@ -18,7 +18,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio_stream::wrappers::BroadcastStream;
 
-use crate::{autostart, ble::BleGateway, codex::CodexControl, state::SharedState};
+use crate::{autostart, ble::BleGateway, producer::ProducerRegistry, state::SharedState};
 
 include!(concat!(env!("OUT_DIR"), "/embedded_assets.rs"));
 
@@ -26,7 +26,7 @@ include!(concat!(env!("OUT_DIR"), "/embedded_assets.rs"));
 pub struct WebContext {
     pub state: Arc<SharedState>,
     pub ble: BleGateway,
-    pub codex: CodexControl,
+    pub producers: ProducerRegistry,
     auth: Arc<Auth>,
 }
 
@@ -36,11 +36,15 @@ struct Auth {
 }
 
 impl WebContext {
-    pub fn new(state: Arc<SharedState>, ble: BleGateway, codex: CodexControl) -> Result<Self> {
+    pub fn new(
+        state: Arc<SharedState>,
+        ble: BleGateway,
+        producers: ProducerRegistry,
+    ) -> Result<Self> {
         Ok(Self {
             state,
             ble,
-            codex,
+            producers,
             auth: Arc::new(Auth {
                 install_token: load_install_token()?,
                 session_token: random_token(),
@@ -66,12 +70,12 @@ pub fn router(context: WebContext) -> Router {
         .route("/api/v1/device/config", patch(config_patch))
         .route(
             "/api/v1/device/resource",
-            get(resource_get).delete(resource_delete),
+            get(resource_get).put(resource_put).delete(resource_delete),
         )
-        .route("/api/v1/device/view", post(view_set))
+        .route("/api/v1/device/page", post(page_set))
         .route("/api/v1/device/refresh", post(display_refresh))
         .route("/api/v1/device/restart", post(device_restart))
-        .route("/api/v1/codex/refresh", post(codex_refresh))
+        .route("/api/v1/producers/{id}/refresh", post(producer_refresh))
         .route("/api/v1/agent/pause", post(agent_pause))
         .route("/api/v1/agent/autostart", post(agent_autostart))
         .route("/api/v1/security/enrollment", post(enrollment))
@@ -267,6 +271,30 @@ struct ResourceQuery {
     key: String,
 }
 
+#[derive(Deserialize)]
+struct ResourcePutInput {
+    resource: Value,
+}
+
+async fn resource_put(
+    State(context): State<WebContext>,
+    headers: HeaderMap,
+    Json(input): Json<ResourcePutInput>,
+) -> ApiResult<Json<Value>> {
+    mutation_auth(&context, &headers)?;
+    if context.state.snapshot().await.device.role.as_deref() != Some("owner") {
+        return Err(ApiError::forbidden("owner role is required"));
+    }
+    let result = context
+        .ble
+        .request("resource.put", json!({ "resource": input.resource }))
+        .await
+        .map_err(ApiError::internal)?;
+    reload_device(&context).await.map_err(ApiError::internal)?;
+    context.state.log("info", "web", "resource published").await;
+    Ok(Json(json!({ "ok": true, "result": result })))
+}
+
 async fn resource_get(
     State(context): State<WebContext>,
     headers: HeaderMap,
@@ -298,32 +326,25 @@ async fn resource_delete(
 }
 
 #[derive(Deserialize)]
-struct ViewInput {
-    renderer_id: String,
-    resource_key: String,
+struct PageInput {
+    page: Value,
 }
 
-async fn view_set(
+async fn page_set(
     State(context): State<WebContext>,
     headers: HeaderMap,
-    Json(input): Json<ViewInput>,
+    Json(input): Json<PageInput>,
 ) -> ApiResult<Json<Value>> {
     mutation_auth(&context, &headers)?;
     let result = context
         .ble
-        .request(
-            "view.set",
-            json!({
-                "renderer_id": input.renderer_id,
-                "resource_key": input.resource_key,
-            }),
-        )
+        .request("page.set", json!({ "page": input.page }))
         .await
         .map_err(ApiError::internal)?;
     reload_device(&context).await.map_err(ApiError::internal)?;
     context
         .state
-        .log("info", "web", "active renderer and resource updated")
+        .log("info", "web", "active page bindings updated")
         .await;
     Ok(Json(json!({ "ok": true, "result": result })))
 }
@@ -372,15 +393,20 @@ async fn device_restart(
     Ok(Json(json!({ "ok": true, "result": result })))
 }
 
-async fn codex_refresh(
+async fn producer_refresh(
     State(context): State<WebContext>,
+    Path(id): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     mutation_auth(&context, &headers)?;
-    context.codex.refresh().await.map_err(ApiError::internal)?;
+    context
+        .producers
+        .refresh(&id)
+        .await
+        .map_err(ApiError::internal)?;
     context
         .state
-        .log("info", "web", "manual Codex refresh queued")
+        .log("info", "web", format!("producer {id} refresh queued"))
         .await;
     Ok(Json(json!({ "ok": true, "queued": true })))
 }

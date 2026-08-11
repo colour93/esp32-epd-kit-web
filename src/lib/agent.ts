@@ -21,13 +21,26 @@ export interface DeviceConfig {
     full_max_age_sec: number
     full_area_threshold_percent: number
   }
-  view: { renderer_id: string; resource_key: string }
+  page: { id: string; bindings: Record<string, string> }
 }
 
-export interface RendererCapability {
+export interface PageSlotCapability {
   id: string
-  schema_id: string
-  schema_version: number
+  status: 'active' | 'reserved'
+  required: boolean
+  schema_id?: string
+  schema_version?: number
+}
+
+export interface PageCapability {
+  id: string
+  title: string
+  slots: PageSlotCapability[]
+  timed_regions: Array<{
+    id: string
+    interval_sec: number
+    bounds: { x: number; y: number; width: number; height: number }
+  }>
 }
 
 export interface DeviceStatus {
@@ -44,11 +57,12 @@ export interface DeviceStatus {
   mtu?: number
   config?: DeviceConfig
   capabilities?: {
-    renderers?: RendererCapability[]
+    pages?: PageCapability[]
     battery?: boolean
     io12?: boolean
     max_resources?: number
     max_resource_payload_bytes?: number
+    max_page_bindings?: number
   }
   resources: ResourceSummary[]
   bonds: Bond[]
@@ -84,16 +98,15 @@ export interface Bond {
   role: 'owner' | 'trusted'
 }
 
-export interface CodexStatus {
+export interface ProducerStatus {
+  id: string
+  title: string
   phase: string
-  account_type?: string
-  email?: string
-  plan_type?: string
-  codex_path?: string
+  resource_keys: string[]
   last_sync_at?: number
   next_sync_at?: number
   last_error?: string
-  rate_limits?: JsonObject
+  details: JsonObject
 }
 
 export interface LogEntry {
@@ -106,7 +119,7 @@ export interface LogEntry {
 export interface Snapshot {
   agent: AgentStatus
   device: DeviceStatus
-  codex: CodexStatus
+  producers: ProducerStatus[]
   logs: LogEntry[]
 }
 
@@ -158,7 +171,9 @@ export const agentApi = {
     method: 'POST', body: JSON.stringify({ mode }),
   }),
   restartDevice: () => request('/api/v1/device/restart', { method: 'POST', body: '{}' }),
-  refreshCodex: () => request('/api/v1/codex/refresh', { method: 'POST', body: '{}' }),
+  refreshProducer: (id: string) => request(`/api/v1/producers/${encodeURIComponent(id)}/refresh`, {
+    method: 'POST', body: '{}',
+  }),
   setPaused: (enabled: boolean) => request('/api/v1/agent/pause', {
     method: 'POST', body: JSON.stringify({ enabled }),
   }),
@@ -179,8 +194,11 @@ export const agentApi = {
   deleteResource: (key: string) => request(`/api/v1/device/resource?key=${encodeURIComponent(key)}`, {
     method: 'DELETE',
   }),
-  setView: (rendererId: string, resourceKey: string) => request('/api/v1/device/view', {
-    method: 'POST', body: JSON.stringify({ renderer_id: rendererId, resource_key: resourceKey }),
+  putResource: (resource: JsonObject) => request('/api/v1/device/resource', {
+    method: 'PUT', body: JSON.stringify({ resource }),
+  }),
+  setPage: (page: { id: string; bindings: Record<string, string> }) => request('/api/v1/device/page', {
+    method: 'POST', body: JSON.stringify({ page }),
   }),
   prepareFactoryReset: () => request<{ result: { expires_in_sec: number } }>('/api/v1/factory/prepare', {
     method: 'POST', body: '{}',

@@ -15,30 +15,33 @@ use tokio::{
 };
 
 use crate::{
-    ble::BleGateway,
+    producer::{ProducerContext, ProducerControl, ProducerManifest, ProducerTrigger},
+    publisher::{ResourcePublisher, SemanticResource},
     state::{SharedState, unix_now},
 };
 
 const RESOURCE_TTL_SEC: u64 = 600;
-const RESOURCE_HEARTBEAT_SEC: u64 = 300;
+pub static MANIFEST: ProducerManifest = ProducerManifest {
+    id: "codex.usage",
+    title: "Codex Usage",
+    resource_keys: &["codex/default"],
+    auto_sync: true,
+};
 
 #[derive(Clone)]
 pub struct CodexControl {
-    trigger: mpsc::Sender<()>,
+    trigger: mpsc::Sender<ProducerTrigger>,
 }
 
 impl CodexControl {
-    pub fn spawn(state: Arc<SharedState>, ble: BleGateway) -> Self {
+    pub fn spawn(context: ProducerContext) -> Self {
         let (trigger, receiver) = mpsc::channel(8);
-        tokio::spawn(supervisor(state, ble, receiver));
+        tokio::spawn(supervisor(context.state, context.publisher, receiver));
         Self { trigger }
     }
 
-    pub async fn refresh(&self) -> Result<()> {
-        self.trigger
-            .send(())
-            .await
-            .map_err(|_| anyhow!("Codex supervisor stopped"))
+    pub fn control(&self) -> ProducerControl {
+        ProducerControl::new(&MANIFEST, self.trigger.clone())
     }
 }
 
@@ -167,8 +170,11 @@ impl Drop for AppServer {
     }
 }
 
-async fn supervisor(state: Arc<SharedState>, ble: BleGateway, mut manual: mpsc::Receiver<()>) {
-    let mut device_events = ble.subscribe();
+async fn supervisor(
+    state: Arc<SharedState>,
+    publisher: ResourcePublisher,
+    mut manual: mpsc::Receiver<ProducerTrigger>,
+) {
     let mut restart_backoff = 1u64;
     state.log("info", "codex", "Codex supervisor started").await;
     loop {
@@ -179,7 +185,7 @@ async fn supervisor(state: Arc<SharedState>, ble: BleGateway, mut manual: mpsc::
                 state
                     .log("warn", "codex", format!("{error}; checking again in 30s"))
                     .await;
-                tokio::time::sleep(Duration::from_secs(30)).await;
+                wait_before_restart(&publisher, &mut manual, 30).await;
                 continue;
             }
         };
@@ -191,17 +197,17 @@ async fn supervisor(state: Arc<SharedState>, ble: BleGateway, mut manual: mpsc::
             )
             .await;
         state
-            .update_codex(|codex| {
-                codex.phase = "starting".into();
-                codex.codex_path = Some(path.display().to_string());
-                codex.last_error = None;
+            .update_producer(MANIFEST.id, |producer| {
+                producer.phase = "starting".into();
+                producer.details["codex_path"] = json!(path.display().to_string());
+                producer.last_error = None;
             })
             .await;
         match AppServer::start(&path, state.clone()).await {
             Ok(mut server) => {
                 restart_backoff = 1;
                 if let Err(error) =
-                    run_connected(&state, &ble, &mut server, &mut manual, &mut device_events).await
+                    run_connected(&state, &publisher, &mut server, &mut manual).await
                 {
                     set_codex_error(&state, "unavailable", error.to_string()).await;
                     state.log("error", "codex", error.to_string()).await;
@@ -219,17 +225,31 @@ async fn supervisor(state: Arc<SharedState>, ble: BleGateway, mut manual: mpsc::
                 format!("restarting app-server in {restart_backoff}s"),
             )
             .await;
-        tokio::time::sleep(Duration::from_secs(restart_backoff)).await;
+        wait_before_restart(&publisher, &mut manual, restart_backoff).await;
         restart_backoff = (restart_backoff * 2).min(60);
+    }
+}
+
+async fn wait_before_restart(
+    publisher: &ResourcePublisher,
+    triggers: &mut mpsc::Receiver<ProducerTrigger>,
+    delay_sec: u64,
+) {
+    tokio::select! {
+        _ = tokio::time::sleep(Duration::from_secs(delay_sec)) => {}
+        trigger = triggers.recv() => {
+            if let Some(ProducerTrigger::SyncCycle(cycle_id)) = trigger {
+                let _ = publisher.complete_cycle(cycle_id, MANIFEST.id, false).await;
+            }
+        }
     }
 }
 
 async fn run_connected(
     state: &SharedState,
-    ble: &BleGateway,
+    publisher: &ResourcePublisher,
     server: &mut AppServer,
-    manual: &mut mpsc::Receiver<()>,
-    device_events: &mut tokio::sync::broadcast::Receiver<String>,
+    manual: &mut mpsc::Receiver<ProducerTrigger>,
 ) -> Result<()> {
     let mut auth_status_logged = false;
     loop {
@@ -258,22 +278,20 @@ async fn run_connected(
             .to_owned();
         let supported = matches!(account_type.as_str(), "chatgpt" | "chatgptAuthTokens");
         state
-            .update_codex(|codex| {
-                codex.phase = if supported {
+            .update_producer(MANIFEST.id, |producer| {
+                producer.phase = if supported {
                     "ready".into()
                 } else {
                     "auth_required".into()
                 };
-                codex.account_type = Some(account_type.clone());
-                codex.email = account_value
-                    .get("email")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
-                codex.plan_type = account_value
+                producer.details["account_type"] = json!(account_type.clone());
+                producer.details["email"] =
+                    account_value.get("email").cloned().unwrap_or(Value::Null);
+                producer.details["plan_type"] = account_value
                     .get("planType")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
-                codex.last_error = if supported {
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                producer.last_error = if supported {
                     None
                 } else {
                     Some("请先在 Codex 中登录 ChatGPT 账号".into())
@@ -302,39 +320,30 @@ async fn run_connected(
         }
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(30)) => {}
-            _ = manual.recv() => {}
+            trigger = manual.recv() => {
+                if let Some(ProducerTrigger::SyncCycle(cycle_id)) = trigger {
+                    publisher.complete_cycle(cycle_id, MANIFEST.id, false).await?;
+                }
+            }
             notification = server.next_notification() => { notification?; }
         }
     }
 
-    // The initial read already covers connection and key events queued while
-    // app-server authentication was in progress.
-    loop {
-        match device_events.try_recv() {
-            Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
-            Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
-        }
-    }
-
     let mut delay = 0u64;
-    let mut sent_payload_hash = None;
-    let mut last_ble_write_at = None;
     let mut reason = "startup";
     loop {
+        let mut cycle_id = None;
         if delay > 0 {
             reason = tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(delay)) => "poll",
-                _ = manual.recv() => "manual",
-                event = device_events.recv() => {
-                    match event.as_deref() {
-                        Ok("ble.connected") => {
-                            sent_payload_hash = None;
-                            last_ble_write_at = None;
-                            "ble.connected"
+                trigger = manual.recv() => {
+                    match trigger {
+                        Some(ProducerTrigger::Manual) => "manual",
+                        Some(ProducerTrigger::SyncCycle(id)) => {
+                            cycle_id = Some(id);
+                            "sync_cycle"
                         }
-                        Ok("input.key") => "input.key",
-                        _ => continue,
+                        None => return Err(anyhow!("producer control channel closed")),
                     }
                 }
                 notification = server.next_notification() => {
@@ -350,23 +359,21 @@ async fn run_connected(
                 format!("reading rate limits; reason={reason}"),
             )
             .await;
-        let result = sync_once(
-            state,
-            ble,
-            server,
-            &mut sent_payload_hash,
-            &mut last_ble_write_at,
-        )
-        .await;
+        let result = sync_once(state, publisher, server).await;
+        if let Some(cycle_id) = cycle_id {
+            publisher
+                .complete_cycle(cycle_id, MANIFEST.id, result.is_ok())
+                .await?;
+        }
         match result {
             Ok(()) => delay = 60,
             Err(error) => {
                 delay = if delay == 0 { 60 } else { (delay * 2).min(900) };
                 state
-                    .update_codex(|codex| {
-                        codex.phase = "degraded".into();
-                        codex.last_error = Some(error.to_string());
-                        codex.next_sync_at = Some(unix_now() + delay);
+                    .update_producer(MANIFEST.id, |producer| {
+                        producer.phase = "degraded".into();
+                        producer.last_error = Some(error.to_string());
+                        producer.next_sync_at = Some(unix_now() + delay);
                     })
                     .await;
                 state.log("warn", "codex", error.to_string()).await;
@@ -377,10 +384,8 @@ async fn run_connected(
 
 async fn sync_once(
     state: &SharedState,
-    ble: &BleGateway,
+    publisher: &ResourcePublisher,
     server: &mut AppServer,
-    sent_payload_hash: &mut Option<u32>,
-    last_ble_write_at: &mut Option<u64>,
 ) -> Result<()> {
     let started = Instant::now();
     state
@@ -412,7 +417,14 @@ async fn sync_once(
         .and_then(Value::as_object)
         .map(|items| items.values().cloned().collect::<Vec<_>>())
         .unwrap_or_else(|| vec![selected.clone()]);
-    let account_plan = state.snapshot().await.codex.plan_type;
+    let snapshot = state.snapshot().await;
+    let account_plan = snapshot
+        .producers
+        .iter()
+        .find(|producer| producer.id == MANIFEST.id)
+        .and_then(|producer| producer.details.get("plan_type"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     let plan_type = selected
         .get("planType")
         .and_then(Value::as_str)
@@ -427,106 +439,25 @@ async fn sync_once(
         "limits": limits.iter().map(normalize_bucket).collect::<Vec<_>>(),
         "rate_limit_reset_credits": rate_limits.get("rateLimitResetCredits").cloned().unwrap_or(Value::Null),
     });
-    let payload_hash = crc32fast::hash(&serde_json::to_vec(&payload)?);
-    let snapshot = state.snapshot().await;
-    let current_revision = snapshot
-        .device
-        .resources
-        .iter()
-        .find(|item| item.get("key").and_then(Value::as_str) == Some("codex/default"))
-        .and_then(|item| item.get("revision"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
     let now = unix_now();
-    let revision = now.max(current_revision.saturating_add(1));
-    let resource = json!({
-        "key": "codex/default",
-        "schema_id": "codex.rate_limits",
-        "schema_version": 1,
-        "revision": revision,
-        "updated_at": now,
-        "ttl_sec": RESOURCE_TTL_SEC,
-        "persistence": "snapshot",
-        "payload": payload,
-    });
-    let heartbeat_due =
-        last_ble_write_at.is_none_or(|last| now.saturating_sub(last) >= RESOURCE_HEARTBEAT_SEC);
-    let should_write = *sent_payload_hash != Some(payload_hash) || heartbeat_due;
-    let mut synchronized = false;
-    if should_write {
-        if ble.is_connected() {
-            ble.request("resource.put", json!({ "resource": resource }))
-                .await
-                .context("sync quota resource over BLE")?;
-            *sent_payload_hash = Some(payload_hash);
-            *last_ble_write_at = Some(now);
-            synchronized = true;
-            state
-                .log(
-                    "info",
-                    "codex",
-                    format!(
-                        "quota resource synchronized; revision={revision} hash={payload_hash:08x}"
-                    ),
-                )
-                .await;
-            if let Ok(resources) = ble.request("resource.list", json!({})).await {
-                state
-                    .update_device(|device| {
-                        device.resources = resources
-                            .get("resources")
-                            .and_then(Value::as_array)
-                            .cloned()
-                            .unwrap_or_default();
-                    })
-                    .await;
-            }
-        } else {
-            state
-                .log("info", "ble", "quota cached until device reconnects")
-                .await;
-        }
-    } else {
-        state
-            .log(
-                "info",
-                "codex",
-                format!("quota resource unchanged; hash={payload_hash:08x}"),
-            )
-            .await;
-    }
-    let battery_auto_session = snapshot.device.connection_mode == "auto"
-        && snapshot
-            .device
-            .config
-            .as_ref()
-            .and_then(|config| config.get("power"))
-            .and_then(|power| power.get("profile"))
-            .and_then(Value::as_str)
-            == Some("battery");
-    if synchronized && battery_auto_session {
-        let result = ble.request("system.sync.complete", json!({})).await?;
-        state
-            .log(
-                "info",
-                "ble",
-                format!(
-                    "battery sync complete; sleep_scheduled={}",
-                    result
-                        .get("sleep_scheduled")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false)
-                ),
-            )
-            .await;
-    }
+    publisher
+        .publish(SemanticResource {
+            producer_id: MANIFEST.id,
+            key: "codex/default",
+            schema_id: "codex.rate_limits",
+            schema_version: 1,
+            ttl_sec: RESOURCE_TTL_SEC,
+            persistence: "snapshot",
+            payload,
+        })
+        .await?;
     state
-        .update_codex(|codex| {
-            codex.phase = "ready".into();
-            codex.last_sync_at = Some(now);
-            codex.next_sync_at = Some(now + 60);
-            codex.last_error = None;
-            codex.rate_limits = Some(rate_limits.clone());
+        .update_producer(MANIFEST.id, |producer| {
+            producer.phase = "ready".into();
+            producer.last_sync_at = Some(now);
+            producer.next_sync_at = Some(now + 60);
+            producer.last_error = None;
+            producer.details["rate_limits"] = rate_limits.clone();
         })
         .await;
     state
@@ -564,9 +495,9 @@ fn normalize_window(value: Option<&Value>) -> Value {
 
 async fn set_codex_error(state: &SharedState, phase: &str, error: String) {
     state
-        .update_codex(|codex| {
-            codex.phase = phase.into();
-            codex.last_error = Some(error);
+        .update_producer(MANIFEST.id, |producer| {
+            producer.phase = phase.into();
+            producer.last_error = Some(error);
         })
         .await;
 }

@@ -340,7 +340,7 @@ async fn supervisor(
                         "info",
                         "ble",
                         format!(
-                            "BLE v3 session ready; frame payload {} bytes",
+                            "BLE v4 session ready; frame payload {} bytes",
                             session.frame_bytes
                         ),
                     )
@@ -583,18 +583,18 @@ async fn connect(
         .iter()
         .find(|item| item.uuid == protocol::RX_UUID)
         .cloned()
-        .ok_or_else(|| anyhow!("BLE v3 RX characteristic not found"))?;
+        .ok_or_else(|| anyhow!("BLE v4 RX characteristic not found"))?;
     let tx = characteristics
         .iter()
         .find(|item| item.uuid == protocol::TX_UUID)
         .cloned()
-        .ok_or_else(|| anyhow!("BLE v3 TX characteristic not found"))?;
+        .ok_or_else(|| anyhow!("BLE v4 TX characteristic not found"))?;
     peripheral
         .subscribe(&tx)
         .await
-        .context("subscribe BLE v3 indications")?;
+        .context("subscribe BLE v4 indications")?;
     state
-        .log("info", "ble", "subscribed to BLE v3 indications")
+        .log("info", "ble", "subscribed to BLE v4 indications")
         .await;
     let notifications = peripheral
         .notifications()
@@ -665,7 +665,7 @@ async fn discover(
                 .local_name
                 .as_deref()
                 .is_some_and(|name| name.starts_with("EPD-KIT-"))
-                && advertisement.protocol_major.is_none_or(|major| major == 3);
+                && advertisement.protocol_major.is_none_or(|major| major == 4);
             let identity = peripheral.id().to_string();
             observed.insert(identity.clone());
             if matches_service || matches_name {
@@ -738,7 +738,7 @@ async fn discover(
                             let mut matches = candidates.values().filter(|candidate| {
                                 candidate.name == target.name
                                     && (candidate.advertises_service
-                                        || candidate.protocol_major == Some(3))
+                                        || candidate.protocol_major == Some(4))
                             });
                             let candidate = matches.next();
                             candidate.filter(|_| matches.next().is_none())
@@ -800,7 +800,7 @@ async fn discover(
                 );
             }
             bail!(
-                "no EPD-KIT BLE v3 device found after 15s ({} peripherals observed)",
+                "no EPD-KIT BLE v4 device found after 15s ({} peripherals observed)",
                 observed.len()
             );
         }
@@ -814,9 +814,12 @@ async fn prime_session(
     device_events: &broadcast::Sender<String>,
 ) -> Result<()> {
     state
-        .log("info", "ble", "initializing BLE v3 session")
+        .log("info", "ble", "initializing BLE v4 session")
         .await;
     let hello = transact(state, session, device_events, "system.hello", json!({})).await?;
+    if hello.get("protocol_major").and_then(Value::as_u64) != Some(4) {
+        bail!("device does not implement BLE protocol v4");
+    }
     if let Some(name) = hello.get("device_name").and_then(Value::as_str) {
         session.device_name = name.to_owned();
     }

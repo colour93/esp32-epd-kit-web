@@ -60,18 +60,19 @@ import {
   type DeviceConfig,
   type DeviceStatus,
   type JsonObject,
+  type PageCapability,
   type ResourceSummary,
   type Snapshot,
 } from './lib/agent'
 
-type View = 'overview' | 'hardware' | 'resources' | 'codex' | 'security' | 'diagnostics'
+type View = 'overview' | 'hardware' | 'resources' | 'producers' | 'security' | 'diagnostics'
 type LogLevel = 'all' | 'info' | 'warn' | 'error'
 
 const NAV_ITEMS: Array<{ id: View; label: string; icon: LucideIcon }> = [
   { id: 'overview', label: '概览', icon: LayoutDashboard },
   { id: 'hardware', label: '硬件与功耗', icon: SlidersHorizontal },
   { id: 'resources', label: '资源与视图', icon: Database },
-  { id: 'codex', label: 'Codex', icon: Bot },
+  { id: 'producers', label: '数据源', icon: Bot },
   { id: 'security', label: '受信主机', icon: ShieldCheck },
   { id: 'diagnostics', label: '诊断', icon: Activity },
 ]
@@ -169,7 +170,7 @@ function connectionErrorText(error: string) {
   if (error.includes('selected EPD-KIT device') && error.includes('was not found')) {
     return '所选设备已离开广播范围，请重新扫描。'
   }
-  if (error.includes('no EPD-KIT BLE v3 device found')) {
+  if (error.includes('no EPD-KIT BLE v4 device found')) {
     return '本轮扫描未发现 EPD-KIT 设备，请确认设备供电；若刚发生配对错误，请重启设备后重新扫描。'
   }
   return error
@@ -197,7 +198,7 @@ function CandidateRow({ candidate, selected, connecting, disabled, onConnect }: 
       </div>
       <div className="candidate-meta">
         <b>{candidate.rssi === undefined ? '—' : `${candidate.rssi} dBm`}</b>
-        <span>{candidate.owned === true ? '已有 Owner' : candidate.owned === false ? '待设置 Owner' : candidate.advertises_service ? 'v3 service' : 'name match'}</span>
+        <span>{candidate.owned === true ? '已有 Owner' : candidate.owned === false ? '待设置 Owner' : candidate.advertises_service ? 'v4 service' : 'name match'}</span>
       </div>
       <Button variant={selected ? 'signal' : 'outline'} size="sm" disabled={disabled} onClick={onConnect}>
         {connecting ? <LoaderCircle className="spin" /> : <Bluetooth />}
@@ -303,10 +304,18 @@ interface LimitBucket {
 }
 
 function getCodexBucket(snapshot: Snapshot | null): LimitBucket | null {
-  const raw = snapshot?.codex.rate_limits
+  const raw = snapshot?.producers.find((producer) => producer.id === 'codex.usage')?.details.rate_limits as JsonObject | undefined
   if (!raw) return null
   const byId = raw.rateLimitsByLimitId as Record<string, LimitBucket> | undefined
   return byId?.codex ?? raw.rateLimits as LimitBucket | undefined ?? null
+}
+
+function compatibleResources(page: PageCapability | undefined, slotId: string, resources: ResourceSummary[]) {
+  const slot = page?.slots.find((item) => item.id === slotId)
+  if (!slot || slot.status !== 'active') return []
+  return resources.filter((resource) => (
+    resource.schema_id === slot.schema_id && resource.schema_version === slot.schema_version
+  ))
 }
 
 function formatPlanName(value?: string) {
@@ -351,6 +360,17 @@ function NumberField({ label, value, min, max, onChange, disabled }: {
   )
 }
 
+const RESOURCE_TEMPLATE = JSON.stringify({
+  key: 'example/default',
+  schema_id: 'example.card',
+  schema_version: 1,
+  revision: 1,
+  updated_at: Math.floor(Date.now() / 1000),
+  ttl_sec: 600,
+  persistence: 'snapshot',
+  payload: {},
+}, null, 2)
+
 function App() {
   const [view, setView] = useState<View>('overview')
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null)
@@ -358,8 +378,9 @@ function App() {
   const [bootError, setBootError] = useState<string | null>(null)
   const [streamDown, setStreamDown] = useState(false)
   const [operation, setOperation] = useState<string | null>(null)
-  const [viewRenderer, setViewRenderer] = useState('')
-  const [viewResource, setViewResource] = useState('')
+  const [pageId, setPageId] = useState('')
+  const [pageBindings, setPageBindings] = useState<Record<string, string>>({})
+  const [resourceEditor, setResourceEditor] = useState(RESOURCE_TEMPLATE)
   const [resourceDetail, setResourceDetail] = useState<JsonObject | null>(null)
   const [detailOpen, setDetailOpen] = useState(false)
   const [enrollmentUntil, setEnrollmentUntil] = useState(0)
@@ -395,8 +416,8 @@ function App() {
   useEffect(() => {
     if (!config) return
     setConfigDraft(structuredClone(config))
-    setViewRenderer(config.view.renderer_id)
-    setViewResource(config.view.resource_key)
+    setPageId(config.page.id)
+    setPageBindings({ ...config.page.bindings })
   }, [config?.revision])
 
   async function perform(key: string, action: () => Promise<unknown>, success: string, refresh = false) {
@@ -415,11 +436,19 @@ function App() {
     }
   }
 
-  const bucket = useMemo(() => getCodexBucket(snapshot), [snapshot?.codex.rate_limits])
+  const codex = snapshot?.producers.find((producer) => producer.id === 'codex.usage')
+  const codexPlan = typeof codex?.details.plan_type === 'string' ? codex.details.plan_type : undefined
+  const codexEmail = typeof codex?.details.email === 'string' ? codex.details.email : undefined
+  const codexPath = typeof codex?.details.codex_path === 'string' ? codex.details.codex_path : undefined
+  const bucket = useMemo(() => getCodexBucket(snapshot), [codex?.details.rate_limits])
   const connected = snapshot?.device.phase === 'connected'
   const owner = snapshot?.device.role === 'owner'
-  const renderers = snapshot?.device.capabilities?.renderers ?? []
+  const pages = snapshot?.device.capabilities?.pages ?? []
   const resources = snapshot?.device.resources ?? []
+  const selectedPage = pages.find((item) => item.id === pageId)
+  const requiredBindingsReady = selectedPage?.slots.every((slot) => (
+    slot.status !== 'active' || !slot.required || Boolean(pageBindings[slot.id])
+  )) ?? false
   const page = NAV_ITEMS.find((item) => item.id === view) ?? NAV_ITEMS[0]
   const logScopes = useMemo(
     () => Array.from(new Set((snapshot?.logs ?? []).map((entry) => entry.scope))).sort(),
@@ -460,6 +489,39 @@ function App() {
       setResourceDetail(response.result.resource)
       setDetailOpen(true)
     }, '资源已读取')) return
+  }
+
+  async function editResource(resource: ResourceSummary) {
+    await perform(`edit:${resource.key}`, async () => {
+      const response = await agentApi.getResource(resource.key)
+      setResourceEditor(JSON.stringify(response.result.resource, null, 2))
+    }, '资源已载入编辑器')
+  }
+
+  function choosePage(id: string) {
+    const capability = pages.find((item) => item.id === id)
+    const bindings: Record<string, string> = {}
+    for (const slot of capability?.slots ?? []) {
+      if (slot.status !== 'active') continue
+      const compatible = compatibleResources(capability, slot.id, resources)
+      const current = config?.page.bindings[slot.id]
+      bindings[slot.id] = compatible.some((resource) => resource.key === current)
+        ? current ?? ''
+        : slot.required ? compatible[0]?.key ?? '' : ''
+    }
+    setPageId(id)
+    setPageBindings(bindings)
+  }
+
+  async function publishEditedResource() {
+    let resource: JsonObject
+    try {
+      resource = JSON.parse(resourceEditor) as JsonObject
+    } catch {
+      toast.error('资源 JSON 格式无效')
+      return
+    }
+    await perform('resource.put', () => agentApi.putResource(resource), '资源已发布', true)
   }
 
   async function openEnrollment() {
@@ -517,7 +579,7 @@ function App() {
       <aside className="sidebar">
         <div className="brand">
           <div className="brand-mark"><span /><span /><span /></div>
-          <div><strong>EPD KIT</strong><small>BLE v3 AGENT</small></div>
+          <div><strong>EPD KIT</strong><small>BLE v4 AGENT</small></div>
         </div>
         <nav aria-label="工作台导航">
           {NAV_ITEMS.map(({ id, label, icon: Icon }) => (
@@ -528,7 +590,7 @@ function App() {
         </nav>
         <div className="sidebar-state">
           <div><Bluetooth /><span>DEVICE</span><StatusPill phase={snapshot.device.phase} /></div>
-          <div><Bot /><span>CODEX</span><StatusPill phase={snapshot.codex.phase} /></div>
+          <div><Bot /><span>PRODUCERS</span><StatusPill phase={snapshot.producers.every((producer) => producer.phase === 'ready') ? 'ready' : 'starting'} /></div>
         </div>
         <div className="agent-version">AGENT {snapshot.agent.version}<br />{snapshot.agent.platform.toUpperCase()}</div>
       </aside>
@@ -564,31 +626,31 @@ function App() {
             <div className="metrics-grid">
               <Metric label="BLE 设备" value={PHASE_LABELS[snapshot.device.phase] ?? snapshot.device.phase}
                 detail={snapshot.device.name ?? '等待发现 EPD-KIT'} icon={Bluetooth} tone={connected ? 'green' : 'red'} />
-              <Metric label="Codex" value={PHASE_LABELS[snapshot.codex.phase] ?? snapshot.codex.phase}
-                detail={snapshot.codex.plan_type ? formatPlanName(snapshot.codex.plan_type) : snapshot.codex.last_error ?? '等待账号状态'} icon={Bot} tone={snapshot.codex.phase === 'ready' ? 'cyan' : 'default'} />
-              <Metric label="同步" value={formatAge(snapshot.codex.last_sync_at)}
-                detail={`下一次 ${formatTime(snapshot.codex.next_sync_at)}`} icon={Clock3} />
+              <Metric label="Producer" value={`${snapshot.producers.filter((producer) => producer.phase === 'ready').length} / ${snapshot.producers.length}`}
+                detail={codex?.last_error ?? '编译期 Producer Registry'} icon={Bot} tone={snapshot.producers.every((producer) => producer.phase === 'ready') ? 'cyan' : 'default'} />
+              <Metric label="同步" value={formatAge(codex?.last_sync_at)}
+                detail={`下一次 ${formatTime(codex?.next_sync_at)}`} icon={Clock3} />
               <Metric label="资源" value={String(resources.length)}
-                detail={`${config?.view.renderer_id ?? '无 renderer'} / rev ${config?.revision ?? '—'}`} icon={Database} />
+                detail={`${config?.page.id ?? '无 page'} / rev ${config?.revision ?? '—'}`} icon={Database} />
             </div>
             <div className="overview-grid">
               <section className="surface epd-module">
-                <SectionTitle icon={MonitorCog} title="当前墨水屏视图" detail={config?.view.resource_key ?? '未选择资源'}
+                <SectionTitle icon={MonitorCog} title="当前墨水屏页面" detail={`${config?.page.id ?? '未选择'} · ${Object.values(config?.page.bindings ?? {}).join(', ')}`}
                   action={<Button size="sm" disabled={!connected || !!operation} onClick={() => void perform('display', () => agentApi.refreshDisplay('auto'), '刷新已排队')}><RefreshCw />刷新</Button>} />
                 <div className="epd-frame">
                   <div className="epd-screen">
                     <div className="epd-top">
-                      <div className="epd-brand"><b>Codex</b><i>-</i><span>{formatPlanName(bucket?.planType ?? snapshot.codex.plan_type)}</span></div>
+                      <div className="epd-brand"><b>{config?.page.id === 'home' ? new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) : 'Codex'}</b><i>-</i><span>{formatPlanName(bucket?.planType ?? codexPlan)}</span></div>
                       <div className="epd-indicators">{configDraft?.hardware.battery.enabled ? <small>--%</small> : null}<i className={connected ? 'connected' : ''} /></div>
                     </div>
                     <div className="epd-rule" />
                     <div className="epd-quotas"><QuotaWindow title={formatWindowName(bucket?.primary)} window={bucket?.primary} /><QuotaWindow title={formatWindowName(bucket?.secondary)} window={bucket?.secondary} /></div>
-                    <div className="epd-bottom"><b>{snapshot.codex.phase === 'ready' ? '同步正常' : '数据保留'}</b><span>更新 {formatTime(snapshot.codex.last_sync_at)}</span></div>
+                    <div className="epd-bottom"><b>{codex?.phase === 'ready' ? '同步正常' : '数据保留'}</b><span>{config?.page.id === 'home' ? '飞书项目 未配置' : `更新 ${formatTime(codex?.last_sync_at)}`}</span></div>
                   </div>
                 </div>
                 <div className="command-row">
                   <Button variant="outline" size="sm" disabled={!connected || !!operation} onClick={() => void perform('full', () => agentApi.refreshDisplay('full'), '全刷已排队')}><RotateCcw />全刷</Button>
-                  <Button variant="outline" size="sm" disabled={!!operation} onClick={() => void perform('codex', agentApi.refreshCodex, 'Codex 读取已排队')}><Bot />同步额度</Button>
+                  <Button variant="outline" size="sm" disabled={!!operation || !codex} onClick={() => void perform('producer:codex.usage', () => agentApi.refreshProducer('codex.usage'), 'Codex 读取已排队')}><Bot />同步额度</Button>
                   <Button variant="outline" size="sm" disabled={!owner || !!operation} onClick={() => void perform('restart', agentApi.restartDevice, '设备即将重启')}><Power />重启设备</Button>
                 </div>
               </section>
@@ -651,41 +713,55 @@ function App() {
 
           {view === 'resources' ? <>
             <section className="surface settings-section">
-              <SectionTitle icon={MonitorCog} title="当前视图" detail={`配置 revision ${config?.revision ?? '—'}`}
-                action={<Button size="sm" disabled={!owner || !viewRenderer || !viewResource || !!operation}
-                  onClick={() => void perform('view', () => agentApi.setView(viewRenderer, viewResource), '视图已切换', true)}><Save />应用</Button>} />
-              <div className="field-grid two settings-fields">
-                <label className="field"><span>Renderer</span><select value={viewRenderer} onChange={(event) => setViewRenderer(event.target.value)}>{renderers.map((renderer) => <option key={renderer.id} value={renderer.id}>{renderer.id} · {renderer.schema_id}/v{renderer.schema_version}</option>)}</select></label>
-                <label className="field"><span>Resource key</span><select value={viewResource} onChange={(event) => setViewResource(event.target.value)}>{resources.map((resource) => <option key={resource.key} value={resource.key}>{resource.key}</option>)}</select></label>
+              <SectionTitle icon={MonitorCog} title="Page 与 Binding" detail={`配置 revision ${config?.revision ?? '—'}`}
+                action={<Button size="sm" disabled={!owner || !pageId || !requiredBindingsReady || !!operation}
+                  onClick={() => void perform('page', () => agentApi.setPage({ id: pageId, bindings: Object.fromEntries(Object.entries(pageBindings).filter(([, key]) => key)) }), '页面已切换', true)}><Save />应用</Button>} />
+              <div className="settings-fields page-binding-editor">
+                <label className="field"><span>Page</span><select value={pageId} onChange={(event) => choosePage(event.target.value)}>{pages.map((item) => <option key={item.id} value={item.id}>{item.title} · {item.id}</option>)}</select></label>
+                <div className="slot-grid">
+                  {selectedPage?.slots.map((slot) => {
+                    const compatible = compatibleResources(selectedPage, slot.id, resources)
+                    if (slot.status === 'reserved') return <label className="field" key={slot.id}><span>{slot.id} · reserved</span><select disabled><option>未配置（不可绑定）</option></select></label>
+                    return <label className="field" key={slot.id}><span>{slot.id} · {slot.schema_id}/v{slot.schema_version}{slot.required ? ' · required' : ''}</span><select value={pageBindings[slot.id] ?? ''} onChange={(event) => setPageBindings({ ...pageBindings, [slot.id]: event.target.value })}><option value="">{slot.required ? '请选择兼容资源' : '不绑定'}</option>{compatible.map((resource) => <option key={resource.key} value={resource.key}>{resource.key}</option>)}</select></label>
+                  })}
+                </div>
               </div>
             </section>
             <section className="surface table-section">
-              <SectionTitle icon={HardDrive} title="资源存储" detail={`${resources.length} / ${snapshot.device.capabilities?.max_resources ?? 8}`} />
+              <SectionTitle icon={HardDrive} title="资源存储" detail={`${resources.length} / ${snapshot.device.capabilities?.max_resources ?? 8}`}
+                action={<Button variant="outline" size="sm" disabled={!owner || !!operation} onClick={() => setResourceEditor(RESOURCE_TEMPLATE)}><Braces />新建 JSON</Button>} />
               <div className="data-table resource-table">
                 <div className="table-head"><span>KEY / SCHEMA</span><span>REVISION</span><span>FRESHNESS</span><span>ACTIONS</span></div>
                 {resources.map((resource) => <div className="table-row" key={resource.key}>
                   <span><b>{resource.key}</b><small>{resource.schema_id}/v{resource.schema_version} · {resource.persistence}</small></span>
                   <span className="mono">{resource.revision}</span><span>{formatAge(resource.updated_at)}<small>TTL {resource.ttl_sec}s</small></span>
-                  <span className="row-actions"><Button variant="ghost" size="icon" title="查看资源" disabled={!!operation} onClick={() => void inspectResource(resource)}><Eye /></Button><Button variant="ghost" size="icon" title="删除资源" disabled={!owner || !!operation || resource.key === config?.view.resource_key} onClick={() => void perform(`delete:${resource.key}`, () => agentApi.deleteResource(resource.key), '资源已删除', true)}><Trash2 /></Button></span>
+                  <span className="row-actions"><Button variant="ghost" size="icon" title="查看资源" disabled={!!operation} onClick={() => void inspectResource(resource)}><Eye /></Button><Button variant="ghost" size="icon" title="载入编辑器" disabled={!owner || !!operation} onClick={() => void editResource(resource)}><Braces /></Button><Button variant="ghost" size="icon" title="删除资源" disabled={!owner || !!operation || Object.values(config?.page.bindings ?? {}).includes(resource.key)} onClick={() => void perform(`delete:${resource.key}`, () => agentApi.deleteResource(resource.key), '资源已删除', true)}><Trash2 /></Button></span>
                 </div>)}
                 {!resources.length ? <EmptyState>设备中没有资源</EmptyState> : null}
               </div>
             </section>
+            <section className="surface resource-editor-section">
+              <SectionTitle icon={Braces} title="Resource JSON" detail="Owner 调试入口"
+                action={<Button size="sm" disabled={!owner || !!operation} onClick={() => void publishEditedResource()}><Save />PUT</Button>} />
+              <textarea className="resource-editor" spellCheck={false} value={resourceEditor} onChange={(event) => setResourceEditor(event.target.value)} />
+            </section>
           </> : null}
 
-          {view === 'codex' ? <>
-            <section className="surface codex-status">
-              <SectionTitle icon={Bot} title="Codex app-server" detail="本机 stdio JSON-RPC"
-                action={<Button size="sm" disabled={!!operation} onClick={() => void perform('codex', agentApi.refreshCodex, '额度读取已排队')}><RefreshCw />立即读取</Button>} />
-              <div className="account-line"><StatusPill phase={snapshot.codex.phase} /><div><b>{snapshot.codex.email ?? '未识别账号'}</b><span>{snapshot.codex.plan_type ? formatPlanName(snapshot.codex.plan_type) : snapshot.codex.account_type ?? '—'}</span></div><div><small>最近同步</small><b>{formatTime(snapshot.codex.last_sync_at)}</b></div></div>
-              {snapshot.codex.last_error ? <div className="inline-error"><CircleAlert />{snapshot.codex.last_error}</div> : null}
-            </section>
-            <section className="surface quota-section">
+          {view === 'producers' ? <>
+            {snapshot.producers.map((producer) => <section className="surface producer-status" key={producer.id}>
+              <SectionTitle icon={Bot} title={producer.title} detail={`${producer.id} · ${producer.resource_keys.join(', ')}`}
+                action={<Button size="sm" disabled={!!operation} onClick={() => void perform(`producer:${producer.id}`, () => agentApi.refreshProducer(producer.id), `${producer.title} 已排队`)}><RefreshCw />立即刷新</Button>} />
+              <div className="account-line"><StatusPill phase={producer.phase} /><div><b>{producer.id === 'codex.usage' ? codexEmail ?? '未识别账号' : producer.title}</b><span>{producer.id === 'codex.usage' ? formatPlanName(codexPlan) : producer.resource_keys.join(', ')}</span></div><div><small>最近同步</small><b>{formatTime(producer.last_sync_at)}</b></div></div>
+              {producer.last_error ? <div className="inline-error"><CircleAlert />{producer.last_error}</div> : null}
+              <pre className="producer-details">{JSON.stringify(producer.details, null, 2)}</pre>
+            </section>)}
+            {!snapshot.producers.length ? <section className="surface"><EmptyState>没有已注册 Producer</EmptyState></section> : null}
+            {codex ? <section className="surface quota-section">
               <SectionTitle icon={Gauge} title={bucket?.limitName ?? 'Codex 额度'} detail={bucket?.rateLimitReachedType ? `LIMIT: ${bucket.rateLimitReachedType}` : '当前计量窗口'} />
               <div className="quota-grid"><QuotaWindow title="主窗口" window={bucket?.primary} /><QuotaWindow title="次窗口" window={bucket?.secondary} /></div>
-              {!bucket ? <EmptyState>暂无额度快照，设备会保留最后一次成功数据</EmptyState> : null}
-            </section>
-            <section className="surface facts-section"><div><span>Codex 路径</span><code>{snapshot.codex.codex_path ?? '未找到'}</code></div><div><span>资源 schema</span><code>codex.rate_limits/v1</code></div><div><span>轮询间隔</span><code>60s / backoff max 900s</code></div></section>
+              {!bucket ? <EmptyState>暂无额度快照</EmptyState> : null}
+            </section> : null}
+            {codex ? <section className="surface facts-section"><div><span>Codex 路径</span><code>{codexPath ?? '未找到'}</code></div><div><span>资源 schema</span><code>codex.rate_limits/v1</code></div><div><span>轮询间隔</span><code>60s / backoff max 900s</code></div></section> : null}
           </> : null}
 
           {view === 'security' ? <>
@@ -729,7 +805,7 @@ function App() {
               <div className="log-table" ref={logTableRef}>{visibleLogs.map((entry, index) => <div key={`${entry.at}:${entry.scope}:${entry.message}:${index}`}><time>{formatTime(entry.at)}</time><span className={entry.level}>{entry.level}</span><b>{entry.scope}</b><code>{entry.message}</code></div>)}{!visibleLogs.length ? <EmptyState>当前筛选没有日志</EmptyState> : null}</div>
             </section>
             <section className="danger-zone">
-              <div><Trash2 /><span><b>恢复出厂</b><small>清除 v3 配置、资源、owner 与全部 bond</small></span></div>
+              <div><Trash2 /><span><b>恢复出厂</b><small>清除 v4 配置、资源、owner 与全部 bond</small></span></div>
               <Button variant="destructive" size="sm" disabled={!owner || !!operation} onClick={() => void prepareReset()}>准备恢复</Button>
             </section>
           </> : null}
@@ -737,7 +813,7 @@ function App() {
       </main>
 
       <Dialog open={detailOpen} onOpenChange={setDetailOpen}><DialogContent><DialogHeader><DialogTitle>资源内容</DialogTitle><DialogDescription>设备返回的完整语义资源</DialogDescription></DialogHeader><pre className="dialog-json">{JSON.stringify(resourceDetail, null, 2)}</pre><DialogFooter><DialogClose asChild><Button variant="outline">关闭</Button></DialogClose></DialogFooter></DialogContent></Dialog>
-      <Dialog open={resetOpen} onOpenChange={setResetOpen}><DialogContent><DialogHeader><DialogTitle>确认恢复出厂</DialogTitle><DialogDescription>输入墨水屏显示的六位确认码。确认后设备会清除 v3 namespace 与全部 bond 并重启。</DialogDescription></DialogHeader><label className="field"><span>六位确认码</span><Input inputMode="numeric" maxLength={6} value={resetCode} onChange={(event) => setResetCode(event.target.value.replace(/\D/g, '').slice(0, 6))} /></label><DialogFooter><DialogClose asChild><Button variant="outline">取消</Button></DialogClose><Button variant="destructive" disabled={resetCode.length !== 6 || !!operation} onClick={() => void perform('reset.commit', () => agentApi.commitFactoryReset(Number(resetCode)), '设备已恢复出厂').then((ok) => ok && setResetOpen(false))}>确认清除</Button></DialogFooter></DialogContent></Dialog>
+      <Dialog open={resetOpen} onOpenChange={setResetOpen}><DialogContent><DialogHeader><DialogTitle>确认恢复出厂</DialogTitle><DialogDescription>输入墨水屏显示的六位确认码。确认后设备会清除 v4 namespace 与全部 bond 并重启。</DialogDescription></DialogHeader><label className="field"><span>六位确认码</span><Input inputMode="numeric" maxLength={6} value={resetCode} onChange={(event) => setResetCode(event.target.value.replace(/\D/g, '').slice(0, 6))} /></label><DialogFooter><DialogClose asChild><Button variant="outline">取消</Button></DialogClose><Button variant="destructive" disabled={resetCode.length !== 6 || !!operation} onClick={() => void perform('reset.commit', () => agentApi.commitFactoryReset(Number(resetCode)), '设备已恢复出厂').then((ok) => ok && setResetOpen(false))}>确认清除</Button></DialogFooter></DialogContent></Dialog>
       <Toaster position="bottom-right" richColors closeButton />
     </div>
   )

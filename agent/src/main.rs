@@ -1,7 +1,10 @@
 mod autostart;
 mod ble;
 mod codex;
+mod coordinator;
+mod producer;
 mod protocol;
+mod publisher;
 mod state;
 mod tray;
 mod web;
@@ -55,8 +58,21 @@ async fn prepare_service() -> Result<Service> {
         )
         .await;
     let ble = ble::BleGateway::spawn(state.clone());
-    let codex = codex::CodexControl::spawn(state.clone(), ble.clone());
-    let context = web::WebContext::new(state.clone(), ble, codex)?;
+    let (completion_tx, completion_rx) = tokio::sync::mpsc::channel(16);
+    let publisher = publisher::ResourcePublisher::spawn(state.clone(), ble.clone(), completion_tx);
+    let codex = codex::CodexControl::spawn(producer::ProducerContext {
+        state: state.clone(),
+        publisher: publisher.clone(),
+    });
+    let producers = producer::ProducerRegistry::new(&state, vec![codex.control()]).await?;
+    coordinator::SyncCoordinator::spawn(
+        state.clone(),
+        ble.clone(),
+        producers.clone(),
+        publisher,
+        completion_rx,
+    );
+    let context = web::WebContext::new(state.clone(), ble, producers)?;
     let port = configured_port()?;
     let launch_url = context.launch_url(port);
     let app = web::router(context);

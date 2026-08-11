@@ -59,23 +59,22 @@ pub struct DeviceStatus {
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
-pub struct CodexStatus {
+pub struct ProducerStatus {
+    pub id: String,
+    pub title: String,
     pub phase: String,
-    pub account_type: Option<String>,
-    pub email: Option<String>,
-    pub plan_type: Option<String>,
-    pub codex_path: Option<String>,
+    pub resource_keys: Vec<String>,
     pub last_sync_at: Option<u64>,
     pub next_sync_at: Option<u64>,
     pub last_error: Option<String>,
-    pub rate_limits: Option<Value>,
+    pub details: Value,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Snapshot {
     pub agent: AgentStatus,
     pub device: DeviceStatus,
-    pub codex: CodexStatus,
+    pub producers: Vec<ProducerStatus>,
     pub logs: Vec<LogEntry>,
 }
 
@@ -100,10 +99,7 @@ impl SharedState {
                     connection_mode: "auto".into(),
                     ..Default::default()
                 },
-                codex: CodexStatus {
-                    phase: "starting".into(),
-                    ..Default::default()
-                },
+                producers: Vec::new(),
                 logs: Vec::new(),
             }),
             events,
@@ -123,9 +119,19 @@ impl SharedState {
         self.publish_locked(&snapshot);
     }
 
-    pub async fn update_codex(&self, update: impl FnOnce(&mut CodexStatus)) {
+    pub async fn register_producer(&self, producer: ProducerStatus) {
         let mut snapshot = self.snapshot.write().await;
-        update(&mut snapshot.codex);
+        if snapshot.producers.iter().all(|item| item.id != producer.id) {
+            snapshot.producers.push(producer);
+        }
+        self.publish_locked(&snapshot);
+    }
+
+    pub async fn update_producer(&self, id: &str, update: impl FnOnce(&mut ProducerStatus)) {
+        let mut snapshot = self.snapshot.write().await;
+        if let Some(producer) = snapshot.producers.iter_mut().find(|item| item.id == id) {
+            update(producer);
+        }
         self.publish_locked(&snapshot);
     }
 

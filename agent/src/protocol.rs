@@ -4,10 +4,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::{Duration, Instant};
 
-pub const SERVICE_UUID: uuid::Uuid = uuid::uuid!("f0a30000-0451-4000-b000-000000000001");
-pub const RX_UUID: uuid::Uuid = uuid::uuid!("f0a30001-0451-4000-b000-000000000001");
-pub const TX_UUID: uuid::Uuid = uuid::uuid!("f0a30002-0451-4000-b000-000000000001");
-pub const FRAME_MAGIC: u8 = 0xe3;
+pub const SERVICE_UUID: uuid::Uuid = uuid::uuid!("f0a40000-0451-4000-b000-000000000001");
+pub const RX_UUID: uuid::Uuid = uuid::uuid!("f0a40001-0451-4000-b000-000000000001");
+pub const TX_UUID: uuid::Uuid = uuid::uuid!("f0a40002-0451-4000-b000-000000000001");
+pub const FRAME_MAGIC: u8 = 0xe4;
 pub const MAX_MESSAGE_BYTES: usize = 8192;
 const HEADER_BYTES: usize = 8;
 const START_METADATA_BYTES: usize = 6;
@@ -65,7 +65,7 @@ pub fn encode_message(
     frame_bytes: usize,
 ) -> Result<Vec<Vec<u8>>> {
     if payload.is_empty() || payload.len() > MAX_MESSAGE_BYTES {
-        bail!("message length is outside BLE v3 limits");
+        bail!("message length is outside BLE v4 limits");
     }
     if frame_bytes < HEADER_BYTES + START_METADATA_BYTES {
         bail!("GATT frame is too small");
@@ -135,10 +135,10 @@ impl FrameAssembler {
                 .is_some_and(|started| started.elapsed() > Duration::from_secs(5))
         {
             self.clear();
-            bail!("BLE v3 fragment assembly timed out");
+            bail!("BLE v4 fragment assembly timed out");
         }
         if frame.len() < HEADER_BYTES || frame[0] != FRAME_MAGIC {
-            bail!("invalid BLE v3 frame header");
+            bail!("invalid BLE v4 frame header");
         }
         let flags = frame[1];
         let kind = flags & FLAG_KIND_MASK;

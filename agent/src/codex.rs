@@ -412,11 +412,6 @@ async fn sync_once(
         .or_else(|| rate_limits.get("rateLimits"))
         .cloned()
         .ok_or_else(|| anyhow!("app-server returned no Codex rate-limit bucket"))?;
-    let limits = rate_limits
-        .get("rateLimitsByLimitId")
-        .and_then(Value::as_object)
-        .map(|items| items.values().cloned().collect::<Vec<_>>())
-        .unwrap_or_else(|| vec![selected.clone()]);
     let snapshot = state.snapshot().await;
     let account_plan = snapshot
         .producers
@@ -431,13 +426,16 @@ async fn sync_once(
         .map(str::to_owned)
         .or(account_plan)
         .unwrap_or_else(|| "unknown".into());
+    let first = selected.get("primary");
+    let second = selected.get("secondary");
+    let (five_hour, seven_day) = normalized_windows(first, second);
     let payload = json!({
         "source_status": "ok",
         "plan_type": plan_type,
-        "limit_reached": selected.get("rateLimitReachedType").is_some_and(|value| !value.is_null()),
-        "selected": normalize_bucket(&selected),
-        "limits": limits.iter().map(normalize_bucket).collect::<Vec<_>>(),
-        "rate_limit_reset_credits": rate_limits.get("rateLimitResetCredits").cloned().unwrap_or(Value::Null),
+        "selected": {
+            "primary": normalize_window(five_hour),
+            "secondary": normalize_window(seven_day),
+        },
     });
     let now = unix_now();
     publisher
@@ -470,16 +468,42 @@ async fn sync_once(
     Ok(())
 }
 
-fn normalize_bucket(bucket: &Value) -> Value {
-    json!({
-        "limit_id": bucket.get("limitId").cloned().unwrap_or(Value::Null),
-        "limit_name": bucket.get("limitName").cloned().unwrap_or(Value::Null),
-        "plan_type": bucket.get("planType").cloned().unwrap_or(Value::Null),
-        "primary": normalize_window(bucket.get("primary")),
-        "secondary": normalize_window(bucket.get("secondary")),
-        "rate_limit_reached_type": bucket.get("rateLimitReachedType").cloned().unwrap_or(Value::Null),
-        "credits": bucket.get("credits").cloned().unwrap_or(Value::Null),
-    })
+fn normalized_windows<'a>(
+    first: Option<&'a Value>,
+    second: Option<&'a Value>,
+) -> (Option<&'a Value>, Option<&'a Value>) {
+    let windows = [
+        first.filter(|value| !value.is_null()),
+        second.filter(|value| !value.is_null()),
+    ];
+    let exact_index = |duration_mins| {
+        windows.iter().position(|window| {
+            window
+                .and_then(|value| value.get("windowDurationMins"))
+                .and_then(Value::as_u64)
+                == Some(duration_mins)
+        })
+    };
+    let seven_day_index = exact_index(7 * 24 * 60);
+    let five_hour_index = exact_index(5 * 60).or_else(|| {
+        windows
+            .iter()
+            .enumerate()
+            .find(|(index, window)| window.is_some() && Some(*index) != seven_day_index)
+            .map(|(index, _)| index)
+    });
+    let seven_day_index = seven_day_index.or_else(|| {
+        windows
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(index, window)| window.is_some() && Some(*index) != five_hour_index)
+            .map(|(index, _)| index)
+    });
+    (
+        five_hour_index.and_then(|index| windows[index]),
+        seven_day_index.and_then(|index| windows[index]),
+    )
 }
 
 fn normalize_window(value: Option<&Value>) -> Value {

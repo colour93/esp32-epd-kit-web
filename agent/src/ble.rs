@@ -105,6 +105,7 @@ impl BleGateway {
         tokio::spawn(supervisor(
             state,
             receiver,
+            gateway.intent.clone(),
             intent_receiver,
             gateway.device_events.clone(),
             gateway.connected.clone(),
@@ -238,9 +239,29 @@ struct Session {
     frame_bytes: usize,
 }
 
+struct ScanCleanup {
+    adapter: Option<Adapter>,
+}
+
+impl ScanCleanup {
+    fn new(adapter: Adapter) -> Self {
+        Self {
+            adapter: Some(adapter),
+        }
+    }
+
+    async fn stop(&mut self) -> Result<()> {
+        let Some(adapter) = self.adapter.take() else {
+            return Ok(());
+        };
+        adapter.stop_scan().await.context("stop BLE scan")
+    }
+}
+
 async fn supervisor(
     state: Arc<SharedState>,
     mut commands: mpsc::Receiver<Command>,
+    intent_sender: watch::Sender<ConnectionIntent>,
     mut intent: watch::Receiver<ConnectionIntent>,
     device_events: broadcast::Sender<String>,
     connected: Arc<AtomicBool>,
@@ -287,16 +308,8 @@ async fn supervisor(
             continue;
         }
 
-        let connect_result = tokio::select! {
-            result = connect(&state, &desired, preferred_target.as_ref()) => Some(result),
-            changed = intent.changed() => {
-                if changed.is_err() { return; }
-                None
-            }
-        };
-        let Some(connect_result) = connect_result else {
-            continue;
-        };
+        let connect_result =
+            connect(&state, &desired, preferred_target.as_ref(), &mut intent).await;
         match connect_result {
             Ok(Some(mut session)) => {
                 backoff = 1;
@@ -308,6 +321,7 @@ async fn supervisor(
                     }
                 };
                 let Some(prime_result) = prime_result else {
+                    connected.store(false, Ordering::Release);
                     disconnect_peripheral(&session.peripheral).await;
                     continue;
                 };
@@ -315,6 +329,15 @@ async fn supervisor(
                     connected.store(false, Ordering::Release);
                     state.log("error", "ble", format!("{error:#}")).await;
                     disconnect_peripheral(&session.peripheral).await;
+                    state
+                        .update_device(|device| {
+                            device.phase = "reconnecting".into();
+                            device.role = None;
+                            device.firmware = None;
+                            device.mtu = None;
+                            device.last_error = Some(format!("{error:#}"));
+                        })
+                        .await;
                     continue;
                 }
                 let target = SavedTarget {
@@ -370,7 +393,11 @@ async fn supervisor(
                             }
                         }
                         _ = health.tick() => {
-                            if !session.peripheral.is_connected().await.unwrap_or(false) { break; }
+                            let transport_connected = tokio::time::timeout(
+                                HEARTBEAT_TIMEOUT,
+                                session.peripheral.is_connected(),
+                            ).await.ok().and_then(|result| result.ok()).unwrap_or(false);
+                            if !transport_connected { break; }
                             if state.paused().await { break; }
                             if let Err(error) = transact_with_timeout(
                                 &state,
@@ -395,15 +422,27 @@ async fn supervisor(
                         }
                     }
                 }
-                disconnect_peripheral(&session.peripheral).await;
                 connected.store(false, Ordering::Release);
-                let next = intent.borrow().clone();
+                let mut next = intent.borrow().clone();
+                if !control_changed && matches!(next, ConnectionIntent::Manual(_)) {
+                    intent_sender.send_replace(ConnectionIntent::Auto);
+                    next = ConnectionIntent::Auto;
+                    intent.borrow_and_update();
+                }
                 state
                     .update_device(|device| {
                         device.phase = match next {
                             ConnectionIntent::Idle => "idle",
-                            ConnectionIntent::Scan | ConnectionIntent::Auto => "scanning",
-                            ConnectionIntent::Manual(_) => "disconnected",
+                            ConnectionIntent::Scan
+                            | ConnectionIntent::Auto
+                            | ConnectionIntent::Manual(_) => "reconnecting",
+                        }
+                        .into();
+                        device.connection_mode = match next {
+                            ConnectionIntent::Idle => "idle",
+                            ConnectionIntent::Scan => "scan",
+                            ConnectionIntent::Auto => "auto",
+                            ConnectionIntent::Manual(_) => "manual",
                         }
                         .into();
                         device.role = None;
@@ -411,6 +450,8 @@ async fn supervisor(
                         device.mtu = None;
                     })
                     .await;
+                let _ = device_events.send("ble.disconnected".into());
+                disconnect_peripheral(&session.peripheral).await;
                 if control_changed {
                     state
                         .log("info", "ble", "BLE session changed by user control")
@@ -422,6 +463,11 @@ async fn supervisor(
                 }
             }
             Ok(None) => {
+                if intent.borrow().clone() != desired {
+                    intent.borrow_and_update();
+                    backoff = 1;
+                    continue;
+                }
                 state
                     .update_device(|device| {
                         device.phase = "idle".into();
@@ -462,15 +508,22 @@ async fn supervisor(
 }
 
 async fn disconnect_peripheral(peripheral: &Peripheral) {
-    if peripheral.is_connected().await.unwrap_or(false) {
-        let _ = tokio::time::timeout(Duration::from_secs(3), peripheral.disconnect()).await;
+    let connected = tokio::time::timeout(Duration::from_secs(2), peripheral.is_connected())
+        .await
+        .ok()
+        .and_then(|result| result.ok())
+        .unwrap_or(true);
+    if !connected {
+        return;
     }
+    let _ = tokio::time::timeout(Duration::from_secs(3), peripheral.disconnect()).await;
 }
 
 async fn connect(
     state: &SharedState,
-    intent: &ConnectionIntent,
+    desired: &ConnectionIntent,
     preferred_target: Option<&SavedTarget>,
+    intent: &mut watch::Receiver<ConnectionIntent>,
 ) -> Result<Option<Session>> {
     let manager = Manager::new()
         .await
@@ -501,124 +554,136 @@ async fn connect(
     state
         .log("info", "ble", format!("using adapter {adapter_name}"))
         .await;
-    let Some(peripheral) = discover(state, &adapter, intent, preferred_target).await? else {
+    let Some(peripheral) = discover(state, &adapter, desired, preferred_target, intent).await?
+    else {
         return Ok(None);
     };
-    let properties = peripheral.properties().await?.unwrap_or_default();
-    let name = properties
-        .local_name
-        .clone()
-        .unwrap_or_else(|| peripheral.id().to_string());
-    state
-        .update_device(|device| {
-            device.phase = "connecting".into();
-            device.name = Some(name.clone());
-        })
-        .await;
-    state
-        .log("info", "ble", format!("connecting to {name}"))
-        .await;
-    platform_pairing_hint(&peripheral, &name).await?;
-    if !peripheral.is_connected().await? {
-        let connect_result = tokio::time::timeout(CONNECT_TIMEOUT, peripheral.connect())
-            .await
-            .map_err(|_| {
-                anyhow!(
-                    "BLE connection timed out after {}s",
-                    CONNECT_TIMEOUT.as_secs()
-                )
-            })?;
-        if let Err(error) = connect_result {
-            let connected_after_error = peripheral.is_connected().await.unwrap_or(false);
-            state
-                .log(
-                    "warn",
-                    "ble",
-                    format!(
-                        "BLE connect failed; connected_after_error={connected_after_error}; cause={error}"
-                    ),
-                )
-                .await;
-            if !connected_after_error {
-                if cfg!(target_os = "macos")
-                    && error
-                        .to_string()
-                        .contains("Peer removed pairing information")
-                {
-                    state
-                        .log(
-                            "info",
-                            "ble",
-                            "peer cleared its bond; rebuilding CoreBluetooth state before retry",
-                        )
-                        .await;
+    let session_result = tokio::select! {
+      result = async {
+        let properties = peripheral.properties().await?.unwrap_or_default();
+        let name = properties
+            .local_name
+            .clone()
+            .unwrap_or_else(|| peripheral.id().to_string());
+        state
+            .update_device(|device| {
+                device.phase = "connecting".into();
+                device.name = Some(name.clone());
+                device.last_error = None;
+            })
+            .await;
+        state
+            .log("info", "ble", format!("connecting to {name}"))
+            .await;
+        platform_pairing_hint(&peripheral, &name).await?;
+        if !peripheral.is_connected().await? {
+            let connect_result = tokio::time::timeout(CONNECT_TIMEOUT, peripheral.connect())
+                .await
+                .map_err(|_| {
+                    anyhow!(
+                        "BLE connection timed out after {}s",
+                        CONNECT_TIMEOUT.as_secs()
+                    )
+                })?;
+            if let Err(error) = connect_result {
+                let connected_after_error = peripheral.is_connected().await.unwrap_or(false);
+                state
+                    .log(
+                        "warn",
+                        "ble",
+                        format!(
+                            "BLE connect failed; connected_after_error={connected_after_error}; cause={error}"
+                        ),
+                    )
+                    .await;
+                if !connected_after_error {
+                    return Err(error).context("connect BLE device");
                 }
-                return Err(error).context("connect BLE device");
             }
         }
+        state
+            .update_device(|device| device.phase = "handshaking".into())
+            .await;
+        state
+            .log(
+                "info",
+                "ble",
+                "BLE transport connected; discovering services",
+            )
+            .await;
+        peripheral
+            .discover_services()
+            .await
+            .context("discover BLE services")?;
+        let characteristics = peripheral.characteristics();
+        state
+            .log(
+                "info",
+                "ble",
+                format!(
+                    "discovered {} GATT characteristic(s)",
+                    characteristics.len()
+                ),
+            )
+            .await;
+        let rx = characteristics
+            .iter()
+            .find(|item| item.uuid == protocol::RX_UUID)
+            .cloned()
+            .ok_or_else(|| anyhow!("BLE v4 RX characteristic not found"))?;
+        let tx = characteristics
+            .iter()
+            .find(|item| item.uuid == protocol::TX_UUID)
+            .cloned()
+            .ok_or_else(|| anyhow!("BLE v4 TX characteristic not found"))?;
+        peripheral
+            .subscribe(&tx)
+            .await
+            .context("subscribe BLE v4 indications")?;
+        state
+            .log("info", "ble", "subscribed to BLE v4 indications")
+            .await;
+        let notifications = peripheral
+            .notifications()
+            .await
+            .context("open BLE notification stream")?;
+        Ok(Session {
+            device_id: peripheral.id().to_string(),
+            device_name: name,
+            peripheral: peripheral.clone(),
+            rx,
+            notifications,
+            assembler: FrameAssembler::default(),
+            next_id: AtomicU32::new(1),
+            frame_bytes: 20,
+        })
+      } => Some(result),
+      changed = intent.changed() => {
+          if changed.is_err() {
+              disconnect_peripheral(&peripheral).await;
+              return Ok(None);
+          }
+          None
+      }
+    };
+    let Some(session_result) = session_result else {
+        disconnect_peripheral(&peripheral).await;
+        return Ok(None);
+    };
+    if session_result.is_err() {
+        disconnect_peripheral(&peripheral).await;
     }
-    state
-        .log(
-            "info",
-            "ble",
-            "BLE transport connected; discovering services",
-        )
-        .await;
-    peripheral
-        .discover_services()
-        .await
-        .context("discover BLE services")?;
-    let characteristics = peripheral.characteristics();
-    state
-        .log(
-            "info",
-            "ble",
-            format!(
-                "discovered {} GATT characteristic(s)",
-                characteristics.len()
-            ),
-        )
-        .await;
-    let rx = characteristics
-        .iter()
-        .find(|item| item.uuid == protocol::RX_UUID)
-        .cloned()
-        .ok_or_else(|| anyhow!("BLE v4 RX characteristic not found"))?;
-    let tx = characteristics
-        .iter()
-        .find(|item| item.uuid == protocol::TX_UUID)
-        .cloned()
-        .ok_or_else(|| anyhow!("BLE v4 TX characteristic not found"))?;
-    peripheral
-        .subscribe(&tx)
-        .await
-        .context("subscribe BLE v4 indications")?;
-    state
-        .log("info", "ble", "subscribed to BLE v4 indications")
-        .await;
-    let notifications = peripheral
-        .notifications()
-        .await
-        .context("open BLE notification stream")?;
-    Ok(Some(Session {
-        device_id: peripheral.id().to_string(),
-        device_name: name,
-        peripheral,
-        rx,
-        notifications,
-        assembler: FrameAssembler::default(),
-        next_id: AtomicU32::new(1),
-        frame_bytes: 20,
-    }))
+    session_result.map(Some)
 }
 
 async fn discover(
     state: &SharedState,
     adapter: &Adapter,
-    intent: &ConnectionIntent,
+    desired: &ConnectionIntent,
     preferred_target: Option<&SavedTarget>,
+    intent: &mut watch::Receiver<ConnectionIntent>,
 ) -> Result<Option<Peripheral>> {
-    let connection_mode = match intent {
+    let connection_mode = match desired {
         ConnectionIntent::Auto => "auto",
         ConnectionIntent::Scan => "scan",
         ConnectionIntent::Manual(_) => "manual",
@@ -628,9 +693,9 @@ async fn discover(
         .update_device(|device| {
             device.phase = "scanning".into();
             device.connection_mode = connection_mode.into();
-            if matches!(intent, ConnectionIntent::Auto) {
+            if matches!(desired, ConnectionIntent::Auto) {
                 device.selected_device_id = preferred_target.map(|target| target.id.clone());
-            } else if !matches!(intent, ConnectionIntent::Manual(_)) {
+            } else if !matches!(desired, ConnectionIntent::Manual(_)) {
                 device.selected_device_id = None;
             }
             device.scan_observed = 0;
@@ -641,6 +706,7 @@ async fn discover(
         .start_scan(ScanFilter::default())
         .await
         .context("start BLE scan")?;
+    let mut scan_cleanup = ScanCleanup::new(adapter.clone());
     state
         .log(
             "info",
@@ -655,8 +721,22 @@ async fn discover(
     let mut candidates = HashMap::<String, BleCandidate>::new();
     let mut candidate_peripherals = HashMap::<String, Peripheral>::new();
     loop {
-        for peripheral in adapter.peripherals().await? {
-            let Some(properties) = peripheral.properties().await? else {
+        let peripherals = match adapter.peripherals().await {
+            Ok(peripherals) => peripherals,
+            Err(error) => {
+                let _ = scan_cleanup.stop().await;
+                return Err(error).context("list BLE scan results");
+            }
+        };
+        for peripheral in peripherals {
+            let properties = match peripheral.properties().await {
+                Ok(properties) => properties,
+                Err(error) => {
+                    let _ = scan_cleanup.stop().await;
+                    return Err(error).context("read BLE advertisement");
+                }
+            };
+            let Some(properties) = properties else {
                 continue;
             };
             let matches_service = properties.services.contains(&protocol::SERVICE_UUID);
@@ -725,10 +805,21 @@ async fn discover(
             })
             .await;
 
-        let selected_id = match intent {
-            ConnectionIntent::Manual(target) if candidate_peripherals.contains_key(target) => {
-                Some(target.clone())
-            }
+        let selected_id = match desired {
+            ConnectionIntent::Manual(target) => candidate_peripherals
+                .contains_key(target)
+                .then(|| target.clone())
+                .or_else(|| {
+                    let saved = preferred_target.filter(|saved| saved.id == *target)?;
+                    let mut matches = candidates.values().filter(|candidate| {
+                        candidate.name == saved.name
+                            && (candidate.advertises_service || candidate.protocol_major == Some(4))
+                    });
+                    let candidate = matches.next();
+                    candidate
+                        .filter(|_| matches.next().is_none())
+                        .map(|candidate| candidate.id.clone())
+                }),
             ConnectionIntent::Auto if tokio::time::Instant::now() >= auto_select_at => {
                 if let Some(target) = preferred_target {
                     candidates
@@ -753,7 +844,7 @@ async fn discover(
             _ => None,
         };
         if let Some(selected_id) = selected_id {
-            adapter.stop_scan().await?;
+            scan_cleanup.stop().await?;
             let selected_name = candidates
                 .get(&selected_id)
                 .map(|candidate| candidate.name.clone());
@@ -777,11 +868,11 @@ async fn discover(
         }
 
         if tokio::time::Instant::now() >= deadline {
-            adapter.stop_scan().await?;
-            if *intent == ConnectionIntent::Scan {
+            scan_cleanup.stop().await?;
+            if *desired == ConnectionIntent::Scan {
                 return Ok(None);
             }
-            if let ConnectionIntent::Manual(target) = intent {
+            if let ConnectionIntent::Manual(target) = desired {
                 bail!(
                     "selected EPD-KIT device {target} was not found after 15s ({} peripherals observed)",
                     observed.len()
@@ -804,7 +895,16 @@ async fn discover(
                 observed.len()
             );
         }
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(400)) => {}
+            changed = intent.changed() => {
+                scan_cleanup.stop().await?;
+                if changed.is_err() {
+                    return Ok(None);
+                }
+                return Ok(None);
+            }
+        }
     }
 }
 
@@ -998,11 +1098,15 @@ async fn transact_with_timeout(
         )
         .await;
     for frame in frames {
-        session
-            .peripheral
-            .write(&session.rx, &frame, WriteType::WithResponse)
-            .await
-            .map_err(|error| link_error(format!("write BLE request {op}: {error}")))?;
+        tokio::time::timeout(
+            timeout,
+            session
+                .peripheral
+                .write(&session.rx, &frame, WriteType::WithResponse),
+        )
+        .await
+        .map_err(|_| link_error(format!("BLE write timed out for {op}")))?
+        .map_err(|error| link_error(format!("write BLE request {op}: {error}")))?;
     }
     let response = tokio::time::timeout(timeout, async {
         loop {

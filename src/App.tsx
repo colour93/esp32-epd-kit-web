@@ -16,6 +16,8 @@ import {
   Gauge,
   HardDrive,
   KeyRound,
+  LayoutGrid,
+  Link2,
   LayoutDashboard,
   LoaderCircle,
   ListChecks,
@@ -65,6 +67,9 @@ import {
   type FeishuProjectPreview,
   type JsonObject,
   type PageCapability,
+  type PageBinding,
+  type PageSlotCapability,
+  type PageWidgetCapability,
   type ResourceSummary,
   type Snapshot,
 } from './lib/agent'
@@ -83,6 +88,7 @@ const NAV_ITEMS: Array<{ id: View; label: string; icon: LucideIcon }> = [
 
 const PHASE_LABELS: Record<string, string> = {
   connected: '已连接', connecting: '连接中', scanning: '扫描中', disconnected: '已断开',
+  handshaking: '初始化中', reconnecting: '正在重连',
   disconnecting: '断开中', idle: '待命', unavailable: '不可用', paused: '已暂停',
   ready: '正常', starting: '启动中', missing: '未安装',
   syncing: '同步中', unconfigured: '未配置', disabled: '已停用',
@@ -118,7 +124,7 @@ function formatAge(seconds?: number) {
 
 function phaseTone(phase: string) {
   if (phase === 'connected' || phase === 'ready') return 'good'
-  if (phase === 'connecting' || phase === 'disconnecting' || phase === 'scanning' || phase === 'starting') return 'working'
+  if (phase === 'connecting' || phase === 'handshaking' || phase === 'reconnecting' || phase === 'disconnecting' || phase === 'scanning' || phase === 'starting') return 'working'
   if (phase === 'paused' || phase === 'idle' || phase === 'disconnected') return 'muted'
   return 'bad'
 }
@@ -222,8 +228,9 @@ function DeviceConnectionPanel({ device, operation, onScan, onConnect, onDisconn
   onAutoConnect: () => void
 }) {
   const connected = device.phase === 'connected'
-  const connecting = device.phase === 'connecting'
+  const connecting = device.phase === 'connecting' || device.phase === 'handshaking'
   const scanning = device.phase === 'scanning'
+  const reconnecting = device.phase === 'reconnecting'
   const active = device.connection_mode !== 'idle'
   const busy = operation?.startsWith('ble.') ?? false
   const mode = CONNECTION_MODE_LABELS[device.connection_mode] ?? device.connection_mode
@@ -265,9 +272,9 @@ function DeviceConnectionPanel({ device, operation, onScan, onConnect, onDisconn
           </div>
           <dl className="connection-facts">
             <div><dt>模式</dt><dd>{mode}</dd></div>
+            <div><dt>会话</dt><dd>{connected ? 'RPC 就绪' : reconnecting ? '清理后重试' : connecting ? '建立中' : '未就绪'}</dd></div>
             <div><dt>目标</dt><dd title={device.selected_device_id ?? device.preferred_device_id}>{shortDeviceId(device.selected_device_id ?? device.preferred_device_id)}</dd></div>
-            <div><dt>广播</dt><dd>{device.scan_observed}</dd></div>
-            <div><dt>候选</dt><dd>{device.candidates.length}</dd></div>
+            <div><dt>候选 / 广播</dt><dd>{device.candidates.length} / {device.scan_observed}</dd></div>
           </dl>
           {device.last_error ? <div className="connection-error"><CircleAlert /><span>{connectionErrorText(device.last_error)}</span></div> : null}
         </div>
@@ -315,12 +322,41 @@ function getCodexBucket(snapshot: Snapshot | null): LimitBucket | null {
   return byId?.codex ?? raw.rateLimits as LimitBucket | undefined ?? null
 }
 
-function compatibleResources(page: PageCapability | undefined, slotId: string, resources: ResourceSummary[]) {
-  const slot = page?.slots.find((item) => item.id === slotId)
+function slotWidgets(slot?: PageSlotCapability, pageId?: string): PageWidgetCapability[] {
   if (!slot || slot.status !== 'active') return []
+  if (slot.widgets?.length) return slot.widgets
+  if (slot.schema_id && slot.schema_version) return [{
+    id: slot.schema_id === 'codex.rate_limits'
+      ? (pageId === 'codex.usage' ? 'codex.usage.full' : 'codex.usage.compact')
+      : slot.schema_id === 'feishu.project_card' ? 'feishu.project.compact' : `${slot.schema_id}.default`,
+    title: slot.id,
+    schema_id: slot.schema_id, schema_version: slot.schema_version,
+  }]
+  return []
+}
+
+function compatibleResources(widget: PageWidgetCapability | undefined, resources: ResourceSummary[]) {
+  if (!widget) return []
   return resources.filter((resource) => (
-    resource.schema_id === slot.schema_id && resource.schema_version === slot.schema_version
+    resource.schema_id === widget.schema_id && resource.schema_version === widget.schema_version
   ))
+}
+
+function normalizedBinding(binding?: PageBinding | string): PageBinding {
+  return typeof binding === 'string'
+    ? { widget_id: '', resource_key: binding }
+    : { widget_id: binding?.widget_id ?? '', resource_key: binding?.resource_key ?? '' }
+}
+
+function configuredResourceKeys(bindings?: Record<string, PageBinding | string>) {
+  return Object.values(bindings ?? {}).map((binding) => normalizedBinding(binding).resource_key).filter(Boolean)
+}
+
+function serializedBindings(page: PageCapability | undefined, bindings: Record<string, PageBinding>) {
+  const widgetAware = page?.slots.some((slot) => Boolean(slot.widgets?.length)) ?? false
+  return Object.fromEntries(Object.entries(bindings)
+    .filter(([, binding]) => binding.widget_id && binding.resource_key)
+    .map(([slotId, binding]) => [slotId, widgetAware ? binding : binding.resource_key]))
 }
 
 function formatPlanName(value?: string) {
@@ -354,6 +390,54 @@ function QuotaWindow({ title, window }: { title: string; window?: WindowLimit | 
       <div className="quota-foot"><span>剩余</span><span>重置 {formatTime(window?.resetsAt)}</span></div>
     </div>
   )
+}
+
+function compactRemaining(window?: WindowLimit | null) {
+  if (!window) return '--'
+  return String(100 - Math.max(0, Math.min(100, window.usedPercent ?? 0)))
+}
+
+function normalizedWindows(bucket: LimitBucket | null): [WindowLimit | null, WindowLimit | null] {
+  const windows = [bucket?.primary ?? null, bucket?.secondary ?? null]
+  const exactIndex = (durationMins: number) => windows.findIndex((window) => window?.windowDurationMins === durationMins)
+  let sevenDayIndex = exactIndex(7 * 24 * 60)
+  let fiveHourIndex = exactIndex(5 * 60)
+  if (fiveHourIndex < 0) fiveHourIndex = windows.findIndex((window, index) => window && index !== sevenDayIndex)
+  if (sevenDayIndex < 0) {
+    for (let index = windows.length - 1; index >= 0; index -= 1) {
+      if (windows[index] && index !== fiveHourIndex) {
+        sevenDayIndex = index
+        break
+      }
+    }
+  }
+  return [windows[fiveHourIndex] ?? null, windows[sevenDayIndex] ?? null]
+}
+
+function HomeWidgetPreview({ binding, fallbackWidget, bucket, codexPlan }: {
+  binding?: PageBinding
+  fallbackWidget?: string
+  bucket: LimitBucket | null
+  codexPlan?: string
+}) {
+  const widgetId = binding?.widget_id || fallbackWidget
+  if (!binding?.resource_key || !widgetId) {
+    return <article className="epd-home-module empty"><LayoutGrid /><span>空组件位</span></article>
+  }
+  if (widgetId === 'codex.usage.compact') {
+    const [fiveHour, sevenDay] = normalizedWindows(bucket)
+    return <article className="epd-home-module codex">
+      <header><b>{formatPlanName(bucket?.planType ?? codexPlan)}</b></header>
+      <div className="epd-home-quota-pair">
+        <div><small>5h</small><strong>{compactRemaining(fiveHour)}</strong></div>
+        <div><small>7d</small><strong>{compactRemaining(sevenDay)}</strong></div>
+      </div>
+    </article>
+  }
+  return <article className="epd-home-module feishu">
+    <header><b>飞书项目</b></header>
+    <div className="epd-home-feishu-content"><strong>--</strong><small>等待数据</small></div>
+  </article>
 }
 
 function NumberField({ label, value, min, max, onChange, disabled }: {
@@ -466,7 +550,7 @@ function App() {
   const [streamDown, setStreamDown] = useState(false)
   const [operation, setOperation] = useState<string | null>(null)
   const [pageId, setPageId] = useState('')
-  const [pageBindings, setPageBindings] = useState<Record<string, string>>({})
+  const [pageBindings, setPageBindings] = useState<Record<string, PageBinding>>({})
   const [resourceEditor, setResourceEditor] = useState(RESOURCE_TEMPLATE)
   const [resourceDetail, setResourceDetail] = useState<JsonObject | null>(null)
   const [detailOpen, setDetailOpen] = useState(false)
@@ -504,7 +588,15 @@ function App() {
     if (!config) return
     setConfigDraft(structuredClone(config))
     setPageId(config.page.id)
-    setPageBindings({ ...config.page.bindings })
+    const page = snapshot?.device.capabilities?.pages?.find((item) => item.id === config.page.id)
+    setPageBindings(Object.fromEntries(Object.entries(config.page.bindings).map(([slotId, raw]) => {
+      const binding = normalizedBinding(raw)
+      const slot = page?.slots.find((item) => item.id === slotId)
+      return [slotId, {
+        widget_id: binding.widget_id || slotWidgets(slot, page?.id)[0]?.id || '',
+        resource_key: binding.resource_key,
+      }]
+    })))
   }, [config?.revision])
 
   async function perform(key: string, action: () => Promise<unknown>, success: string, refresh = false) {
@@ -529,12 +621,17 @@ function App() {
   const codexPath = typeof codex?.details.codex_path === 'string' ? codex.details.codex_path : undefined
   const bucket = useMemo(() => getCodexBucket(snapshot), [codex?.details.rate_limits])
   const connected = snapshot?.device.phase === 'connected'
+  const previewNow = new Date()
+  const previewClock = `${String(previewNow.getHours()).padStart(2, '0')}:${String(previewNow.getMinutes()).padStart(2, '0')}`
+  const previewDate = `${String(previewNow.getMonth() + 1).padStart(2, '0')}/${String(previewNow.getDate()).padStart(2, '0')}`
   const owner = snapshot?.device.role === 'owner'
   const pages = snapshot?.device.capabilities?.pages ?? []
   const resources = snapshot?.device.resources ?? []
   const selectedPage = pages.find((item) => item.id === pageId)
   const requiredBindingsReady = selectedPage?.slots.every((slot) => (
-    slot.status !== 'active' || !slot.required || Boolean(pageBindings[slot.id])
+    slot.status !== 'active' || !slot.required || Boolean(
+      pageBindings[slot.id]?.widget_id && pageBindings[slot.id]?.resource_key,
+    )
   )) ?? false
   const page = NAV_ITEMS.find((item) => item.id === view) ?? NAV_ITEMS[0]
   const logScopes = useMemo(
@@ -587,14 +684,19 @@ function App() {
 
   function choosePage(id: string) {
     const capability = pages.find((item) => item.id === id)
-    const bindings: Record<string, string> = {}
+    const bindings: Record<string, PageBinding> = {}
     for (const slot of capability?.slots ?? []) {
       if (slot.status !== 'active') continue
-      const compatible = compatibleResources(capability, slot.id, resources)
-      const current = config?.page.bindings[slot.id]
-      bindings[slot.id] = compatible.some((resource) => resource.key === current)
-        ? current ?? ''
-        : slot.required ? compatible[0]?.key ?? '' : ''
+      const widgets = slotWidgets(slot, capability?.id)
+      const current = normalizedBinding(config?.page.bindings[slot.id])
+      const widget = widgets.find((item) => item.id === current.widget_id) ?? widgets[0]
+      const compatible = compatibleResources(widget, resources)
+      bindings[slot.id] = {
+        widget_id: widget?.id ?? '',
+        resource_key: compatible.some((resource) => resource.key === current.resource_key)
+          ? current.resource_key
+          : slot.required ? compatible[0]?.key ?? '' : '',
+      }
     }
     setPageId(id)
     setPageBindings(bindings)
@@ -722,17 +824,29 @@ function App() {
             </div>
             <div className="overview-grid">
               <section className="surface epd-module">
-                <SectionTitle icon={MonitorCog} title="当前墨水屏页面" detail={`${config?.page.id ?? '未选择'} · ${Object.values(config?.page.bindings ?? {}).join(', ')}`}
+                <SectionTitle icon={MonitorCog} title="当前墨水屏页面" detail={`${config?.page.id ?? '未选择'} · ${configuredResourceKeys(config?.page.bindings).join(', ')}`}
                   action={<Button size="sm" disabled={!connected || !!operation} onClick={() => void perform('display', () => agentApi.refreshDisplay('auto'), '刷新已排队')}><RefreshCw />刷新</Button>} />
                 <div className="epd-frame">
-                  <div className="epd-screen">
-                    <div className="epd-top">
-                      <div className="epd-brand"><b>{config?.page.id === 'home' ? new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) : 'Codex'}</b><i>-</i><span>{formatPlanName(bucket?.planType ?? codexPlan)}</span></div>
-                      <div className="epd-indicators">{configDraft?.hardware.battery.enabled ? <small>--%</small> : null}<i className={connected ? 'connected' : ''} /></div>
-                    </div>
-                    <div className="epd-rule" />
-                    <div className="epd-quotas"><QuotaWindow title={formatWindowName(bucket?.primary)} window={bucket?.primary} /><QuotaWindow title={formatWindowName(bucket?.secondary)} window={bucket?.secondary} /></div>
-                    <div className="epd-bottom"><b>{codex?.phase === 'ready' ? '同步正常' : '数据保留'}</b><span>{config?.page.id === 'home' ? '飞书项目 未配置' : `更新 ${formatTime(codex?.last_sync_at)}`}</span></div>
+                  <div className={`epd-screen ${config?.page.id === 'home' ? 'home' : ''}`}>
+                    {config?.page.id === 'home' ? <>
+                      <div className="epd-home-head">
+                        <b>{previewClock}</b>
+                        <time>{previewDate}</time>
+                        <span><i className={connected ? 'connected' : ''} />{connected ? '已连接' : '离线'}</span>
+                      </div>
+                      <div className="epd-home-modules">
+                        <HomeWidgetPreview binding={pageBindings.codex} fallbackWidget="codex.usage.compact" bucket={bucket} codexPlan={codexPlan} />
+                        <HomeWidgetPreview binding={pageBindings.feishu_project} fallbackWidget="feishu.project.compact" bucket={bucket} codexPlan={codexPlan} />
+                      </div>
+                    </> : <>
+                      <div className="epd-top">
+                        <div className="epd-brand"><b>Codex</b><i>-</i><span>{formatPlanName(bucket?.planType ?? codexPlan)}</span></div>
+                        <div className="epd-indicators">{configDraft?.hardware.battery.enabled ? <small>--%</small> : null}<i className={connected ? 'connected' : ''} /></div>
+                      </div>
+                      <div className="epd-rule" />
+                      <div className="epd-quotas"><QuotaWindow title={formatWindowName(bucket?.primary)} window={bucket?.primary} /><QuotaWindow title={formatWindowName(bucket?.secondary)} window={bucket?.secondary} /></div>
+                      <div className="epd-bottom"><b>{codex?.phase === 'ready' ? '同步正常' : '数据保留'}</b><span>更新 {formatTime(codex?.last_sync_at)}</span></div>
+                    </>}
                   </div>
                 </div>
                 <div className="command-row">
@@ -802,14 +916,29 @@ function App() {
             <section className="surface settings-section">
               <SectionTitle icon={MonitorCog} title="Page 与 Binding" detail={`配置 revision ${config?.revision ?? '—'}`}
                 action={<Button size="sm" disabled={!owner || !pageId || !requiredBindingsReady || !!operation}
-                  onClick={() => void perform('page', () => agentApi.setPage({ id: pageId, bindings: Object.fromEntries(Object.entries(pageBindings).filter(([, key]) => key)) }), '页面已切换', true)}><Save />应用</Button>} />
+                  onClick={() => void perform('page', () => agentApi.setPage({ id: pageId, bindings: serializedBindings(selectedPage, pageBindings) }), '页面布局已应用', true)}><Save />应用</Button>} />
               <div className="settings-fields page-binding-editor">
                 <label className="field"><span>Page</span><select value={pageId} onChange={(event) => choosePage(event.target.value)}>{pages.map((item) => <option key={item.id} value={item.id}>{item.title} · {item.id}</option>)}</select></label>
-                <div className="slot-grid">
+                <div className="widget-binding-list">
                   {selectedPage?.slots.map((slot) => {
-                    const compatible = compatibleResources(selectedPage, slot.id, resources)
-                    if (slot.status === 'reserved') return <label className="field" key={slot.id}><span>{slot.id} · reserved</span><select disabled><option>未配置（不可绑定）</option></select></label>
-                    return <label className="field" key={slot.id}><span>{slot.id} · {slot.schema_id}/v{slot.schema_version}{slot.required ? ' · required' : ''}</span><select value={pageBindings[slot.id] ?? ''} onChange={(event) => setPageBindings({ ...pageBindings, [slot.id]: event.target.value })}><option value="">{slot.required ? '请选择兼容资源' : '不绑定'}</option>{compatible.map((resource) => <option key={resource.key} value={resource.key}>{resource.key}</option>)}</select></label>
+                    if (slot.status === 'reserved') return <div className="widget-binding-row reserved" key={slot.id}><div><LayoutGrid /><span><b>{slot.title ?? slot.id}</b><small>{slot.id} · reserved</small></span></div><span>不可配置</span></div>
+                    const widgets = slotWidgets(slot, selectedPage?.id)
+                    const binding = pageBindings[slot.id] ?? { widget_id: widgets[0]?.id ?? '', resource_key: '' }
+                    const widget = widgets.find((item) => item.id === binding.widget_id) ?? widgets[0]
+                    const compatible = compatibleResources(widget, resources)
+                    return <div className="widget-binding-row" key={slot.id}>
+                      <div className="widget-slot-name"><LayoutGrid /><span><b>{slot.title ?? slot.id}</b><small>{slot.id}{slot.required ? ' · required' : ' · optional'}</small></span></div>
+                      <label className="field"><span>展示组件</span><select value={binding.widget_id} onChange={(event) => {
+                        const nextWidget = widgets.find((item) => item.id === event.target.value)
+                        const nextResources = compatibleResources(nextWidget, resources)
+                        setPageBindings({ ...pageBindings, [slot.id]: {
+                          widget_id: event.target.value,
+                          resource_key: nextResources.some((item) => item.key === binding.resource_key) ? binding.resource_key : nextResources[0]?.key ?? '',
+                        } })
+                      }}><option value="">空组件位</option>{widgets.map((item) => <option key={item.id} value={item.id}>{item.title}</option>)}</select></label>
+                      <label className="field"><span>数据源</span><select value={binding.resource_key} disabled={!binding.widget_id} onChange={(event) => setPageBindings({ ...pageBindings, [slot.id]: { ...binding, resource_key: event.target.value } })}><option value="">{slot.required ? '请选择数据源' : '不绑定'}</option>{compatible.map((resource) => <option key={resource.key} value={resource.key}>{resource.key}</option>)}</select></label>
+                      <div className="binding-contract"><Link2 /><code>{widget ? `${widget.schema_id}/v${widget.schema_version}` : '未选择组件'}</code></div>
+                    </div>
                   })}
                 </div>
               </div>
@@ -822,7 +951,7 @@ function App() {
                 {resources.map((resource) => <div className="table-row" key={resource.key}>
                   <span><b>{resource.key}</b><small>{resource.schema_id}/v{resource.schema_version} · {resource.persistence}</small></span>
                   <span className="mono">{resource.revision}</span><span>{formatAge(resource.updated_at)}<small>TTL {resource.ttl_sec}s</small></span>
-                  <span className="row-actions"><Button variant="ghost" size="icon" title="查看资源" disabled={!!operation} onClick={() => void inspectResource(resource)}><Eye /></Button><Button variant="ghost" size="icon" title="载入编辑器" disabled={!owner || !!operation} onClick={() => void editResource(resource)}><Braces /></Button><Button variant="ghost" size="icon" title="删除资源" disabled={!owner || !!operation || Object.values(config?.page.bindings ?? {}).includes(resource.key)} onClick={() => void perform(`delete:${resource.key}`, () => agentApi.deleteResource(resource.key), '资源已删除', true)}><Trash2 /></Button></span>
+                  <span className="row-actions"><Button variant="ghost" size="icon" title="查看资源" disabled={!!operation} onClick={() => void inspectResource(resource)}><Eye /></Button><Button variant="ghost" size="icon" title="载入编辑器" disabled={!owner || !!operation} onClick={() => void editResource(resource)}><Braces /></Button><Button variant="ghost" size="icon" title="删除资源" disabled={!owner || !!operation || configuredResourceKeys(config?.page.bindings).includes(resource.key)} onClick={() => void perform(`delete:${resource.key}`, () => agentApi.deleteResource(resource.key), '资源已删除', true)}><Trash2 /></Button></span>
                 </div>)}
                 {!resources.length ? <EmptyState>设备中没有资源</EmptyState> : null}
               </div>

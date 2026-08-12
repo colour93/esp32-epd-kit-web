@@ -1,5 +1,10 @@
 export type JsonObject = Record<string, unknown>
 
+export interface PageBinding {
+  widget_id: string
+  resource_key: string
+}
+
 export interface AgentStatus {
   version: string
   paused: boolean
@@ -21,13 +26,22 @@ export interface DeviceConfig {
     full_max_age_sec: number
     full_area_threshold_percent: number
   }
-  page: { id: string; bindings: Record<string, string> }
+  page: { id: string; bindings: Record<string, PageBinding | string> }
+}
+
+export interface PageWidgetCapability {
+  id: string
+  title: string
+  schema_id: string
+  schema_version: number
 }
 
 export interface PageSlotCapability {
   id: string
+  title?: string
   status: 'active' | 'reserved'
   required: boolean
+  widgets?: PageWidgetCapability[]
   schema_id?: string
   schema_version?: number
 }
@@ -225,7 +239,7 @@ export const agentApi = {
   putResource: (resource: JsonObject) => request('/api/v1/device/resource', {
     method: 'PUT', body: JSON.stringify({ resource }),
   }),
-  setPage: (page: { id: string; bindings: Record<string, string> }) => request('/api/v1/device/page', {
+  setPage: (page: { id: string; bindings: Record<string, PageBinding | string> }) => request('/api/v1/device/page', {
     method: 'POST', body: JSON.stringify({ page }),
   }),
   prepareFactoryReset: () => request<{ result: { expires_in_sec: number } }>('/api/v1/factory/prepare', {

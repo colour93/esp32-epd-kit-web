@@ -34,6 +34,7 @@ mod platform {
                 .with_tooltip("EPD Agent")
                 .with_menu(Box::new(menu))
                 .with_icon(agent_icon()?)
+                .with_icon_as_template(cfg!(target_os = "macos"))
                 .build()?;
             Ok(Self {
                 _icon: icon,
@@ -57,6 +58,54 @@ mod platform {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    fn agent_icon() -> Result<Icon> {
+        const SIZE: usize = 36;
+        const SAMPLES: usize = 4;
+        let mut rgba = vec![0u8; SIZE * SIZE * 4];
+
+        for y in 0..SIZE {
+            for x in 0..SIZE {
+                let mut covered = 0;
+                for sample_y in 0..SAMPLES {
+                    for sample_x in 0..SAMPLES {
+                        let px = x as f32 + (sample_x as f32 + 0.5) / SAMPLES as f32;
+                        let py = y as f32 + (sample_y as f32 + 0.5) / SAMPLES as f32;
+                        let frame = rounded_rect(px, py, 3.0, 3.0, 33.0, 33.0, 4.0)
+                            && !rounded_rect(px, py, 6.0, 6.0, 30.0, 30.0, 1.5);
+                        let bars = [9.0, 16.0, 23.0]
+                            .iter()
+                            .any(|left| rounded_rect(px, py, *left, 10.0, *left + 4.0, 26.0, 1.0));
+                        covered += usize::from(frame || bars);
+                    }
+                }
+
+                let offset = (y * SIZE + x) * 4;
+                rgba[offset + 3] = (covered * 255 / (SAMPLES * SAMPLES)) as u8;
+            }
+        }
+
+        Ok(Icon::from_rgba(rgba, SIZE as u32, SIZE as u32)?)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn rounded_rect(
+        x: f32,
+        y: f32,
+        left: f32,
+        top: f32,
+        right: f32,
+        bottom: f32,
+        radius: f32,
+    ) -> bool {
+        let nearest_x = x.clamp(left + radius, right - radius);
+        let nearest_y = y.clamp(top + radius, bottom - radius);
+        let dx = x - nearest_x;
+        let dy = y - nearest_y;
+        x >= left && x <= right && y >= top && y <= bottom && dx * dx + dy * dy <= radius * radius
+    }
+
+    #[cfg(target_os = "windows")]
     fn agent_icon() -> Result<Icon> {
         const SIZE: usize = 32;
         let mut rgba = vec![0u8; SIZE * SIZE * 4];

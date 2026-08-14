@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
@@ -13,8 +16,8 @@ const HEARTBEAT_SEC: u64 = 300;
 
 #[derive(Clone, Debug)]
 pub struct SemanticResource {
-    pub producer_id: &'static str,
-    pub key: &'static str,
+    pub source_id: String,
+    pub key: String,
     pub schema_id: &'static str,
     pub schema_version: u16,
     pub ttl_sec: u64,
@@ -31,6 +34,8 @@ pub struct CycleCompletion {
 
 enum Command {
     Publish(SemanticResource, oneshot::Sender<Result<bool>>),
+    Get(String, oneshot::Sender<Option<SemanticResource>>),
+    Delete(String, oneshot::Sender<Result<()>>),
     CycleComplete(CycleCompletion),
     Reconcile,
     Flush(oneshot::Sender<()>),
@@ -80,6 +85,28 @@ impl ResourcePublisher {
             .map_err(|_| anyhow!("resource publish was cancelled"))?
     }
 
+    pub async fn delete(&self, key: String) -> Result<()> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::Delete(key, reply))
+            .await
+            .map_err(|_| anyhow!("resource publisher stopped"))?;
+        response
+            .await
+            .map_err(|_| anyhow!("resource delete was cancelled"))?
+    }
+
+    pub async fn get(&self, key: String) -> Result<Option<SemanticResource>> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::Get(key, reply))
+            .await
+            .map_err(|_| anyhow!("resource publisher stopped"))?;
+        response
+            .await
+            .map_err(|_| anyhow!("resource lookup was cancelled"))
+    }
+
     pub async fn complete_cycle(
         &self,
         cycle_id: u64,
@@ -115,6 +142,7 @@ async fn run(
     mut commands: mpsc::Receiver<Command>,
 ) {
     let mut cache = HashMap::<String, CachedResource>::new();
+    let mut pending_deletes = HashSet::<String>::new();
     while let Some(command) = commands.recv().await {
         match command {
             Command::Publish(resource, reply) => {
@@ -125,7 +153,8 @@ async fn run(
                         continue;
                     }
                 };
-                let key = resource.key.to_owned();
+                let key = resource.key.clone();
+                pending_deletes.remove(&key);
                 let entry = cache.entry(key).or_insert_with(|| CachedResource {
                     resource: resource.clone(),
                     payload_hash,
@@ -137,7 +166,48 @@ async fn run(
                 let result = publish_one(&state, &ble, entry, false).await;
                 let _ = reply.send(result);
             }
+            Command::Get(key, reply) => {
+                let resource = cache.get(&key).map(|entry| entry.resource.clone());
+                let _ = reply.send(resource);
+            }
+            Command::Delete(key, reply) => {
+                cache.remove(&key);
+                pending_deletes.insert(key.clone());
+                match delete_one(&state, &ble, &key).await {
+                    Ok(true) => {
+                        pending_deletes.remove(&key);
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        state
+                            .log(
+                                "warn",
+                                "publisher",
+                                format!("delete queued for {key}: {error:#}"),
+                            )
+                            .await;
+                    }
+                }
+                let _ = reply.send(Ok(()));
+            }
             Command::Reconcile => {
+                for key in pending_deletes.clone() {
+                    match delete_one(&state, &ble, &key).await {
+                        Ok(true) => {
+                            pending_deletes.remove(&key);
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            state
+                                .log(
+                                    "warn",
+                                    "publisher",
+                                    format!("delete reconcile failed for {key}: {error:#}"),
+                                )
+                                .await;
+                        }
+                    }
+                }
                 for entry in cache.values_mut() {
                     entry.sent_hash = None;
                     if let Err(error) = publish_one(&state, &ble, entry, true).await {
@@ -155,6 +225,33 @@ async fn run(
             }
         }
     }
+}
+
+async fn delete_one(state: &SharedState, ble: &BleGateway, key: &str) -> Result<bool> {
+    if !ble.is_connected() {
+        state
+            .log(
+                "info",
+                "publisher",
+                format!("{key} deletion queued until BLE reconnects"),
+            )
+            .await;
+        return Ok(false);
+    }
+    ble.request("resource.delete", json!({ "key": key }))
+        .await
+        .with_context(|| format!("delete resource {key}"))?;
+    state
+        .update_device(|device| {
+            device
+                .resources
+                .retain(|item| item.get("key").and_then(Value::as_str) != Some(key));
+        })
+        .await;
+    state
+        .log("info", "publisher", format!("{key} removed"))
+        .await;
+    Ok(true)
 }
 
 async fn publish_one(
@@ -185,7 +282,7 @@ async fn publish_one(
         .device
         .resources
         .iter()
-        .find(|item| item.get("key").and_then(Value::as_str) == Some(entry.resource.key))
+        .find(|item| item.get("key").and_then(Value::as_str) == Some(entry.resource.key.as_str()))
         .and_then(|item| item.get("revision"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
@@ -222,7 +319,7 @@ async fn publish_one(
             "publisher",
             format!(
                 "{} synchronized by {}; revision={revision} hash={:08x}",
-                entry.resource.key, entry.resource.producer_id, entry.payload_hash
+                entry.resource.key, entry.resource.source_id, entry.payload_hash
             ),
         )
         .await;

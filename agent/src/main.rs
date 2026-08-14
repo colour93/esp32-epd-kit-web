@@ -1,8 +1,8 @@
 mod autostart;
 mod ble;
+mod cli;
 mod codex;
 mod coordinator;
-mod feishu;
 mod producer;
 mod protocol;
 mod publisher;
@@ -65,20 +65,20 @@ async fn prepare_service() -> Result<Service> {
         state: state.clone(),
         publisher: publisher.clone(),
     });
-    let feishu = feishu::FeishuControl::spawn(producer::ProducerContext {
+    let cli = cli::CliMetricControl::spawn(producer::ProducerContext {
         state: state.clone(),
         publisher: publisher.clone(),
     })?;
     let producers =
-        producer::ProducerRegistry::new(&state, vec![codex.control(), feishu.control()]).await?;
+        producer::ProducerRegistry::new(&state, vec![codex.control(), cli.control()]).await?;
     coordinator::SyncCoordinator::spawn(
         state.clone(),
         ble.clone(),
         producers.clone(),
-        publisher,
+        publisher.clone(),
         completion_rx,
     );
-    let context = web::WebContext::new(state.clone(), ble, producers, feishu)?;
+    let context = web::WebContext::new(state.clone(), ble, producers, cli, publisher)?;
     let port = configured_port()?;
     let launch_url = context.launch_url(port);
     let app = web::router(context);

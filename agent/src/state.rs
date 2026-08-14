@@ -59,9 +59,21 @@ pub struct DeviceStatus {
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
-pub struct ProducerStatus {
+pub struct SourceTypeStatus {
     pub id: String,
     pub title: String,
+    pub description: String,
+    pub configurable: bool,
+    pub multi_instance: bool,
+    pub auto_sync: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SourceStatus {
+    pub id: String,
+    pub type_id: String,
+    pub title: String,
+    pub enabled: bool,
     pub phase: String,
     pub resource_keys: Vec<String>,
     pub last_sync_at: Option<u64>,
@@ -74,7 +86,8 @@ pub struct ProducerStatus {
 pub struct Snapshot {
     pub agent: AgentStatus,
     pub device: DeviceStatus,
-    pub producers: Vec<ProducerStatus>,
+    pub source_types: Vec<SourceTypeStatus>,
+    pub sources: Vec<SourceStatus>,
     pub logs: Vec<LogEntry>,
 }
 
@@ -99,7 +112,8 @@ impl SharedState {
                     connection_mode: "auto".into(),
                     ..Default::default()
                 },
-                producers: Vec::new(),
+                source_types: Vec::new(),
+                sources: Vec::new(),
                 logs: Vec::new(),
             }),
             events,
@@ -119,19 +133,43 @@ impl SharedState {
         self.publish_locked(&snapshot);
     }
 
-    pub async fn register_producer(&self, producer: ProducerStatus) {
+    pub async fn register_source_type(&self, source_type: SourceTypeStatus) {
         let mut snapshot = self.snapshot.write().await;
-        if snapshot.producers.iter().all(|item| item.id != producer.id) {
-            snapshot.producers.push(producer);
+        if snapshot
+            .source_types
+            .iter()
+            .all(|item| item.id != source_type.id)
+        {
+            snapshot.source_types.push(source_type);
         }
         self.publish_locked(&snapshot);
     }
 
-    pub async fn update_producer(&self, id: &str, update: impl FnOnce(&mut ProducerStatus)) {
+    pub async fn register_source(&self, source: SourceStatus) {
         let mut snapshot = self.snapshot.write().await;
-        if let Some(producer) = snapshot.producers.iter_mut().find(|item| item.id == id) {
-            update(producer);
+        if let Some(current) = snapshot
+            .sources
+            .iter_mut()
+            .find(|item| item.id == source.id)
+        {
+            *current = source;
+        } else {
+            snapshot.sources.push(source);
         }
+        self.publish_locked(&snapshot);
+    }
+
+    pub async fn update_source(&self, id: &str, update: impl FnOnce(&mut SourceStatus)) {
+        let mut snapshot = self.snapshot.write().await;
+        if let Some(source) = snapshot.sources.iter_mut().find(|item| item.id == id) {
+            update(source);
+        }
+        self.publish_locked(&snapshot);
+    }
+
+    pub async fn remove_source(&self, id: &str) {
+        let mut snapshot = self.snapshot.write().await;
+        snapshot.sources.retain(|item| item.id != id);
         self.publish_locked(&snapshot);
     }
 

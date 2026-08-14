@@ -21,8 +21,9 @@ use tokio_stream::wrappers::BroadcastStream;
 use crate::{
     autostart,
     ble::BleGateway,
-    feishu::{FeishuConfig, FeishuControl},
+    cli::{CliMetricConfig, CliMetricControl},
     producer::ProducerRegistry,
+    publisher::ResourcePublisher,
     state::SharedState,
 };
 
@@ -33,7 +34,8 @@ pub struct WebContext {
     pub state: Arc<SharedState>,
     pub ble: BleGateway,
     pub producers: ProducerRegistry,
-    pub feishu: FeishuControl,
+    pub cli: CliMetricControl,
+    pub publisher: ResourcePublisher,
     auth: Arc<Auth>,
 }
 
@@ -47,13 +49,15 @@ impl WebContext {
         state: Arc<SharedState>,
         ble: BleGateway,
         producers: ProducerRegistry,
-        feishu: FeishuControl,
+        cli: CliMetricControl,
+        publisher: ResourcePublisher,
     ) -> Result<Self> {
         Ok(Self {
             state,
             ble,
             producers,
-            feishu,
+            cli,
+            publisher,
             auth: Arc::new(Auth {
                 install_token: load_install_token()?,
                 session_token: random_token(),
@@ -84,14 +88,22 @@ pub fn router(context: WebContext) -> Router {
         .route("/api/v1/device/page", post(page_set))
         .route("/api/v1/device/refresh", post(display_refresh))
         .route("/api/v1/device/restart", post(device_restart))
-        .route("/api/v1/producers/{id}/refresh", post(producer_refresh))
         .route(
-            "/api/v1/producers/feishu.project/config",
-            get(feishu_config_get).put(feishu_config_put),
+            "/api/v1/source-types/{id}/refresh",
+            post(source_type_refresh),
+        )
+        .route("/api/v1/sources/{id}/refresh", post(source_refresh))
+        .route(
+            "/api/v1/source-types/cli.jmespath/sources",
+            get(cli_sources_get).post(cli_source_create),
         )
         .route(
-            "/api/v1/producers/feishu.project/test",
-            post(feishu_config_test),
+            "/api/v1/source-types/cli.jmespath/sources/{id}",
+            axum::routing::put(cli_source_update).delete(cli_source_delete),
+        )
+        .route(
+            "/api/v1/source-types/cli.jmespath/test",
+            post(cli_source_test),
         )
         .route("/api/v1/agent/pause", post(agent_pause))
         .route("/api/v1/agent/autostart", post(agent_autostart))
@@ -318,6 +330,26 @@ async fn resource_get(
     Query(input): Query<ResourceQuery>,
 ) -> ApiResult<Json<Value>> {
     authenticate(&context, &headers)?;
+    if let Some(resource) = context
+        .publisher
+        .get(input.key.clone())
+        .await
+        .map_err(ApiError::internal)?
+    {
+        return Ok(Json(json!({
+            "ok": true,
+            "result": {
+                "resource": {
+                    "key": resource.key,
+                    "schema_id": resource.schema_id,
+                    "schema_version": resource.schema_version,
+                    "ttl_sec": resource.ttl_sec,
+                    "persistence": resource.persistence,
+                    "payload": resource.payload,
+                }
+            }
+        })));
+    }
     let result = context
         .ble
         .request("resource.get", json!({ "key": input.key }))
@@ -410,7 +442,7 @@ async fn device_restart(
     Ok(Json(json!({ "ok": true, "result": result })))
 }
 
-async fn producer_refresh(
+async fn source_type_refresh(
     State(context): State<WebContext>,
     Path(id): Path<String>,
     headers: HeaderMap,
@@ -423,53 +455,128 @@ async fn producer_refresh(
         .map_err(ApiError::internal)?;
     context
         .state
-        .log("info", "web", format!("producer {id} refresh queued"))
+        .log("info", "web", format!("source type {id} refresh queued"))
         .await;
     Ok(Json(json!({ "ok": true, "queued": true })))
 }
 
-async fn feishu_config_get(
+async fn source_refresh(
+    State(context): State<WebContext>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    mutation_auth(&context, &headers)?;
+    let source = context
+        .state
+        .snapshot()
+        .await
+        .sources
+        .into_iter()
+        .find(|source| source.id == id)
+        .ok_or_else(|| ApiError::invalid(anyhow!("unknown data source: {id}")))?;
+    if source.type_id == "cli.jmespath" {
+        context
+            .cli
+            .refresh_source(&source.id)
+            .await
+            .map_err(ApiError::internal)?;
+    } else {
+        context
+            .producers
+            .refresh(&source.type_id)
+            .await
+            .map_err(ApiError::internal)?;
+    }
+    context
+        .state
+        .log("info", "web", format!("source {id} refresh queued"))
+        .await;
+    Ok(Json(json!({ "ok": true, "queued": true })))
+}
+
+async fn cli_sources_get(
     State(context): State<WebContext>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     authenticate(&context, &headers)?;
     Ok(Json(
-        json!({ "ok": true, "config": context.feishu.config().await }),
+        json!({ "ok": true, "sources": context.cli.sources().await }),
     ))
 }
 
-async fn feishu_config_put(
+async fn cli_source_create(
     State(context): State<WebContext>,
     headers: HeaderMap,
-    Json(config): Json<FeishuConfig>,
+    Json(config): Json<CliMetricConfig>,
 ) -> ApiResult<Json<Value>> {
     mutation_auth(&context, &headers)?;
-    let config = context
-        .feishu
-        .save_config(config)
+    let source = context
+        .cli
+        .create_source(&context.state, config)
         .await
         .map_err(ApiError::invalid)?;
     context
         .state
-        .log("info", "web", "Feishu project configuration saved")
+        .log(
+            "info",
+            "web",
+            format!("CLI data source {} created", source.id),
+        )
         .await;
-    Ok(Json(json!({ "ok": true, "config": config })))
+    Ok(Json(json!({ "ok": true, "source": source })))
 }
 
-async fn feishu_config_test(
+async fn cli_source_update(
+    State(context): State<WebContext>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(config): Json<CliMetricConfig>,
+) -> ApiResult<Json<Value>> {
+    mutation_auth(&context, &headers)?;
+    let source = context
+        .cli
+        .update_source(&context.state, &id, config)
+        .await
+        .map_err(ApiError::invalid)?;
+    context
+        .state
+        .log("info", "web", format!("CLI data source {id} updated"))
+        .await;
+    Ok(Json(json!({ "ok": true, "source": source })))
+}
+
+async fn cli_source_delete(
+    State(context): State<WebContext>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    mutation_auth(&context, &headers)?;
+    context
+        .cli
+        .delete_source(&context.state, &id)
+        .await
+        .map_err(ApiError::invalid)?;
+    context
+        .state
+        .log("info", "web", format!("CLI data source {id} deleted"))
+        .await;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn cli_source_test(
     State(context): State<WebContext>,
     headers: HeaderMap,
-    Json(config): Json<FeishuConfig>,
+    Json(config): Json<CliMetricConfig>,
 ) -> ApiResult<Json<Value>> {
     mutation_auth(&context, &headers)?;
     let preview = context
-        .feishu
+        .cli
         .test_config(config)
         .await
         .map_err(ApiError::invalid)?;
     context
         .state
-        .log("info", "web", "Feishu project configuration tested")
+        .log("info", "web", "CLI data source instance tested")
         .await;
     Ok(Json(json!({ "ok": true, "preview": preview })))
 }

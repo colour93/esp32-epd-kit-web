@@ -1,6 +1,6 @@
 # EPD Agent 与设备工作台
 
-Rust Agent `0.2.x` 与内嵌 React 工作台，为 ESP32 E-Paper BLE Protocol v4 提供数据 Producer、设备同步和本地管理。
+Rust Agent `0.2.x` 与内嵌 React 工作台，为 ESP32 E-Paper BLE Protocol v4 提供数据源、设备同步和本地管理。
 
 ```text
 Browser -> 127.0.0.1 HTTP/SSE -> Rust Agent -> BLE v4 -> ESP32
@@ -10,7 +10,7 @@ Browser -> 127.0.0.1 HTTP/SSE -> Rust Agent -> BLE v4 -> ESP32
                                            -> SyncCoordinator
 ```
 
-Agent 是唯一 BLE 主机。React 不使用 Web Bluetooth，不直接访问云服务。Codex Producer 通过本机 `codex app-server` 读取现有登录并发布 `codex.rate_limits/v1`。
+Agent 是唯一 BLE 主机。React 不使用 Web Bluetooth，不直接访问云服务。数据源分为两层：`source_types[]` 是静态能力目录，`sources[]` 是具有独立 ID、配置、状态和资源键的实例。Codex 通过本机 `codex app-server` 读取现有登录；`cli.jmespath` 类型可创建多个实例，把不同 CLI JSON 输出分别投影为通用指标。
 
 ## 核心模块
 
@@ -18,11 +18,12 @@ Agent 是唯一 BLE 主机。React 不使用 Web Bluetooth，不直接访问云�
 - `agent/src/publisher.rs`：revision、hash、heartbeat、reconcile 和串行 Resource 写；
 - `agent/src/coordinator.rs`：battery auto-sync cycle 与唯一 `system.sync.complete`；
 - `agent/src/codex.rs`：Codex app-server 客户端、采集和 schema 投影；
+- `agent/src/cli.rs`：多实例 CLI 数据源管理、JMESPath 投影和本机私有配置；
 - `agent/src/ble.rs`：v4 扫描、重新配对、分帧、RPC 和重连；
 - `agent/src/web.rs`：loopback Axum API、SSE、本地 session 与静态资源；
-- `src/App.tsx`：动态 Page/Binding、Resource JSON、Producer、安全和诊断界面。
+- `src/App.tsx`：动态 Page/Binding、Resource JSON、数据源类型与实例、安全和诊断界面。
 
-新增 Producer 或 Page 通常不修改 React：Page 表单来自 `capabilities.pages`，Producer 列表来自 `producers[]`。完整注册规则见固件仓库的[功能组件开发规范](../esp32-epd-kit/docs/feature_component_development.md)。
+新增数据源类型或 Page 通常不修改 React：Page 表单来自 `capabilities.pages`，类型与实例分别来自 `source_types[]`、`sources[]`。CLI 实例持久化在本机 `cli-sources.json`，每个实例发布 `cli/{id}`。完整注册规则见固件仓库的[功能组件开发规范](../esp32-epd-kit/docs/feature_component_development.md)。
 
 ## 本地 API
 
@@ -30,8 +31,11 @@ Agent 是唯一 BLE 主机。React 不使用 Web Bluetooth，不直接访问云�
 
 | Route | 用途 |
 |---|---|
-| `GET /api/v1/snapshot` | Agent、设备、`producers[]` 和日志 |
-| `POST /api/v1/producers/{id}/refresh` | 按 Producer ID 刷新 |
+| `GET /api/v1/snapshot` | Agent、设备、`source_types[]`、`sources[]` 和日志 |
+| `POST /api/v1/source-types/{id}/refresh` | 刷新某类型的全部实例 |
+| `POST /api/v1/sources/{id}/refresh` | 刷新单个数据源实例 |
+| `GET/POST /api/v1/source-types/cli.jmespath/sources` | 列出或创建 CLI 实例 |
+| `PUT/DELETE /api/v1/source-types/cli.jmespath/sources/{id}` | 更新或删除 CLI 实例 |
 | `POST /api/v1/device/page` | 提交 PageSettings |
 | `GET/PUT/DELETE /api/v1/device/resource` | 读取、owner 发布、删除 Resource |
 | `PATCH /api/v1/device/config` | staged patch + commit |

@@ -15,17 +15,27 @@ use tokio::{
 };
 
 use crate::{
-    producer::{ProducerContext, ProducerControl, ProducerManifest, ProducerTrigger},
+    producer::{
+        BuiltInSourceManifest, ProducerContext, ProducerControl, ProducerManifest, ProducerTrigger,
+    },
     publisher::{ResourcePublisher, SemanticResource},
     state::{SharedState, unix_now},
 };
 
 const RESOURCE_TTL_SEC: u64 = 600;
+const SOURCE_ID: &str = "codex";
 pub static MANIFEST: ProducerManifest = ProducerManifest {
     id: "codex.usage",
     title: "Codex Usage",
-    resource_keys: &["codex/default"],
+    description: "读取本机 Codex 登录态与额度窗口",
+    configurable: false,
+    multi_instance: false,
     auto_sync: true,
+    built_in_source: Some(BuiltInSourceManifest {
+        id: SOURCE_ID,
+        title: "Codex Usage",
+        resource_keys: &["codex/default", "codex/metrics"],
+    }),
 };
 
 #[derive(Clone)]
@@ -197,10 +207,10 @@ async fn supervisor(
             )
             .await;
         state
-            .update_producer(MANIFEST.id, |producer| {
-                producer.phase = "starting".into();
-                producer.details["codex_path"] = json!(path.display().to_string());
-                producer.last_error = None;
+            .update_source(SOURCE_ID, |source| {
+                source.phase = "starting".into();
+                source.details["codex_path"] = json!(path.display().to_string());
+                source.last_error = None;
             })
             .await;
         match AppServer::start(&path, state.clone()).await {
@@ -278,20 +288,20 @@ async fn run_connected(
             .to_owned();
         let supported = matches!(account_type.as_str(), "chatgpt" | "chatgptAuthTokens");
         state
-            .update_producer(MANIFEST.id, |producer| {
-                producer.phase = if supported {
+            .update_source(SOURCE_ID, |source| {
+                source.phase = if supported {
                     "ready".into()
                 } else {
                     "auth_required".into()
                 };
-                producer.details["account_type"] = json!(account_type.clone());
-                producer.details["email"] =
+                source.details["account_type"] = json!(account_type.clone());
+                source.details["email"] =
                     account_value.get("email").cloned().unwrap_or(Value::Null);
-                producer.details["plan_type"] = account_value
+                source.details["plan_type"] = account_value
                     .get("planType")
                     .cloned()
                     .unwrap_or(Value::Null);
-                producer.last_error = if supported {
+                source.last_error = if supported {
                     None
                 } else {
                     Some("请先在 Codex 中登录 ChatGPT 账号".into())
@@ -370,10 +380,10 @@ async fn run_connected(
             Err(error) => {
                 delay = if delay == 0 { 60 } else { (delay * 2).min(900) };
                 state
-                    .update_producer(MANIFEST.id, |producer| {
-                        producer.phase = "degraded".into();
-                        producer.last_error = Some(error.to_string());
-                        producer.next_sync_at = Some(unix_now() + delay);
+                    .update_source(SOURCE_ID, |source| {
+                        source.phase = "degraded".into();
+                        source.last_error = Some(error.to_string());
+                        source.next_sync_at = Some(unix_now() + delay);
                     })
                     .await;
                 state.log("warn", "codex", error.to_string()).await;
@@ -414,10 +424,10 @@ async fn sync_once(
         .ok_or_else(|| anyhow!("app-server returned no Codex rate-limit bucket"))?;
     let snapshot = state.snapshot().await;
     let account_plan = snapshot
-        .producers
+        .sources
         .iter()
-        .find(|producer| producer.id == MANIFEST.id)
-        .and_then(|producer| producer.details.get("plan_type"))
+        .find(|source| source.id == SOURCE_ID)
+        .and_then(|source| source.details.get("plan_type"))
         .and_then(Value::as_str)
         .map(str::to_owned);
     let plan_type = selected
@@ -431,17 +441,27 @@ async fn sync_once(
     let (five_hour, seven_day) = normalized_windows(first, second);
     let payload = json!({
         "source_status": "ok",
-        "plan_type": plan_type,
+        "plan_type": plan_type.clone(),
         "selected": {
             "primary": normalize_window(five_hour),
             "secondary": normalize_window(seven_day),
         },
     });
+    let metrics_payload = json!({
+        "source_status": "ok",
+        "title": "Codex",
+        "items": [
+            percentage_metric("5h", five_hour),
+            percentage_metric("7d", seven_day),
+            reset_metric("5h 重置", five_hour),
+            reset_metric("7d 重置", seven_day),
+        ],
+    });
     let now = unix_now();
     publisher
         .publish(SemanticResource {
-            producer_id: MANIFEST.id,
-            key: "codex/default",
+            source_id: SOURCE_ID.into(),
+            key: "codex/default".into(),
             schema_id: "codex.rate_limits",
             schema_version: 1,
             ttl_sec: RESOURCE_TTL_SEC,
@@ -449,13 +469,24 @@ async fn sync_once(
             payload,
         })
         .await?;
+    publisher
+        .publish(SemanticResource {
+            source_id: SOURCE_ID.into(),
+            key: "codex/metrics".into(),
+            schema_id: "generic.metrics",
+            schema_version: 1,
+            ttl_sec: RESOURCE_TTL_SEC,
+            persistence: "snapshot",
+            payload: metrics_payload,
+        })
+        .await?;
     state
-        .update_producer(MANIFEST.id, |producer| {
-            producer.phase = "ready".into();
-            producer.last_sync_at = Some(now);
-            producer.next_sync_at = Some(now + 60);
-            producer.last_error = None;
-            producer.details["rate_limits"] = rate_limits.clone();
+        .update_source(SOURCE_ID, |source| {
+            source.phase = "ready".into();
+            source.last_sync_at = Some(now);
+            source.next_sync_at = Some(now + 60);
+            source.last_error = None;
+            source.details["rate_limits"] = rate_limits.clone();
         })
         .await;
     state
@@ -517,11 +548,37 @@ fn normalize_window(value: Option<&Value>) -> Value {
     })
 }
 
+fn percentage_metric(label: &str, value: Option<&Value>) -> Value {
+    let remaining = value
+        .and_then(|window| window.get("usedPercent"))
+        .and_then(Value::as_u64)
+        .map(|used| 100u64.saturating_sub(used.min(100)));
+    json!({
+        "label": label,
+        "data": remaining.map(Value::from).unwrap_or_else(|| json!("--")),
+        "description": "剩余",
+        "progress": remaining,
+        "format": "percent",
+    })
+}
+
+fn reset_metric(label: &str, value: Option<&Value>) -> Value {
+    let resets_at = value
+        .and_then(|window| window.get("resetsAt"))
+        .and_then(Value::as_u64);
+    json!({
+        "label": label,
+        "data": resets_at.map(Value::from).unwrap_or_else(|| json!("--")),
+        "description": "距重置",
+        "format": "countdown",
+    })
+}
+
 async fn set_codex_error(state: &SharedState, phase: &str, error: String) {
     state
-        .update_producer(MANIFEST.id, |producer| {
-            producer.phase = phase.into();
-            producer.last_error = Some(error);
+        .update_source(SOURCE_ID, |source| {
+            source.phase = phase.into();
+            source.last_error = Some(error);
         })
         .await;
 }

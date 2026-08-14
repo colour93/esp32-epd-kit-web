@@ -5,7 +5,7 @@ use tokio::sync::mpsc;
 
 use crate::{
     publisher::ResourcePublisher,
-    state::{ProducerStatus, SharedState},
+    state::{SharedState, SourceStatus, SourceTypeStatus},
 };
 
 #[derive(Clone)]
@@ -23,8 +23,18 @@ pub enum ProducerTrigger {
 pub struct ProducerManifest {
     pub id: &'static str,
     pub title: &'static str,
-    pub resource_keys: &'static [&'static str],
+    pub description: &'static str,
+    pub configurable: bool,
+    pub multi_instance: bool,
     pub auto_sync: bool,
+    pub built_in_source: Option<BuiltInSourceManifest>,
+}
+
+#[derive(Clone, Copy)]
+pub struct BuiltInSourceManifest {
+    pub id: &'static str,
+    pub title: &'static str,
+    pub resource_keys: &'static [&'static str],
 }
 
 #[derive(Clone)]
@@ -71,19 +81,32 @@ impl ProducerRegistry {
                 bail!("duplicate producer id: {}", item.manifest.id);
             }
             state
-                .register_producer(ProducerStatus {
+                .register_source_type(SourceTypeStatus {
                     id: item.manifest.id.into(),
                     title: item.manifest.title.into(),
-                    phase: "starting".into(),
-                    resource_keys: item
-                        .manifest
-                        .resource_keys
-                        .iter()
-                        .map(|key| (*key).into())
-                        .collect(),
-                    ..Default::default()
+                    description: item.manifest.description.into(),
+                    configurable: item.manifest.configurable,
+                    multi_instance: item.manifest.multi_instance,
+                    auto_sync: item.manifest.auto_sync,
                 })
                 .await;
+            if let Some(source) = item.manifest.built_in_source {
+                state
+                    .register_source(SourceStatus {
+                        id: source.id.into(),
+                        type_id: item.manifest.id.into(),
+                        title: source.title.into(),
+                        enabled: true,
+                        phase: "starting".into(),
+                        resource_keys: source
+                            .resource_keys
+                            .iter()
+                            .map(|key| (*key).into())
+                            .collect(),
+                        ..Default::default()
+                    })
+                    .await;
+            }
         }
         Ok(Self {
             items: Arc::new(items),

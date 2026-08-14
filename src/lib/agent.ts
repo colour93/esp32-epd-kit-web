@@ -112,9 +112,20 @@ export interface Bond {
   role: 'owner' | 'trusted'
 }
 
-export interface ProducerStatus {
+export interface SourceTypeStatus {
   id: string
   title: string
+  description: string
+  configurable: boolean
+  multi_instance: boolean
+  auto_sync: boolean
+}
+
+export interface SourceStatus {
+  id: string
+  type_id: string
+  title: string
+  enabled: boolean
   phase: string
   resource_keys: string[]
   last_sync_at?: number
@@ -123,19 +134,36 @@ export interface ProducerStatus {
   details: JsonObject
 }
 
-export interface FeishuProjectConfig {
-  enabled: boolean
-  display_name: string
-  command: string
-  value_expression: string
-  detail_expression: string
+export type GenericMetricFormat = 'text' | 'percent' | 'countdown'
+
+export interface CliMetricItemConfig {
+  label: string
+  data_expression: string
+  description_expression: string
+  progress_expression: string
+  format: GenericMetricFormat
 }
 
-export interface FeishuProjectPreview {
+export interface CliMetricConfig {
+  id: string
+  enabled: boolean
+  title: string
+  command: string
+  items: CliMetricItemConfig[]
+}
+
+export interface CliMetricPreviewItem {
+  label: string
+  data: unknown
+  description?: string
+  progress?: number
+  format: GenericMetricFormat
+}
+
+export interface CliMetricPreview {
   source_status: 'ok'
-  display_name: string
-  value: string
-  detail?: string
+  title: string
+  items: CliMetricPreviewItem[]
   elapsed_ms: number
   output_bytes: number
 }
@@ -150,7 +178,8 @@ export interface LogEntry {
 export interface Snapshot {
   agent: AgentStatus
   device: DeviceStatus
-  producers: ProducerStatus[]
+  source_types: SourceTypeStatus[]
+  sources: SourceStatus[]
   logs: LogEntry[]
 }
 
@@ -202,18 +231,29 @@ export const agentApi = {
     method: 'POST', body: JSON.stringify({ mode }),
   }),
   restartDevice: () => request('/api/v1/device/restart', { method: 'POST', body: '{}' }),
-  refreshProducer: (id: string) => request(`/api/v1/producers/${encodeURIComponent(id)}/refresh`, {
+  refreshSourceType: (id: string) => request(`/api/v1/source-types/${encodeURIComponent(id)}/refresh`, {
     method: 'POST', body: '{}',
   }),
-  getFeishuProjectConfig: () => request<{ config: FeishuProjectConfig }>(
-    '/api/v1/producers/feishu.project/config',
+  refreshSource: (id: string) => request(`/api/v1/sources/${encodeURIComponent(id)}/refresh`, {
+    method: 'POST', body: '{}',
+  }),
+  getCliMetricSources: () => request<{ sources: CliMetricConfig[] }>(
+    '/api/v1/source-types/cli.jmespath/sources',
   ),
-  saveFeishuProjectConfig: (config: FeishuProjectConfig) => request<{ config: FeishuProjectConfig }>(
-    '/api/v1/producers/feishu.project/config',
-    { method: 'PUT', body: JSON.stringify(config) },
+  createCliMetricSource: (source: CliMetricConfig) => request<{ source: CliMetricConfig }>(
+    '/api/v1/source-types/cli.jmespath/sources',
+    { method: 'POST', body: JSON.stringify(source) },
   ),
-  testFeishuProjectConfig: (config: FeishuProjectConfig) => request<{ preview: FeishuProjectPreview }>(
-    '/api/v1/producers/feishu.project/test',
+  updateCliMetricSource: (source: CliMetricConfig) => request<{ source: CliMetricConfig }>(
+    `/api/v1/source-types/cli.jmespath/sources/${encodeURIComponent(source.id)}`,
+    { method: 'PUT', body: JSON.stringify(source) },
+  ),
+  deleteCliMetricSource: (id: string) => request(
+    `/api/v1/source-types/cli.jmespath/sources/${encodeURIComponent(id)}`,
+    { method: 'DELETE' },
+  ),
+  testCliMetricConfig: (config: CliMetricConfig) => request<{ preview: CliMetricPreview }>(
+    '/api/v1/source-types/cli.jmespath/test',
     { method: 'POST', body: JSON.stringify(config) },
   ),
   setPaused: (enabled: boolean) => request('/api/v1/agent/pause', {

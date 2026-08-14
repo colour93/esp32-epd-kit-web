@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react'
 import {
   Activity,
   BatteryCharging,
@@ -15,15 +15,18 @@ import {
   FlaskConical,
   Gauge,
   HardDrive,
+  Hash,
   KeyRound,
   LayoutGrid,
+  Layers3,
   Link2,
   LayoutDashboard,
   LoaderCircle,
-  ListChecks,
   MonitorCog,
   Pause,
+  Pencil,
   Play,
+  Plus,
   Power,
   Radio,
   RefreshCw,
@@ -36,6 +39,7 @@ import {
   SignalLow,
   SignalMedium,
   SlidersHorizontal,
+  Terminal,
   Trash2,
   Unplug,
   Users,
@@ -63,25 +67,27 @@ import {
   type BleCandidate,
   type DeviceConfig,
   type DeviceStatus,
-  type FeishuProjectConfig,
-  type FeishuProjectPreview,
+  type CliMetricConfig,
+  type CliMetricPreview,
   type JsonObject,
   type PageCapability,
   type PageBinding,
   type PageSlotCapability,
   type PageWidgetCapability,
   type ResourceSummary,
+  type SourceStatus,
+  type SourceTypeStatus,
   type Snapshot,
 } from './lib/agent'
 
-type View = 'overview' | 'hardware' | 'resources' | 'producers' | 'security' | 'diagnostics'
+type View = 'overview' | 'hardware' | 'resources' | 'sources' | 'security' | 'diagnostics'
 type LogLevel = 'all' | 'info' | 'warn' | 'error'
 
 const NAV_ITEMS: Array<{ id: View; label: string; icon: LucideIcon }> = [
   { id: 'overview', label: '概览', icon: LayoutDashboard },
   { id: 'hardware', label: '硬件与功耗', icon: SlidersHorizontal },
   { id: 'resources', label: '资源与视图', icon: Database },
-  { id: 'producers', label: '数据源', icon: Bot },
+  { id: 'sources', label: '数据源', icon: Bot },
   { id: 'security', label: '受信主机', icon: ShieldCheck },
   { id: 'diagnostics', label: '诊断', icon: Activity },
 ]
@@ -316,7 +322,7 @@ interface LimitBucket {
 }
 
 function getCodexBucket(snapshot: Snapshot | null): LimitBucket | null {
-  const raw = snapshot?.producers.find((producer) => producer.id === 'codex.usage')?.details.rate_limits as JsonObject | undefined
+  const raw = snapshot?.sources.find((source) => source.id === 'codex')?.details.rate_limits as JsonObject | undefined
   if (!raw) return null
   const byId = raw.rateLimitsByLimitId as Record<string, LimitBucket> | undefined
   return byId?.codex ?? raw.rateLimits as LimitBucket | undefined ?? null
@@ -328,7 +334,7 @@ function slotWidgets(slot?: PageSlotCapability, pageId?: string): PageWidgetCapa
   if (slot.schema_id && slot.schema_version) return [{
     id: slot.schema_id === 'codex.rate_limits'
       ? (pageId === 'codex.usage' ? 'codex.usage.full' : 'codex.usage.compact')
-      : slot.schema_id === 'feishu.project_card' ? 'feishu.project.compact' : `${slot.schema_id}.default`,
+      : `${slot.schema_id}.default`,
     title: slot.id,
     schema_id: slot.schema_id, schema_version: slot.schema_version,
   }]
@@ -340,6 +346,183 @@ function compatibleResources(widget: PageWidgetCapability | undefined, resources
   return resources.filter((resource) => (
     resource.schema_id === widget.schema_id && resource.schema_version === widget.schema_version
   ))
+}
+
+function compatibleSlotResources(widgets: PageWidgetCapability[], resources: ResourceSummary[]) {
+  return resources.filter((resource) => widgets.some((widget) => (
+    resource.schema_id === widget.schema_id && resource.schema_version === widget.schema_version
+  )))
+}
+
+function defaultWidgetForResource(widgets: PageWidgetCapability[], resource?: ResourceSummary) {
+  if (!resource) return widgets[0]
+  const compatible = widgets.filter((widget) => (
+    widget.schema_id === resource.schema_id && widget.schema_version === resource.schema_version
+  ))
+  return resource.schema_id === 'generic.metrics'
+    ? compatible.find((widget) => widget.id === 'generic.metric.value.1') ?? compatible[0]
+    : compatible[0]
+}
+
+type MetricPresentation = 'value' | 'bar' | 'ring' | 'dual'
+
+interface MetricItemChoice {
+  index: number
+  label: string
+  description?: string
+  supportsProgress: boolean
+}
+
+const metricItemRequests = new Map<string, Promise<MetricItemChoice[]>>()
+
+function genericMetricWidget(widgetId: string) {
+  const match = /^generic\.metric\.(value|bar|ring)\.(\d+)$/.exec(widgetId)
+  if (match) return { presentation: match[1] as Exclude<MetricPresentation, 'dual'>, itemIndex: Number(match[2]) - 1 }
+  return widgetId === 'generic.metric.dual'
+    ? { presentation: 'dual' as const, itemIndex: 0 }
+    : null
+}
+
+function fallbackMetricItems(count: number) {
+  return Array.from({ length: count }, (_, index): MetricItemChoice => ({
+    index,
+    label: `数据 ${index + 1}`,
+    supportsProgress: true,
+  }))
+}
+
+function loadMetricItems(resourceKey: string, resourceRevision: number, revisionToken: string) {
+  const cacheKey = `${resourceKey}:${resourceRevision}:${revisionToken}`
+  const cached = metricItemRequests.get(cacheKey)
+  if (cached) return cached
+  const request = agentApi.getResource(resourceKey).then((response) => {
+    const payload = response.result.resource.payload
+    const items = payload && typeof payload === 'object' && !Array.isArray(payload)
+      ? (payload as JsonObject).items
+      : undefined
+    if (!Array.isArray(items)) throw new Error('资源没有可选择的数据项')
+    return items.slice(0, 4).map((raw, index): MetricItemChoice => {
+      const item = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw as JsonObject : {}
+      return {
+        index,
+        label: typeof item.label === 'string' && item.label ? item.label : `数据 ${index + 1}`,
+        description: typeof item.description === 'string' && item.description ? item.description : undefined,
+        supportsProgress: item.format === 'percent' || typeof item.progress === 'number',
+      }
+    })
+  }).catch((error) => {
+    metricItemRequests.delete(cacheKey)
+    throw error
+  })
+  metricItemRequests.set(cacheKey, request)
+  return request
+}
+
+function sourceForResource(resourceKey: string, sources: SourceStatus[]) {
+  return sources.find((source) => source.resource_keys.includes(resourceKey))
+}
+
+function WidgetBindingEditor({ slot, pageId, binding, resources, sources, onChange }: {
+  slot: PageSlotCapability
+  pageId?: string
+  binding: PageBinding
+  resources: ResourceSummary[]
+  sources: SourceStatus[]
+  onChange: (binding: PageBinding) => void
+}) {
+  const widgets = slotWidgets(slot, pageId)
+  const availableResources = compatibleSlotResources(widgets, resources)
+  const selectedResource = availableResources.find((resource) => resource.key === binding.resource_key)
+  const resourceWidgets = selectedResource
+    ? widgets.filter((widget) => widget.schema_id === selectedResource.schema_id && widget.schema_version === selectedResource.schema_version)
+    : []
+  const generic = selectedResource?.schema_id === 'generic.metrics' && selectedResource.schema_version === 1
+  const selectedWidget = resourceWidgets.find((widget) => widget.id === binding.widget_id)
+    ?? (generic ? resourceWidgets.find((widget) => widget.id === 'generic.metric.value.1') : undefined)
+    ?? resourceWidgets[0]
+  const genericSelection = genericMetricWidget(selectedWidget?.id ?? '')
+  const metricItemCount = Math.max(0, ...resourceWidgets.map((widget) => genericMetricWidget(widget.id)?.itemIndex ?? 0)) + 1
+  const fallbackItems = useMemo(() => fallbackMetricItems(metricItemCount), [metricItemCount])
+  const [metricItems, setMetricItems] = useState<MetricItemChoice[]>(fallbackItems)
+  const selectedSource = selectedResource ? sourceForResource(selectedResource.key, sources) : undefined
+  const selectedResourceKey = selectedResource?.key
+  const selectedResourceRevision = selectedResource?.revision
+  const revisionToken = selectedSource?.last_sync_at?.toString() ?? 'device'
+
+  useEffect(() => {
+    if (!generic || !selectedResourceKey || selectedResourceRevision === undefined) {
+      setMetricItems(fallbackItems)
+      return
+    }
+    let active = true
+    setMetricItems(fallbackItems)
+    loadMetricItems(selectedResourceKey, selectedResourceRevision, revisionToken)
+      .then((items) => { if (active && items.length) setMetricItems(items) })
+      .catch(() => {})
+    return () => { active = false }
+  }, [generic, selectedResourceKey, selectedResourceRevision, revisionToken, fallbackItems])
+
+  function chooseResource(resourceKey: string) {
+    const resource = availableResources.find((item) => item.key === resourceKey)
+    if (!resource) {
+      onChange({ widget_id: '', resource_key: '' })
+      return
+    }
+    const nextWidget = defaultWidgetForResource(widgets, resource)
+    onChange({ widget_id: nextWidget?.id ?? '', resource_key: resource.key })
+  }
+
+  function chooseMetricItem(itemIndex: number) {
+    const item = metricItems.find((choice) => choice.index === itemIndex)
+    const currentPresentation = genericSelection?.presentation === 'dual' ? 'value' : genericSelection?.presentation ?? 'value'
+    const presentation = item?.supportsProgress ? currentPresentation : 'value'
+    const widgetId = `generic.metric.${presentation}.${itemIndex + 1}`
+    const widget = resourceWidgets.find((candidate) => candidate.id === widgetId)
+      ?? resourceWidgets.find((candidate) => candidate.id === `generic.metric.value.${itemIndex + 1}`)
+    if (widget) onChange({ ...binding, widget_id: widget.id })
+  }
+
+  function choosePresentation(presentation: MetricPresentation) {
+    const widgetId = presentation === 'dual'
+      ? 'generic.metric.dual'
+      : `generic.metric.${presentation}.${(genericSelection?.itemIndex ?? 0) + 1}`
+    const widget = resourceWidgets.find((candidate) => candidate.id === widgetId)
+    if (widget) onChange({ ...binding, widget_id: widget.id })
+  }
+
+  const selectedItem = metricItems.find((item) => item.index === (genericSelection?.itemIndex ?? 0)) ?? metricItems[0]
+  const presentations: Array<{ id: MetricPresentation; label: string; title: string; icon: LucideIcon }> = [
+    { id: 'value', label: '数值', title: '数值', icon: Hash },
+    { id: 'bar', label: '条形', title: '条形进度', icon: Activity },
+    { id: 'ring', label: '环形', title: '环形进度', icon: Gauge },
+    { id: 'dual', label: '双项', title: '双数据', icon: LayoutGrid },
+  ]
+
+  return <div className="widget-binding-row">
+    <div className="widget-slot-name"><LayoutGrid /><span><b>{slot.title ?? slot.id}</b><small>{slot.id}{slot.required ? ' · required' : ' · optional'}</small></span></div>
+    <div className={`binding-control-grid${generic ? '' : ' simple'}`}>
+      <label className="field binding-source-field"><span>数据源 / 输出</span><select value={binding.resource_key} onChange={(event) => chooseResource(event.target.value)}>
+        <option value="">{slot.required ? '请选择数据源' : '不绑定'}</option>
+        {availableResources.map((resource) => {
+          const source = sourceForResource(resource.key, sources)
+          return <option key={resource.key} value={resource.key}>{source ? `${source.title} · ` : ''}{resource.key}</option>
+        })}
+      </select></label>
+      {generic ? <label className="field"><span>数据项</span><select value={genericSelection?.itemIndex ?? 0} onChange={(event) => chooseMetricItem(Number(event.target.value))} disabled={genericSelection?.presentation === 'dual'}>
+        {genericSelection?.presentation === 'dual' ? <option value={0}>前两项</option> : metricItems.map((item) => <option key={item.index} value={item.index}>{item.label}{item.description ? ` · ${item.description}` : ''}</option>)}
+      </select></label> : null}
+      {generic ? <div className="field"><span>呈现方式</span><div className="presentation-segment">
+        {presentations.map(({ id, label, title, icon: Icon }) => {
+          const supported = id === 'dual'
+            ? resourceWidgets.some((widget) => widget.id === 'generic.metric.dual')
+            : resourceWidgets.some((widget) => widget.id === `generic.metric.${id}.${(genericSelection?.itemIndex ?? 0) + 1}`)
+          const progressUnsupported = (id === 'bar' || id === 'ring') && !selectedItem?.supportsProgress
+          return <button key={id} type="button" title={title} aria-label={title} className={genericSelection?.presentation === id ? 'active' : ''} disabled={!supported || progressUnsupported} onClick={() => choosePresentation(id)}><Icon /><span>{label}</span></button>
+        })}
+      </div></div> : null}
+      <div className="binding-contract"><Link2 /><code>{selectedWidget ? `${selectedWidget.schema_id}/v${selectedWidget.schema_version}` : '未选择输出'}</code></div>
+    </div>
+  </div>
 }
 
 function normalizedBinding(binding?: PageBinding | string): PageBinding {
@@ -434,10 +617,43 @@ function HomeWidgetPreview({ binding, fallbackWidget, bucket, codexPlan }: {
       </div>
     </article>
   }
-  return <article className="epd-home-module feishu">
-    <header><b>飞书项目</b></header>
-    <div className="epd-home-feishu-content"><strong>--</strong><small>等待数据</small></div>
+  const [fiveHour, sevenDay] = normalizedWindows(bucket)
+  const codexItems = [
+    { label: '5h', data: fiveHour ? `${compactRemaining(fiveHour)}%` : '--', description: '剩余', progress: Number(compactRemaining(fiveHour)) || 0 },
+    { label: '7d', data: sevenDay ? `${compactRemaining(sevenDay)}%` : '--', description: '剩余', progress: Number(compactRemaining(sevenDay)) || 0 },
+    { label: '5h 重置', data: formatResetDistance(fiveHour?.resetsAt), description: '距重置', progress: 0 },
+    { label: '7d 重置', data: formatResetDistance(sevenDay?.resetsAt), description: '距重置', progress: 0 },
+  ]
+  const genericItems = binding.resource_key === 'codex/metrics'
+    ? codexItems
+    : Array.from({ length: 4 }, (_, index) => ({ label: `数据 ${index + 1}`, data: '--', description: '等待数据', progress: 0 }))
+  const title = binding.resource_key === 'codex/metrics' ? 'Codex' : 'CLI 数据'
+  if (widgetId === 'generic.metric.dual') {
+    return <article className="epd-home-module generic dual">
+      <header><b>{title}</b></header>
+      <div className="epd-home-quota-pair">{genericItems.slice(0, 2).map((item) => <div key={item.label}><small>{item.label}</small><strong>{item.data}</strong></div>)}</div>
+    </article>
+  }
+  const itemIndex = Math.max(0, Number(widgetId.split('.').at(-1) ?? 1) - 1)
+  const item = genericItems[itemIndex] ?? genericItems[0]
+  const style = widgetId.includes('.ring.') ? 'ring' : widgetId.includes('.bar.') ? 'bar' : 'value'
+  return <article className={`epd-home-module generic ${style}`}>
+    <header><b>{title}</b></header>
+    <div className="epd-generic-content">
+      <small>{item.label}</small>
+      {style === 'ring' ? <div className="epd-generic-ring" style={{ '--progress': `${item.progress * 3.6}deg` } as CSSProperties}><strong>{item.data}</strong></div> : <strong>{item.data}</strong>}
+      {style === 'bar' ? <div className="epd-generic-bar"><i style={{ width: `${item.progress}%` }} /></div> : null}
+      {style === 'value' ? <span>{item.description}</span> : null}
+    </div>
   </article>
+}
+
+function formatResetDistance(resetsAt?: number) {
+  if (!resetsAt) return '--'
+  const remaining = Math.max(0, resetsAt - Math.floor(Date.now() / 1000))
+  const hours = Math.floor(remaining / 3600)
+  if (hours >= 24) return `${Math.floor(hours / 24)}天${hours % 24}时`
+  return `${hours}时${Math.floor((remaining % 3600) / 60)}分`
 }
 
 function NumberField({ label, value, min, max, onChange, disabled }: {
@@ -449,27 +665,53 @@ function NumberField({ label, value, min, max, onChange, disabled }: {
   )
 }
 
-function FeishuProjectConfigPanel() {
-  const [draft, setDraft] = useState<FeishuProjectConfig | null>(null)
-  const [preview, setPreview] = useState<FeishuProjectPreview | null>(null)
-  const [busy, setBusy] = useState<'load' | 'test' | 'save' | null>('load')
+function newCliSource(): CliMetricConfig {
+  return {
+    id: '', enabled: true, title: 'CLI 数据', command: '',
+    items: [{ label: '数据', data_expression: '', description_expression: '', progress_expression: '', format: 'text' }],
+  }
+}
+
+function DataSourceManager({ sourceTypes, sources }: {
+  sourceTypes: SourceTypeStatus[]
+  sources: SourceStatus[]
+}) {
+  const [configs, setConfigs] = useState<CliMetricConfig[]>([])
+  const [draft, setDraft] = useState<CliMetricConfig | null>(null)
+  const [creating, setCreating] = useState(false)
+  const [preview, setPreview] = useState<CliMetricPreview | null>(null)
+  const [busy, setBusy] = useState<string | null>('load')
 
   useEffect(() => {
     let active = true
-    agentApi.getFeishuProjectConfig()
-      .then(({ config }) => { if (active) setDraft(config) })
+    agentApi.getCliMetricSources()
+      .then(({ sources: cliSources }) => { if (active) setConfigs(cliSources) })
       .catch((error) => { if (active) toast.error(errorText(error)) })
       .finally(() => { if (active) setBusy(null) })
     return () => { active = false }
   }, [])
 
+  function beginCreate() {
+    setCreating(true)
+    setPreview(null)
+    setDraft(newCliSource())
+  }
+
+  function beginEdit(id: string) {
+    const config = configs.find((source) => source.id === id)
+    if (!config) return
+    setCreating(false)
+    setPreview(null)
+    setDraft(structuredClone(config))
+  }
+
   async function testDraft() {
     if (!draft || busy) return
     setBusy('test')
     try {
-      const result = await agentApi.testFeishuProjectConfig(draft)
+      const result = await agentApi.testCliMetricConfig(draft)
       setPreview(result.preview)
-      toast.success('Meegle 查询与表达式执行成功')
+      toast.success('CLI 与 JMESPath 执行成功')
     } catch (error) {
       toast.error(errorText(error))
     } finally {
@@ -481,9 +723,56 @@ function FeishuProjectConfigPanel() {
     if (!draft || busy) return
     setBusy('save')
     try {
-      const result = await agentApi.saveFeishuProjectConfig(draft)
-      setDraft(result.config)
-      toast.success('飞书项目配置已保存')
+      const result = creating
+        ? await agentApi.createCliMetricSource(draft)
+        : await agentApi.updateCliMetricSource(draft)
+      setConfigs((current) => creating
+        ? [...current, result.source]
+        : current.map((source) => source.id === result.source.id ? result.source : source))
+      setDraft(result.source)
+      setCreating(false)
+      toast.success(creating ? 'CLI 数据源已创建' : 'CLI 数据源已保存')
+    } catch (error) {
+      toast.error(errorText(error))
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  async function refreshSource(id: string) {
+    if (busy) return
+    setBusy(`refresh:${id}`)
+    try {
+      await agentApi.refreshSource(id)
+      toast.success('数据源刷新已排队')
+    } catch (error) {
+      toast.error(errorText(error))
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  async function refreshType(id: string) {
+    if (busy) return
+    setBusy(`type:${id}`)
+    try {
+      await agentApi.refreshSourceType(id)
+      toast.success('该类型的全部数据源刷新已排队')
+    } catch (error) {
+      toast.error(errorText(error))
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  async function deleteSource(id: string) {
+    if (busy || !window.confirm(`删除数据源 ${id}？对应资源也会从设备中注销。`)) return
+    setBusy(`delete:${id}`)
+    try {
+      await agentApi.deleteCliMetricSource(id)
+      setConfigs((current) => current.filter((source) => source.id !== id))
+      if (draft?.id === id) setDraft(null)
+      toast.success('CLI 数据源已删除')
     } catch (error) {
       toast.error(errorText(error))
     } finally {
@@ -492,54 +781,106 @@ function FeishuProjectConfigPanel() {
   }
 
   return (
-    <section className="surface feishu-config">
-      <SectionTitle icon={ListChecks} title="飞书项目投影" detail="本机私有配置 · JMESPath"
-        action={<div className="feishu-actions">
-          <Button variant="outline" size="sm" disabled={!draft || !!busy} onClick={() => void testDraft()}>
-            {busy === 'test' ? <LoaderCircle className="spin" /> : <FlaskConical />}测试
-          </Button>
-          <Button size="sm" disabled={!draft || !!busy} onClick={() => void saveDraft()}>
-            {busy === 'save' ? <LoaderCircle className="spin" /> : <Save />}保存
-          </Button>
-        </div>} />
-      {draft ? <>
+    <>
+      <section className="surface source-type-section">
+        <SectionTitle icon={Layers3} title="数据源类型" detail={`${sourceTypes.length} 种能力定义`} />
+        <div className="source-type-list">
+          {sourceTypes.map((sourceType) => {
+            const count = sources.filter((source) => source.type_id === sourceType.id).length
+            const Icon = sourceType.id === 'cli.jmespath' ? Terminal : Bot
+            return <div className="source-type-row" key={sourceType.id}>
+              <span className="source-type-icon"><Icon /></span>
+              <div><b>{sourceType.title}</b><code>{sourceType.id}</code><p>{sourceType.description}</p></div>
+              <div className="source-type-facts"><span>{sourceType.configurable ? (sourceType.multi_instance ? '多实例' : '可配置') : '内置单实例'}</span><strong>{count}</strong><small>实例</small></div>
+              <div className="row-actions">
+                <Button variant="ghost" size="icon" title="刷新该类型的全部实例" disabled={!!busy} onClick={() => void refreshType(sourceType.id)}><RefreshCw className={busy === `type:${sourceType.id}` ? 'spin' : ''} /></Button>
+                {sourceType.id === 'cli.jmespath' ? <Button size="sm" disabled={!!busy} onClick={beginCreate}><Plus />添加实例</Button> : null}
+              </div>
+            </div>
+          })}
+        </div>
+      </section>
+
+      <section className="surface table-section source-instance-section">
+        <SectionTitle icon={Database} title="数据源实例" detail={`${sources.length} 个独立数据输入`}
+          action={<Button size="sm" disabled={!!busy} onClick={beginCreate}><Plus />添加 CLI 数据源</Button>} />
+        <div className="data-table source-table">
+          <div className="table-head"><span>实例 / 类型</span><span>状态</span><span>资源</span><span>最近同步</span><span>操作</span></div>
+          {sources.map((source) => <div className="table-row" key={source.id}>
+            <span><b>{source.title}</b><small>{source.id} · {source.type_id}</small></span>
+            <span><StatusPill phase={source.phase} /></span>
+            <span><code>{source.resource_keys.join(', ')}</code></span>
+            <span>{formatTime(source.last_sync_at)}<small>{source.last_error ?? (source.enabled ? '已启用' : '已停用')}</small></span>
+            <span className="row-actions">
+              <Button variant="ghost" size="icon" title="立即刷新" disabled={!!busy || !source.enabled} onClick={() => void refreshSource(source.id)}><RefreshCw className={busy === `refresh:${source.id}` ? 'spin' : ''} /></Button>
+              {source.type_id === 'cli.jmespath' ? <><Button variant="ghost" size="icon" title="编辑数据源" disabled={!!busy} onClick={() => beginEdit(source.id)}><Pencil /></Button><Button variant="ghost" size="icon" title="删除数据源" disabled={!!busy} onClick={() => void deleteSource(source.id)}><Trash2 /></Button></> : null}
+            </span>
+          </div>)}
+          {!sources.length ? <EmptyState>尚未创建数据源实例</EmptyState> : null}
+        </div>
+      </section>
+
+      {draft ? <section className="surface cli-config">
+        <SectionTitle icon={Terminal} title={creating ? '添加 CLI 数据源' : `编辑 ${draft.title}`} detail={draft.id ? `cli/${draft.id} · generic.metrics/v1` : '设置稳定 ID 后生成独立资源键'}
+          action={<div className="cli-actions">
+            <Button variant="outline" size="sm" disabled={!!busy} onClick={() => setDraft(null)}>取消</Button>
+            <Button variant="outline" size="sm" disabled={!!busy || !draft.id} onClick={() => void testDraft()}>
+              {busy === 'test' ? <LoaderCircle className="spin" /> : <FlaskConical />}测试
+            </Button>
+            <Button size="sm" disabled={!!busy || !draft.id} onClick={() => void saveDraft()}>
+              {busy === 'save' ? <LoaderCircle className="spin" /> : <Save />}{creating ? '创建' : '保存'}
+            </Button>
+          </div>} />
         <div className="settings-rows">
-          <div className="setting-toggle"><div><b>启用同步</b><span>{draft.enabled ? '参与定时与电池自动同步' : '保留配置但不执行查询'}</span></div><Switch checked={draft.enabled}
+          <div className="setting-toggle"><div><b>启用同步</b><span>{draft.enabled ? '参与定时与电池自动同步' : '保留配置但不执行命令'}</span></div><Switch checked={draft.enabled}
             onCheckedChange={(enabled) => setDraft({ ...draft, enabled })} /></div>
         </div>
-        <div className="feishu-fields">
-          <label className="field"><span>展示名</span><Input maxLength={32} value={draft.display_name}
-            onChange={(event) => setDraft({ ...draft, display_name: event.target.value })} /></label>
-          <label className="field feishu-command-field"><span>Meegle CLI 命令</span><textarea spellCheck={false} value={draft.command}
-            placeholder="meegle workitem query ... --format json"
-            onChange={(event) => setDraft({ ...draft, command: event.target.value })} /></label>
+        <div className="cli-fields">
           <div className="field-grid two">
-            <label className="field"><span>主值 JMESPath</span><Input value={draft.value_expression} placeholder="length(data)"
-              onChange={(event) => setDraft({ ...draft, value_expression: event.target.value })} /></label>
-            <label className="field"><span>详情 JMESPath</span><Input value={draft.detail_expression} placeholder="session_id"
-              onChange={(event) => setDraft({ ...draft, detail_expression: event.target.value })} /></label>
+            <label className="field"><span>实例 ID</span><Input maxLength={32} disabled={!creating} value={draft.id} placeholder="team-issues"
+              onChange={(event) => setDraft({ ...draft, id: event.target.value.toLowerCase().replace(/[^a-z0-9_-]/g, '') })} /></label>
+            <label className="field"><span>名称 / 组件标题</span><Input maxLength={32} value={draft.title}
+            onChange={(event) => setDraft({ ...draft, title: event.target.value })} /></label>
+          </div>
+          <label className="field cli-command-field"><span>CLI 命令</span><textarea spellCheck={false} value={draft.command}
+            placeholder="command --format json"
+            onChange={(event) => setDraft({ ...draft, command: event.target.value })} /></label>
+          <div className="cli-item-list">
+            {draft.items.map((item, index) => <div className="cli-item-row" key={index}>
+              <div className="cli-item-index"><b>{String(index + 1).padStart(2, '0')}</b><small>DATA</small></div>
+              <label className="field"><span>Label</span><Input maxLength={24} value={item.label} onChange={(event) => setDraft({ ...draft, items: draft.items.map((value, itemIndex) => itemIndex === index ? { ...value, label: event.target.value } : value) })} /></label>
+              <label className="field"><span>Data JMESPath</span><Input value={item.data_expression} placeholder="length(data)" onChange={(event) => setDraft({ ...draft, items: draft.items.map((value, itemIndex) => itemIndex === index ? { ...value, data_expression: event.target.value } : value) })} /></label>
+              <label className="field"><span>Description JMESPath</span><Input value={item.description_expression} placeholder="meta.description" onChange={(event) => setDraft({ ...draft, items: draft.items.map((value, itemIndex) => itemIndex === index ? { ...value, description_expression: event.target.value } : value) })} /></label>
+              <label className="field"><span>Progress JMESPath</span><Input value={item.progress_expression} placeholder="percent" onChange={(event) => setDraft({ ...draft, items: draft.items.map((value, itemIndex) => itemIndex === index ? { ...value, progress_expression: event.target.value } : value) })} /></label>
+              <label className="field"><span>格式</span><select value={item.format} onChange={(event) => setDraft({ ...draft, items: draft.items.map((value, itemIndex) => itemIndex === index ? { ...value, format: event.target.value as typeof value.format } : value) })}><option value="text">文本</option><option value="percent">百分比</option><option value="countdown">Unix 重置倒计时</option></select></label>
+              <Button variant="ghost" size="icon" title="删除数据项" disabled={draft.items.length === 1} onClick={() => setDraft({ ...draft, items: draft.items.filter((_, itemIndex) => itemIndex !== index) })}><Trash2 /></Button>
+            </div>)}
+            <Button variant="outline" size="sm" disabled={draft.items.length >= 4} onClick={() => setDraft({ ...draft, items: [...draft.items, { label: `数据 ${draft.items.length + 1}`, data_expression: '', description_expression: '', progress_expression: '', format: 'text' }] })}><Plus />添加数据项</Button>
           </div>
         </div>
-        <div className="feishu-preview">
+        <div className="cli-preview">
           <span>TEST OUTPUT</span>
-          <div><b>{preview?.display_name ?? '尚未测试'}</b><strong>{preview?.value ?? '--'}</strong></div>
-          <p>{preview?.detail ?? '—'}</p>
-          <code>{preview ? `${preview.elapsed_ms}ms · ${preview.output_bytes} bytes` : 'JMESPath preview'}</code>
+          <header><b>{preview?.title ?? '尚未测试'}</b><code>{preview ? `${preview.elapsed_ms}ms · ${preview.output_bytes} bytes` : 'JMESPath preview'}</code></header>
+          <div>{(preview?.items ?? draft.items).map((item, index) => <article key={index}><small>{item.label}</small><strong>{'data' in item ? String(item.data) : '--'}</strong><p>{'description' in item ? item.description ?? '—' : '—'}</p></article>)}</div>
         </div>
-      </> : <EmptyState>正在读取飞书项目配置</EmptyState>}
-    </section>
+      </section> : null}
+    </>
   )
 }
 
 const RESOURCE_TEMPLATE = JSON.stringify({
   key: 'example/default',
-  schema_id: 'example.card',
+  schema_id: 'generic.metrics',
   schema_version: 1,
   revision: 1,
   updated_at: Math.floor(Date.now() / 1000),
   ttl_sec: 600,
   persistence: 'snapshot',
-  payload: {},
+  payload: {
+    source_status: 'ok',
+    title: '示例数据',
+    items: [{ label: '完成度', data: 64, description: '今日', progress: 64, format: 'percent' }],
+  },
 }, null, 2)
 
 function App() {
@@ -592,8 +933,13 @@ function App() {
     setPageBindings(Object.fromEntries(Object.entries(config.page.bindings).map(([slotId, raw]) => {
       const binding = normalizedBinding(raw)
       const slot = page?.slots.find((item) => item.id === slotId)
+      const widgets = slotWidgets(slot, page?.id)
+      const resource = snapshot?.device.resources.find((item) => item.key === binding.resource_key)
+      const configuredWidget = widgets.find((widget) => widget.id === binding.widget_id && (
+        !resource || (widget.schema_id === resource.schema_id && widget.schema_version === resource.schema_version)
+      ))
       return [slotId, {
-        widget_id: binding.widget_id || slotWidgets(slot, page?.id)[0]?.id || '',
+        widget_id: configuredWidget?.id ?? defaultWidgetForResource(widgets, resource)?.id ?? '',
         resource_key: binding.resource_key,
       }]
     })))
@@ -615,9 +961,8 @@ function App() {
     }
   }
 
-  const codex = snapshot?.producers.find((producer) => producer.id === 'codex.usage')
+  const codex = snapshot?.sources.find((source) => source.id === 'codex')
   const codexPlan = typeof codex?.details.plan_type === 'string' ? codex.details.plan_type : undefined
-  const codexEmail = typeof codex?.details.email === 'string' ? codex.details.email : undefined
   const codexPath = typeof codex?.details.codex_path === 'string' ? codex.details.codex_path : undefined
   const bucket = useMemo(() => getCodexBucket(snapshot), [codex?.details.rate_limits])
   const connected = snapshot?.device.phase === 'connected'
@@ -685,17 +1030,21 @@ function App() {
   function choosePage(id: string) {
     const capability = pages.find((item) => item.id === id)
     const bindings: Record<string, PageBinding> = {}
-    for (const slot of capability?.slots ?? []) {
+    for (const [slotIndex, slot] of (capability?.slots ?? []).entries()) {
       if (slot.status !== 'active') continue
       const widgets = slotWidgets(slot, capability?.id)
       const current = normalizedBinding(config?.page.bindings[slot.id])
-      const widget = widgets.find((item) => item.id === current.widget_id) ?? widgets[0]
+      const layoutDefault = id === 'home.three' ? `generic.metric.value.${slotIndex + 1}` : undefined
+      const widget = widgets.find((item) => item.id === current.widget_id)
+        ?? widgets.find((item) => item.id === layoutDefault)
+        ?? widgets[0]
       const compatible = compatibleResources(widget, resources)
+      const autoBind = slot.required || id === 'home.three' || (id === 'home' && slot.id === 'primary')
       bindings[slot.id] = {
         widget_id: widget?.id ?? '',
         resource_key: compatible.some((resource) => resource.key === current.resource_key)
           ? current.resource_key
-          : slot.required ? compatible[0]?.key ?? '' : '',
+          : autoBind ? compatible[0]?.key ?? '' : '',
       }
     }
     setPageId(id)
@@ -779,7 +1128,7 @@ function App() {
         </nav>
         <div className="sidebar-state">
           <div><Bluetooth /><span>DEVICE</span><StatusPill phase={snapshot.device.phase} /></div>
-          <div><Bot /><span>PRODUCERS</span><StatusPill phase={snapshot.producers.every((producer) => producer.phase === 'ready') ? 'ready' : 'starting'} /></div>
+          <div><Bot /><span>SOURCES</span><StatusPill phase={snapshot.sources.every((source) => source.phase === 'ready' || source.phase === 'disabled') ? 'ready' : 'starting'} /></div>
         </div>
         <div className="agent-version">AGENT {snapshot.agent.version}<br />{snapshot.agent.platform.toUpperCase()}</div>
       </aside>
@@ -815,8 +1164,8 @@ function App() {
             <div className="metrics-grid">
               <Metric label="BLE 设备" value={PHASE_LABELS[snapshot.device.phase] ?? snapshot.device.phase}
                 detail={snapshot.device.name ?? '等待发现 EPD-KIT'} icon={Bluetooth} tone={connected ? 'green' : 'red'} />
-              <Metric label="Producer" value={`${snapshot.producers.filter((producer) => producer.phase === 'ready').length} / ${snapshot.producers.length}`}
-                detail={codex?.last_error ?? '编译期 Producer Registry'} icon={Bot} tone={snapshot.producers.every((producer) => producer.phase === 'ready') ? 'cyan' : 'default'} />
+              <Metric label="数据源" value={`${snapshot.sources.filter((source) => source.phase === 'ready').length} / ${snapshot.sources.length}`}
+                detail={codex?.last_error ?? `${snapshot.source_types.length} 种数据源类型`} icon={Bot} tone={snapshot.sources.every((source) => source.phase === 'ready' || source.phase === 'disabled') ? 'cyan' : 'default'} />
               <Metric label="同步" value={formatAge(codex?.last_sync_at)}
                 detail={`下一次 ${formatTime(codex?.next_sync_at)}`} icon={Clock3} />
               <Metric label="资源" value={String(resources.length)}
@@ -827,16 +1176,15 @@ function App() {
                 <SectionTitle icon={MonitorCog} title="当前墨水屏页面" detail={`${config?.page.id ?? '未选择'} · ${configuredResourceKeys(config?.page.bindings).join(', ')}`}
                   action={<Button size="sm" disabled={!connected || !!operation} onClick={() => void perform('display', () => agentApi.refreshDisplay('auto'), '刷新已排队')}><RefreshCw />刷新</Button>} />
                 <div className="epd-frame">
-                  <div className={`epd-screen ${config?.page.id === 'home' ? 'home' : ''}`}>
-                    {config?.page.id === 'home' ? <>
+                  <div className={`epd-screen ${config?.page.id.startsWith('home') ? 'home' : ''}`}>
+                    {config?.page.id.startsWith('home') ? <>
                       <div className="epd-home-head">
                         <b>{previewClock}</b>
                         <time>{previewDate}</time>
                         <span><i className={connected ? 'connected' : ''} />{connected ? '已连接' : '离线'}</span>
                       </div>
-                      <div className="epd-home-modules">
-                        <HomeWidgetPreview binding={pageBindings.codex} fallbackWidget="codex.usage.compact" bucket={bucket} codexPlan={codexPlan} />
-                        <HomeWidgetPreview binding={pageBindings.feishu_project} fallbackWidget="feishu.project.compact" bucket={bucket} codexPlan={codexPlan} />
+                      <div className={`epd-home-modules ${config.page.id === 'home.three' ? 'three' : 'two'}`}>
+                        {(config.page.id === 'home.three' ? ['first', 'second', 'third'] : ['primary', 'secondary']).map((slotId) => <HomeWidgetPreview key={slotId} binding={pageBindings[slotId]} fallbackWidget={slotId === 'primary' ? 'codex.usage.compact' : undefined} bucket={bucket} codexPlan={codexPlan} />)}
                       </div>
                     </> : <>
                       <div className="epd-top">
@@ -851,7 +1199,7 @@ function App() {
                 </div>
                 <div className="command-row">
                   <Button variant="outline" size="sm" disabled={!connected || !!operation} onClick={() => void perform('full', () => agentApi.refreshDisplay('full'), '全刷已排队')}><RotateCcw />全刷</Button>
-                  <Button variant="outline" size="sm" disabled={!!operation || !codex} onClick={() => void perform('producer:codex.usage', () => agentApi.refreshProducer('codex.usage'), 'Codex 读取已排队')}><Bot />同步额度</Button>
+                  <Button variant="outline" size="sm" disabled={!!operation || !codex} onClick={() => void perform('source:codex', () => agentApi.refreshSource('codex'), 'Codex 读取已排队')}><Bot />同步额度</Button>
                   <Button variant="outline" size="sm" disabled={!owner || !!operation} onClick={() => void perform('restart', agentApi.restartDevice, '设备即将重启')}><Power />重启设备</Button>
                 </div>
               </section>
@@ -918,27 +1266,17 @@ function App() {
                 action={<Button size="sm" disabled={!owner || !pageId || !requiredBindingsReady || !!operation}
                   onClick={() => void perform('page', () => agentApi.setPage({ id: pageId, bindings: serializedBindings(selectedPage, pageBindings) }), '页面布局已应用', true)}><Save />应用</Button>} />
               <div className="settings-fields page-binding-editor">
-                <label className="field"><span>Page</span><select value={pageId} onChange={(event) => choosePage(event.target.value)}>{pages.map((item) => <option key={item.id} value={item.id}>{item.title} · {item.id}</option>)}</select></label>
+                <div className="page-mode-row">
+                  <label className="field"><span>Page</span><select value={pageId === 'home.three' ? 'home' : pageId} onChange={(event) => choosePage(event.target.value)}>{pages.filter((item) => item.id !== 'home.three').map((item) => <option key={item.id} value={item.id}>{item.title} · {item.id}</option>)}</select></label>
+                  {pageId.startsWith('home') && pages.some((item) => item.id === 'home.three') ? <div className="field"><span>布局</span><div className="layout-segment"><button className={pageId === 'home' ? 'active' : ''} type="button" onClick={() => choosePage('home')}><LayoutGrid />2 组件</button><button className={pageId === 'home.three' ? 'active' : ''} type="button" onClick={() => choosePage('home.three')}><LayoutGrid />3 组件</button></div></div> : null}
+                </div>
                 <div className="widget-binding-list">
                   {selectedPage?.slots.map((slot) => {
                     if (slot.status === 'reserved') return <div className="widget-binding-row reserved" key={slot.id}><div><LayoutGrid /><span><b>{slot.title ?? slot.id}</b><small>{slot.id} · reserved</small></span></div><span>不可配置</span></div>
                     const widgets = slotWidgets(slot, selectedPage?.id)
                     const binding = pageBindings[slot.id] ?? { widget_id: widgets[0]?.id ?? '', resource_key: '' }
-                    const widget = widgets.find((item) => item.id === binding.widget_id) ?? widgets[0]
-                    const compatible = compatibleResources(widget, resources)
-                    return <div className="widget-binding-row" key={slot.id}>
-                      <div className="widget-slot-name"><LayoutGrid /><span><b>{slot.title ?? slot.id}</b><small>{slot.id}{slot.required ? ' · required' : ' · optional'}</small></span></div>
-                      <label className="field"><span>展示组件</span><select value={binding.widget_id} onChange={(event) => {
-                        const nextWidget = widgets.find((item) => item.id === event.target.value)
-                        const nextResources = compatibleResources(nextWidget, resources)
-                        setPageBindings({ ...pageBindings, [slot.id]: {
-                          widget_id: event.target.value,
-                          resource_key: nextResources.some((item) => item.key === binding.resource_key) ? binding.resource_key : nextResources[0]?.key ?? '',
-                        } })
-                      }}><option value="">空组件位</option>{widgets.map((item) => <option key={item.id} value={item.id}>{item.title}</option>)}</select></label>
-                      <label className="field"><span>数据源</span><select value={binding.resource_key} disabled={!binding.widget_id} onChange={(event) => setPageBindings({ ...pageBindings, [slot.id]: { ...binding, resource_key: event.target.value } })}><option value="">{slot.required ? '请选择数据源' : '不绑定'}</option>{compatible.map((resource) => <option key={resource.key} value={resource.key}>{resource.key}</option>)}</select></label>
-                      <div className="binding-contract"><Link2 /><code>{widget ? `${widget.schema_id}/v${widget.schema_version}` : '未选择组件'}</code></div>
-                    </div>
+                    return <WidgetBindingEditor key={slot.id} slot={slot} pageId={selectedPage?.id} binding={binding} resources={resources} sources={snapshot.sources}
+                      onChange={(nextBinding) => setPageBindings((current) => ({ ...current, [slot.id]: nextBinding }))} />
                   })}
                 </div>
               </div>
@@ -963,18 +1301,8 @@ function App() {
             </section>
           </> : null}
 
-          {view === 'producers' ? <>
-            {snapshot.producers.map((producer) => <Fragment key={producer.id}>
-              <section className="surface producer-status">
-                <SectionTitle icon={Bot} title={producer.title} detail={`${producer.id} · ${producer.resource_keys.join(', ')}`}
-                  action={<Button size="sm" disabled={!!operation} onClick={() => void perform(`producer:${producer.id}`, () => agentApi.refreshProducer(producer.id), `${producer.title} 已排队`)}><RefreshCw />立即刷新</Button>} />
-                <div className="account-line"><StatusPill phase={producer.phase} /><div><b>{producer.id === 'codex.usage' ? codexEmail ?? '未识别账号' : producer.title}</b><span>{producer.id === 'codex.usage' ? formatPlanName(codexPlan) : producer.resource_keys.join(', ')}</span></div><div><small>最近同步</small><b>{formatTime(producer.last_sync_at)}</b></div></div>
-                {producer.last_error ? <div className="inline-error"><CircleAlert />{producer.last_error}</div> : null}
-                <pre className="producer-details">{JSON.stringify(producer.details, null, 2)}</pre>
-              </section>
-              {producer.id === 'feishu.project' ? <FeishuProjectConfigPanel /> : null}
-            </Fragment>)}
-            {!snapshot.producers.length ? <section className="surface"><EmptyState>没有已注册 Producer</EmptyState></section> : null}
+          {view === 'sources' ? <>
+            <DataSourceManager sourceTypes={snapshot.source_types} sources={snapshot.sources} />
             {codex ? <section className="surface quota-section">
               <SectionTitle icon={Gauge} title={bucket?.limitName ?? 'Codex 额度'} detail={bucket?.rateLimitReachedType ? `LIMIT: ${bucket.rateLimitReachedType}` : '当前计量窗口'} />
               <div className="quota-grid"><QuotaWindow title="主窗口" window={bucket?.primary} /><QuotaWindow title="次窗口" window={bucket?.secondary} /></div>

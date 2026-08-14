@@ -80,6 +80,7 @@ bun run package:agent
 ```
 
 构建脚本会运行 Bun production build，并把 `dist/` 嵌入 Rust binary。macOS 使用用户 LaunchAgent，Windows 使用 HKCU Run。
+推送 `v` 前缀 tag（如 `v0.2.0`）会构建 macOS arm64 与 Windows x64 二进制和安装包，并上传到对应 GitHub Release。
 
 ## 本地安全
 

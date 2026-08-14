@@ -3,6 +3,7 @@ mod ble;
 mod cli;
 mod codex;
 mod coordinator;
+mod instance;
 mod producer;
 mod protocol;
 mod publisher;
@@ -32,6 +33,11 @@ fn main() -> Result<()> {
     if std::env::args().any(|argument| argument == "--disable-autostart") {
         return autostart::set_enabled(false);
     }
+
+    let Some(_instance_guard) = instance::acquire()? else {
+        tracing::info!("EPD Agent is already running; skipping duplicate startup");
+        return Ok(());
+    };
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

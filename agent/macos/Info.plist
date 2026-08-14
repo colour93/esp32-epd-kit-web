@@ -7,15 +7,11 @@
     <key>CFBundleExecutable</key>
     <string>epd-agent</string>
     <key>CFBundleIdentifier</key>
-    <string>dev.epd-kit.agent</string>
+    <string>icu.fur93.epd-agent</string>
     <key>CFBundleName</key>
     <string>EPD Agent</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
-    <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
-    <key>CFBundleVersion</key>
-    <string>0.1.0</string>
     <key>LSUIElement</key>
     <true/>
     <key>NSBluetoothAlwaysUsageDescription</key>

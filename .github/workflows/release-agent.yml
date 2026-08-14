@@ -1,0 +1,94 @@
+name: Release EPD Agent
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: release-epd-agent-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+            formats: app,dmg
+            artifact_name: epd-agent-macos-aarch64
+            artifact_paths: |
+              agent/target/aarch64-apple-darwin/release/epd-agent
+              agent/target/aarch64-apple-darwin/release/*.dmg
+          - name: Windows x64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            formats: nsis
+            artifact_name: epd-agent-windows-x86_64
+            artifact_paths: |
+              agent/target/x86_64-pc-windows-msvc/release/*.exe
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build management UI
+        run: bun run build
+
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Install cargo-packager
+        run: cargo install cargo-packager --locked --version 0.11.8
+
+      - name: Build agent
+        env:
+          EPD_AGENT_SKIP_WEB_BUILD: "1"
+        run: cargo build --release --locked --manifest-path agent/Cargo.toml --target ${{ matrix.target }}
+
+      - name: Package agent
+        run: cargo packager --release --manifest-path agent/Cargo.toml --target ${{ matrix.target }} --formats ${{ matrix.formats }}
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_paths }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create release and upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --verify-tag --generate-notes --title "EPD Agent $tag"
+          fi
+          mapfile -d '' assets < <(find release-assets -type f -print0)
+          gh release upload "$tag" "${assets[@]}" --clobber

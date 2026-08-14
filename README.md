@@ -92,3 +92,5 @@ bun run package:agent
 - 浏览器无 BLE、Codex stdio 或云凭据访问能力。
 
 协议与数据契约见 [BLE Protocol v4](../esp32-epd-kit/docs/ble_protocol_v4.md)、[v4 架构](../esp32-epd-kit/docs/architecture_v4.md)和 [Codex schema](../esp32-epd-kit/docs/openai_codex_usage.md)。
+
+设备通过物理串口执行 `setup` 后会广播 setup 标志 120 秒。Windows 若保留了设备端已经丢失的旧配对，Agent 会在该窗口内首次安全握手失败后清除本机旧记录并重新触发系统配对；正常重连不会清除 bond。

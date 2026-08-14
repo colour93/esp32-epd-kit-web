@@ -64,6 +64,7 @@ struct AdvertisementState {
     owned: Option<bool>,
     battery: Option<bool>,
     fast_advertising: Option<bool>,
+    setup_mode: Option<bool>,
 }
 
 struct Command {
@@ -237,6 +238,7 @@ struct Session {
     assembler: FrameAssembler,
     next_id: AtomicU32,
     frame_bytes: usize,
+    setup_mode: bool,
 }
 
 struct ScanCleanup {
@@ -267,6 +269,7 @@ async fn supervisor(
     connected: Arc<AtomicBool>,
 ) {
     let mut backoff = 1u64;
+    let mut repaired_pairing_for: Option<String> = None;
     let mut preferred_target = match load_saved_target() {
         Ok(target) => target,
         Err(error) => {
@@ -329,6 +332,37 @@ async fn supervisor(
                     connected.store(false, Ordering::Release);
                     state.log("error", "ble", format!("{error:#}")).await;
                     disconnect_peripheral(&session.peripheral).await;
+                    let should_repair = session.setup_mode
+                        && is_link_error(&error)
+                        && repaired_pairing_for.as_deref() != Some(&session.device_id);
+                    if should_repair {
+                        match platform_repair_pairing(&session.peripheral, &session.device_name)
+                            .await
+                        {
+                            Ok(true) => {
+                                repaired_pairing_for = Some(session.device_id.clone());
+                                state
+                                    .log(
+                                        "info",
+                                        "ble",
+                                        "removed stale Windows pairing; system re-pair completed",
+                                    )
+                                    .await;
+                            }
+                            Ok(false) => {}
+                            Err(repair_error) => {
+                                state
+                                    .log(
+                                        "warn",
+                                        "ble",
+                                        format!(
+                                            "cannot repair Windows BLE pairing: {repair_error:#}"
+                                        ),
+                                    )
+                                    .await;
+                            }
+                        }
+                    }
                     state
                         .update_device(|device| {
                             device.phase = "reconnecting".into();
@@ -340,6 +374,7 @@ async fn supervisor(
                         .await;
                     continue;
                 }
+                repaired_pairing_for = None;
                 let target = SavedTarget {
                     id: session.device_id.clone(),
                     name: session.device_name.clone(),
@@ -554,7 +589,8 @@ async fn connect(
     state
         .log("info", "ble", format!("using adapter {adapter_name}"))
         .await;
-    let Some(peripheral) = discover(state, &adapter, desired, preferred_target, intent).await?
+    let Some((peripheral, advertisement)) =
+        discover(state, &adapter, desired, preferred_target, intent).await?
     else {
         return Ok(None);
     };
@@ -656,6 +692,7 @@ async fn connect(
             assembler: FrameAssembler::default(),
             next_id: AtomicU32::new(1),
             frame_bytes: 20,
+            setup_mode: advertisement.setup_mode.unwrap_or(false),
         })
       } => Some(result),
       changed = intent.changed() => {
@@ -682,7 +719,7 @@ async fn discover(
     desired: &ConnectionIntent,
     preferred_target: Option<&SavedTarget>,
     intent: &mut watch::Receiver<ConnectionIntent>,
-) -> Result<Option<Peripheral>> {
+) -> Result<Option<(Peripheral, AdvertisementState)>> {
     let connection_mode = match desired {
         ConnectionIntent::Auto => "auto",
         ConnectionIntent::Scan => "scan",
@@ -720,6 +757,7 @@ async fn discover(
     let mut observed = HashSet::new();
     let mut candidates = HashMap::<String, BleCandidate>::new();
     let mut candidate_peripherals = HashMap::<String, Peripheral>::new();
+    let mut candidate_advertisements = HashMap::<String, AdvertisementState>::new();
     loop {
         let peripherals = match adapter.peripherals().await {
             Ok(peripherals) => peripherals,
@@ -786,6 +824,7 @@ async fn discover(
                         last_seen_at: unix_now(),
                     },
                 );
+                candidate_advertisements.insert(identity.clone(), advertisement);
                 candidate_peripherals.insert(identity, peripheral);
             }
         }
@@ -864,7 +903,16 @@ async fn discover(
                     format!("EPD-KIT candidate selected id={selected_id}"),
                 )
                 .await;
-            return Ok(candidate_peripherals.get(&selected_id).cloned());
+            return Ok(candidate_peripherals
+                .get(&selected_id)
+                .cloned()
+                .map(|peripheral| {
+                    let advertisement = candidate_advertisements
+                        .get(&selected_id)
+                        .copied()
+                        .unwrap_or_default();
+                    (peripheral, advertisement)
+                }));
         }
 
         if tokio::time::Instant::now() >= deadline {
@@ -1023,6 +1071,7 @@ fn advertisement_state(manufacturer_data: &HashMap<u16, Vec<u8>>) -> Advertiseme
         owned: Some(flags & 0x01 != 0),
         battery: Some(flags & 0x02 != 0),
         fast_advertising: Some(flags & 0x08 != 0),
+        setup_mode: Some(flags & 0x10 != 0),
     }
 }
 
@@ -1205,29 +1254,82 @@ async fn platform_pairing_hint(_peripheral: &Peripheral, name: &str) -> Result<(
     };
 
     let selector = BluetoothLEDevice::GetDeviceSelector()?;
-    let devices = DeviceInformation::FindAllAsyncAqsFilter(&selector)?.await?;
-    for device in devices {
-        if device.Name()?.to_string() != name {
-            continue;
+    let device = {
+        let devices = DeviceInformation::FindAllAsyncAqsFilter(&selector)?.await?;
+        let mut matching_device = None;
+        for device in devices {
+            if device.Name()?.to_string() == name {
+                matching_device = Some(device);
+                break;
+            }
         }
-        let pairing = device.Pairing()?;
-        if pairing.IsPaired()? {
-            return Ok(());
-        }
-        let result = pairing
-            .PairWithProtectionLevelAsync(
-                DevicePairingProtectionLevel::EncryptionAndAuthentication,
-            )?
-            .await?;
-        return match result.Status()? {
-            DevicePairingResultStatus::Paired | DevicePairingResultStatus::AlreadyPaired => Ok(()),
-            status => bail!("Windows BLE pairing failed: {status:?}"),
-        };
+        matching_device
+    };
+    let Some(device) = device else {
+        return Ok(());
+    };
+
+    let pairing = device.Pairing()?;
+    if pairing.IsPaired()? {
+        return Ok(());
     }
-    Ok(())
+    let result = pairing
+        .PairWithProtectionLevelAsync(DevicePairingProtectionLevel::EncryptionAndAuthentication)?
+        .await?;
+    match result.Status()? {
+        DevicePairingResultStatus::Paired | DevicePairingResultStatus::AlreadyPaired => Ok(()),
+        status => bail!("Windows BLE pairing failed: {status:?}"),
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
 async fn platform_pairing_hint(_peripheral: &Peripheral, _name: &str) -> Result<()> {
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+async fn platform_repair_pairing(_peripheral: &Peripheral, name: &str) -> Result<bool> {
+    use windows::Devices::{
+        Bluetooth::BluetoothLEDevice,
+        Enumeration::{
+            DeviceInformation, DevicePairingProtectionLevel, DevicePairingResultStatus,
+            DeviceUnpairingResultStatus,
+        },
+    };
+
+    let selector = BluetoothLEDevice::GetDeviceSelector()?;
+    let devices = DeviceInformation::FindAllAsyncAqsFilter(&selector)?.await?;
+    let mut matching_device = None;
+    for device in devices {
+        if device.Name()?.to_string() == name {
+            matching_device = Some(device);
+            break;
+        }
+    }
+    let Some(device) = matching_device else {
+        return Ok(false);
+    };
+    let pairing = device.Pairing()?;
+    if !pairing.IsPaired()? {
+        return Ok(false);
+    }
+
+    let unpair = pairing.UnpairAsync()?.await?;
+    match unpair.Status()? {
+        DeviceUnpairingResultStatus::Unpaired | DeviceUnpairingResultStatus::AlreadyUnpaired => {}
+        status => bail!("Windows BLE unpair failed: {status:?}"),
+    }
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let result = pairing
+        .PairWithProtectionLevelAsync(DevicePairingProtectionLevel::EncryptionAndAuthentication)?
+        .await?;
+    match result.Status()? {
+        DevicePairingResultStatus::Paired | DevicePairingResultStatus::AlreadyPaired => Ok(true),
+        status => bail!("Windows BLE re-pair failed: {status:?}"),
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+async fn platform_repair_pairing(_peripheral: &Peripheral, _name: &str) -> Result<bool> {
+    Ok(false)
 }

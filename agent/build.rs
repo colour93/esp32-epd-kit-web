@@ -55,7 +55,8 @@ fn collect(root: &Path, directory: &Path, generated: &mut String) {
         let relative = path
             .strip_prefix(root)
             .expect("relative asset")
-            .to_string_lossy();
+            .to_string_lossy()
+            .replace('\\', "/");
         let mime = mime(&path);
         generated.push_str(&format!(
             "    ({relative:?}, include_bytes!({absolute:?}), {mime:?}),\n",

@@ -769,30 +769,42 @@ async fn reload_device(context: &WebContext) -> Result<()> {
     Ok(())
 }
 
-async fn static_asset(State(_context): State<WebContext>, request: Request<Body>) -> Response {
+async fn static_asset(request: Request<Body>) -> Response {
     let requested = request.uri().path().trim_start_matches('/');
     let path = if requested.is_empty() {
         "index.html"
     } else {
         requested
     };
-    let asset = WEB_ASSETS
-        .iter()
-        .find(|(name, _, _)| *name == path)
-        .or_else(|| WEB_ASSETS.iter().find(|(name, _, _)| *name == "index.html"));
-    let Some((_, bytes, mime)) = asset else {
+    if WEB_ASSETS.is_empty() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "Web assets were not embedded",
         )
             .into_response();
+    }
+    let asset = WEB_ASSETS.iter().find(|(name, _, _)| *name == path);
+    let asset = match asset {
+        Some(asset) => asset,
+        None if !path.rsplit('/').next().unwrap_or(path).contains('.') => {
+            let Some(index) = WEB_ASSETS.iter().find(|(name, _, _)| *name == "index.html") else {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Web assets were not embedded",
+                )
+                    .into_response();
+            };
+            index
+        }
+        None => return StatusCode::NOT_FOUND.into_response(),
     };
+    let (name, bytes, mime) = asset;
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, *mime)
         .header(
             header::CACHE_CONTROL,
-            if path == "index.html" {
+            if *name == "index.html" {
                 "no-store"
             } else {
                 "public, max-age=31536000, immutable"
@@ -936,5 +948,54 @@ impl IntoResponse for ApiError {
             Json(json!({ "error": { "message": self.message } })),
         )
             .into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode, header},
+    };
+
+    use super::{WEB_ASSETS, static_asset};
+
+    #[test]
+    fn embedded_asset_names_use_url_separators() {
+        for (name, _, _) in WEB_ASSETS {
+            assert!(!name.contains('\\'), "invalid embedded asset URL: {name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn embedded_javascript_is_served_with_javascript_mime() {
+        let name = WEB_ASSETS
+            .iter()
+            .find_map(|(name, _, _)| name.ends_with(".js").then_some(*name))
+            .expect("embedded JavaScript asset");
+        let request = Request::builder()
+            .uri(format!("/{name}"))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = static_asset(request).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/javascript; charset=utf-8"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_javascript_does_not_fall_back_to_html() {
+        let request = Request::builder()
+            .uri("/assets/missing.js")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = static_asset(request).await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }

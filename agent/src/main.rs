@@ -161,7 +161,10 @@ fn run_desktop(runtime: tokio::runtime::Runtime) -> Result<()> {
 
     let service = runtime.block_on(prepare_service())?;
     let paused = runtime.block_on(service.state.paused());
-    let mut event_loop = EventLoopBuilder::<DesktopEvent>::with_user_event().build();
+    let event_loop = EventLoopBuilder::<DesktopEvent>::with_user_event().build();
+
+    #[cfg(target_os = "macos")]
+    let mut event_loop = event_loop;
 
     #[cfg(target_os = "macos")]
     {

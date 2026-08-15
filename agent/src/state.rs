@@ -55,7 +55,15 @@ pub struct DeviceStatus {
     pub resources: Vec<Value>,
     pub bonds: Vec<Value>,
     pub diagnostics: Option<Value>,
+    pub pairing: Option<PairingStatus>,
     pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PairingStatus {
+    pub request_id: String,
+    pub device_name: String,
+    pub expires_at: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]

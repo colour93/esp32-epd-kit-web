@@ -20,17 +20,18 @@ use btleplug::{
 use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::sync::{Mutex, broadcast, mpsc, oneshot, watch};
 
 use crate::{
     protocol::{self, FrameAssembler, MessageKind},
-    state::{BleCandidate, SharedState, unix_now},
+    state::{BleCandidate, PairingStatus, SharedState, unix_now},
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(18);
+const PAIRING_PIN_TIMEOUT: Duration = Duration::from_secs(90);
 const INTERNAL_COMPANY_ID: u16 = 0xffff;
 
 #[derive(Debug)]
@@ -88,6 +89,156 @@ pub struct BleGateway {
     device_events: broadcast::Sender<String>,
     connected: Arc<AtomicBool>,
     state: Arc<SharedState>,
+    pairing: PairingBroker,
+}
+
+#[derive(Clone)]
+struct PairingBroker {
+    state: Arc<SharedState>,
+    pending: Arc<Mutex<Option<PendingPairing>>>,
+}
+
+struct PendingPairing {
+    request_id: String,
+    reply: Option<oneshot::Sender<String>>,
+}
+
+impl PairingBroker {
+    fn new(state: Arc<SharedState>) -> Self {
+        Self {
+            state,
+            pending: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    async fn request_pin(&self, device_name: &str) -> Result<String> {
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let (reply, response) = oneshot::channel();
+        {
+            let mut pending = self.pending.lock().await;
+            if pending.is_some() {
+                bail!("another Windows BLE pairing request is already active");
+            }
+            *pending = Some(PendingPairing {
+                request_id: request_id.clone(),
+                reply: Some(reply),
+            });
+        }
+        self.state
+            .update_device(|device| {
+                device.pairing = Some(PairingStatus {
+                    request_id: request_id.clone(),
+                    device_name: device_name.to_owned(),
+                    expires_at: unix_now() + PAIRING_PIN_TIMEOUT.as_secs(),
+                });
+            })
+            .await;
+        self.state
+            .log(
+                "info",
+                "ble.pairing",
+                format!("waiting for the six-digit passkey shown on {device_name}"),
+            )
+            .await;
+
+        let result = match tokio::time::timeout(PAIRING_PIN_TIMEOUT, response).await {
+            Ok(Ok(pin)) => Ok(pin),
+            Ok(Err(_)) => Err(anyhow!("Windows BLE pairing was cancelled")),
+            Err(_) => Err(anyhow!("Windows BLE pairing passkey timed out")),
+        };
+        self.finish(&request_id).await;
+        result
+    }
+
+    async fn submit_pin(&self, request_id: &str, pin: String) -> Result<()> {
+        validate_pairing_pin(&pin)?;
+        let sender = {
+            let mut pending = self.pending.lock().await;
+            let active = pending
+                .as_mut()
+                .filter(|active| active.request_id == request_id)
+                .ok_or_else(|| anyhow!("Windows BLE pairing request is no longer active"))?;
+            active
+                .reply
+                .take()
+                .ok_or_else(|| anyhow!("Windows BLE pairing passkey was already submitted"))?
+        };
+        sender
+            .send(pin)
+            .map_err(|_| anyhow!("Windows BLE pairing request is no longer active"))?;
+        self.state
+            .log("info", "ble.pairing", "pairing passkey submitted")
+            .await;
+        Ok(())
+    }
+
+    async fn cancel(&self, request_id: &str) -> Result<()> {
+        let cancelled = {
+            let mut pending = self.pending.lock().await;
+            if pending
+                .as_ref()
+                .is_some_and(|active| active.request_id == request_id)
+            {
+                pending.take();
+                true
+            } else {
+                false
+            }
+        };
+        if !cancelled {
+            bail!("Windows BLE pairing request is no longer active");
+        }
+        self.clear_status(request_id).await;
+        self.state
+            .log("info", "ble.pairing", "pairing request cancelled")
+            .await;
+        Ok(())
+    }
+
+    async fn cancel_active(&self) {
+        let request_id = self
+            .pending
+            .lock()
+            .await
+            .take()
+            .map(|active| active.request_id);
+        if let Some(request_id) = request_id {
+            self.clear_status(&request_id).await;
+        }
+    }
+
+    async fn finish(&self, request_id: &str) {
+        let mut pending = self.pending.lock().await;
+        if pending
+            .as_ref()
+            .is_some_and(|active| active.request_id == request_id)
+        {
+            pending.take();
+        }
+        drop(pending);
+        self.clear_status(request_id).await;
+    }
+
+    async fn clear_status(&self, request_id: &str) {
+        self.state
+            .update_device(|device| {
+                if device
+                    .pairing
+                    .as_ref()
+                    .is_some_and(|pairing| pairing.request_id == request_id)
+                {
+                    device.pairing = None;
+                }
+            })
+            .await;
+    }
+}
+
+fn validate_pairing_pin(pin: &str) -> Result<()> {
+    if pin.len() != 6 || !pin.bytes().all(|byte| byte.is_ascii_digit()) {
+        bail!("pairing passkey must contain exactly six digits");
+    }
+    Ok(())
 }
 
 impl BleGateway {
@@ -96,12 +247,14 @@ impl BleGateway {
         let (intent, intent_receiver) = watch::channel(ConnectionIntent::Auto);
         let (device_events, _) = broadcast::channel(32);
         let connected = Arc::new(AtomicBool::new(false));
+        let pairing = PairingBroker::new(state.clone());
         let gateway = Self {
             commands,
             intent,
             device_events,
             connected,
             state: state.clone(),
+            pairing: pairing.clone(),
         };
         tokio::spawn(supervisor(
             state,
@@ -110,6 +263,7 @@ impl BleGateway {
             intent_receiver,
             gateway.device_events.clone(),
             gateway.connected.clone(),
+            pairing,
         ));
         gateway
     }
@@ -141,6 +295,7 @@ impl BleGateway {
     }
 
     pub async fn scan(&self) {
+        self.pairing.cancel_active().await;
         self.state
             .update_device(|device| {
                 device.phase = "scanning".into();
@@ -163,6 +318,7 @@ impl BleGateway {
         if id.is_empty() {
             bail!("BLE device id is required");
         }
+        self.pairing.cancel_active().await;
         let snapshot = self.state.snapshot().await;
         if !snapshot
             .device
@@ -193,6 +349,7 @@ impl BleGateway {
     }
 
     pub async fn auto_connect(&self) {
+        self.pairing.cancel_active().await;
         self.state
             .update_device(|device| {
                 device.phase = "scanning".into();
@@ -209,6 +366,7 @@ impl BleGateway {
     }
 
     pub async fn disconnect(&self) {
+        self.pairing.cancel_active().await;
         let disconnecting = self.connected.load(Ordering::Acquire);
         self.state
             .update_device(|device| {
@@ -227,6 +385,14 @@ impl BleGateway {
             .log("info", "ble", "BLE disconnect requested")
             .await;
     }
+
+    pub async fn submit_pairing_pin(&self, request_id: &str, pin: String) -> Result<()> {
+        self.pairing.submit_pin(request_id, pin).await
+    }
+
+    pub async fn cancel_pairing(&self, request_id: &str) -> Result<()> {
+        self.pairing.cancel(request_id).await
+    }
 }
 
 struct Session {
@@ -238,7 +404,7 @@ struct Session {
     assembler: FrameAssembler,
     next_id: AtomicU32,
     frame_bytes: usize,
-    setup_mode: bool,
+    pairing_repair_allowed: bool,
 }
 
 struct ScanCleanup {
@@ -267,6 +433,7 @@ async fn supervisor(
     mut intent: watch::Receiver<ConnectionIntent>,
     device_events: broadcast::Sender<String>,
     connected: Arc<AtomicBool>,
+    pairing: PairingBroker,
 ) {
     let mut backoff = 1u64;
     let mut repaired_pairing_for: Option<String> = None;
@@ -311,8 +478,14 @@ async fn supervisor(
             continue;
         }
 
-        let connect_result =
-            connect(&state, &desired, preferred_target.as_ref(), &mut intent).await;
+        let connect_result = connect(
+            &state,
+            &desired,
+            preferred_target.as_ref(),
+            &mut intent,
+            &pairing,
+        )
+        .await;
         match connect_result {
             Ok(Some(mut session)) => {
                 backoff = 1;
@@ -332,15 +505,19 @@ async fn supervisor(
                     connected.store(false, Ordering::Release);
                     state.log("error", "ble", format!("{error:#}")).await;
                     disconnect_peripheral(&session.peripheral).await;
-                    let should_repair = session.setup_mode
+                    let should_repair = session.pairing_repair_allowed
                         && is_link_error(&error)
                         && repaired_pairing_for.as_deref() != Some(&session.device_id);
                     if should_repair {
-                        match platform_repair_pairing(&session.peripheral, &session.device_name)
-                            .await
+                        repaired_pairing_for = Some(session.device_id.clone());
+                        match platform_repair_pairing(
+                            &session.peripheral,
+                            &session.device_name,
+                            &pairing,
+                        )
+                        .await
                         {
                             Ok(true) => {
-                                repaired_pairing_for = Some(session.device_id.clone());
                                 state
                                     .log(
                                         "info",
@@ -559,6 +736,7 @@ async fn connect(
     desired: &ConnectionIntent,
     preferred_target: Option<&SavedTarget>,
     intent: &mut watch::Receiver<ConnectionIntent>,
+    pairing: &PairingBroker,
 ) -> Result<Option<Session>> {
     let manager = Manager::new()
         .await
@@ -611,7 +789,16 @@ async fn connect(
         state
             .log("info", "ble", format!("connecting to {name}"))
             .await;
-        platform_pairing_hint(&peripheral, &name).await?;
+        let reset_stale_pairing = advertisement.owned == Some(false);
+        if platform_pairing_hint(&peripheral, &name, reset_stale_pairing, pairing).await? {
+            state
+                .log(
+                    "info",
+                    "ble",
+                    "device is unowned; replaced stale Windows pairing before connecting",
+                )
+                .await;
+        }
         if !peripheral.is_connected().await? {
             let connect_result = tokio::time::timeout(CONNECT_TIMEOUT, peripheral.connect())
                 .await
@@ -692,7 +879,8 @@ async fn connect(
             assembler: FrameAssembler::default(),
             next_id: AtomicU32::new(1),
             frame_bytes: 20,
-            setup_mode: advertisement.setup_mode.unwrap_or(false),
+            pairing_repair_allowed: advertisement.owned == Some(false)
+                || advertisement.setup_mode.unwrap_or(false),
         })
       } => Some(result),
       changed = intent.changed() => {
@@ -1247,89 +1435,218 @@ fn chrono_offset() -> i16 {
 }
 
 #[cfg(target_os = "windows")]
-async fn platform_pairing_hint(_peripheral: &Peripheral, name: &str) -> Result<()> {
-    use windows::Devices::{
-        Bluetooth::BluetoothLEDevice,
-        Enumeration::{DeviceInformation, DevicePairingProtectionLevel, DevicePairingResultStatus},
-    };
-
-    let selector = BluetoothLEDevice::GetDeviceSelector()?;
-    let device = {
-        let devices = DeviceInformation::FindAllAsyncAqsFilter(&selector)?.await?;
-        let mut matching_device = None;
-        for device in devices {
-            if device.Name()?.to_string() == name {
-                matching_device = Some(device);
-                break;
-            }
+fn windows_bluetooth_address(peripheral: &Peripheral) -> Option<u64> {
+    let id = peripheral.id().to_string();
+    let mut address = 0u64;
+    let mut count = 0usize;
+    for part in id.split(':') {
+        if part.len() != 2 {
+            return None;
         }
-        matching_device
-    };
-    let Some(device) = device else {
-        return Ok(());
-    };
-
-    let pairing = device.Pairing()?;
-    if pairing.IsPaired()? {
-        return Ok(());
+        let octet = u8::from_str_radix(part, 16).ok()?;
+        address = (address << 8) | u64::from(octet);
+        count += 1;
     }
-    let result = pairing
-        .PairWithProtectionLevelAsync(DevicePairingProtectionLevel::EncryptionAndAuthentication)?
-        .await?;
-    match result.Status()? {
-        DevicePairingResultStatus::Paired | DevicePairingResultStatus::AlreadyPaired => Ok(()),
-        status => bail!("Windows BLE pairing failed: {status:?}"),
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-async fn platform_pairing_hint(_peripheral: &Peripheral, _name: &str) -> Result<()> {
-    Ok(())
+    (count == 6).then_some(address)
 }
 
 #[cfg(target_os = "windows")]
-async fn platform_repair_pairing(_peripheral: &Peripheral, name: &str) -> Result<bool> {
-    use windows::Devices::{
-        Bluetooth::BluetoothLEDevice,
-        Enumeration::{
-            DeviceInformation, DevicePairingProtectionLevel, DevicePairingResultStatus,
-            DeviceUnpairingResultStatus,
-        },
-    };
+async fn windows_device_information(
+    peripheral: &Peripheral,
+    name: &str,
+) -> Result<Option<windows::Devices::Enumeration::DeviceInformation>> {
+    use windows::Devices::{Bluetooth::BluetoothLEDevice, Enumeration::DeviceInformation};
+
+    if let Some(address) = windows_bluetooth_address(peripheral)
+        && let Ok(operation) = BluetoothLEDevice::FromBluetoothAddressAsync(address)
+        && let Ok(device) = operation.await
+        && let Ok(information) = device.DeviceInformation()
+    {
+        return Ok(Some(information));
+    }
 
     let selector = BluetoothLEDevice::GetDeviceSelector()?;
     let devices = DeviceInformation::FindAllAsyncAqsFilter(&selector)?.await?;
-    let mut matching_device = None;
     for device in devices {
         if device.Name()?.to_string() == name {
-            matching_device = Some(device);
-            break;
+            return Ok(Some(device));
         }
     }
-    let Some(device) = matching_device else {
-        return Ok(false);
-    };
-    let pairing = device.Pairing()?;
-    if !pairing.IsPaired()? {
-        return Ok(false);
-    }
+    Ok(None)
+}
 
-    let unpair = pairing.UnpairAsync()?.await?;
-    match unpair.Status()? {
-        DeviceUnpairingResultStatus::Unpaired | DeviceUnpairingResultStatus::AlreadyUnpaired => {}
-        status => bail!("Windows BLE unpair failed: {status:?}"),
-    }
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    let result = pairing
-        .PairWithProtectionLevelAsync(DevicePairingProtectionLevel::EncryptionAndAuthentication)?
-        .await?;
+#[cfg(target_os = "windows")]
+async fn windows_pair(
+    device: &windows::Devices::Enumeration::DeviceInformation,
+    name: &str,
+    context: &str,
+    pairing_broker: &PairingBroker,
+) -> Result<()> {
+    use windows::{
+        Devices::Enumeration::{
+            DeviceInformationCustomPairing, DevicePairingKinds, DevicePairingProtectionLevel,
+            DevicePairingRequestedEventArgs, DevicePairingResultStatus,
+        },
+        Foundation::TypedEventHandler,
+        core::{HSTRING, Ref},
+    };
+
+    let pairing = device.Pairing()?;
+    let custom = pairing.Custom()?;
+    let runtime = tokio::runtime::Handle::current();
+    let request_broker = pairing_broker.clone();
+    let request_name = name.to_owned();
+    let token = {
+        let handler: TypedEventHandler<
+            DeviceInformationCustomPairing,
+            DevicePairingRequestedEventArgs,
+        > = TypedEventHandler::new(move |_sender, args: Ref<DevicePairingRequestedEventArgs>| {
+            let args = args.ok()?;
+            match args.PairingKind()? {
+                DevicePairingKinds::ProvidePin => {
+                    let args = args.clone();
+                    let deferral = args.GetDeferral()?;
+                    let broker = request_broker.clone();
+                    let name = request_name.clone();
+                    runtime.spawn(async move {
+                        match broker.request_pin(&name).await {
+                            Ok(pin) => {
+                                if let Err(error) = args.AcceptWithPin(&HSTRING::from(pin)) {
+                                    broker
+                                        .state
+                                        .log(
+                                            "error",
+                                            "ble.pairing",
+                                            format!("cannot submit passkey to Windows: {error}"),
+                                        )
+                                        .await;
+                                }
+                            }
+                            Err(error) => {
+                                broker
+                                    .state
+                                    .log("warn", "ble.pairing", format!("{error:#}"))
+                                    .await;
+                            }
+                        }
+                        if let Err(error) = deferral.Complete() {
+                            broker
+                                .state
+                                .log(
+                                    "warn",
+                                    "ble.pairing",
+                                    format!("cannot complete Windows pairing request: {error}"),
+                                )
+                                .await;
+                        }
+                    });
+                    Ok(())
+                }
+                kind => {
+                    tracing::warn!(
+                        scope = "ble.pairing",
+                        "Windows requested unsupported pairing ceremony {kind:?}"
+                    );
+                    Ok(())
+                }
+            }
+        });
+        custom.PairingRequested(&handler)?
+    };
+    let result = match custom.PairWithProtectionLevelAsync(
+        DevicePairingKinds::ProvidePin,
+        DevicePairingProtectionLevel::EncryptionAndAuthentication,
+    ) {
+        Ok(operation) => operation.await,
+        Err(error) => Err(error),
+    };
+    let remove_result = custom.RemovePairingRequested(token);
+    pairing_broker.cancel_active().await;
+    let result = result?;
+    remove_result?;
     match result.Status()? {
-        DevicePairingResultStatus::Paired | DevicePairingResultStatus::AlreadyPaired => Ok(true),
-        status => bail!("Windows BLE re-pair failed: {status:?}"),
+        DevicePairingResultStatus::Paired | DevicePairingResultStatus::AlreadyPaired => Ok(()),
+        status => bail!("Windows BLE {context} failed: {status:?}"),
     }
 }
 
+#[cfg(target_os = "windows")]
+async fn platform_pairing_hint(
+    peripheral: &Peripheral,
+    name: &str,
+    reset_stale_pairing: bool,
+    pairing_broker: &PairingBroker,
+) -> Result<bool> {
+    use windows::Devices::Enumeration::DeviceUnpairingResultStatus;
+
+    let Some(device) = windows_device_information(peripheral, name).await? else {
+        return Ok(false);
+    };
+    let pairing = device.Pairing()?;
+    if pairing.IsPaired()? && !reset_stale_pairing {
+        return Ok(false);
+    }
+    if pairing.IsPaired()? {
+        let unpair = pairing.UnpairAsync()?.await?;
+        match unpair.Status()? {
+            DeviceUnpairingResultStatus::Unpaired
+            | DeviceUnpairingResultStatus::AlreadyUnpaired => {}
+            status => bail!("Windows BLE stale-pair removal failed: {status:?}"),
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let device = windows_device_information(peripheral, name)
+            .await?
+            .ok_or_else(|| anyhow!("Windows BLE device disappeared after stale-pair removal"))?;
+        windows_pair(&device, name, "re-pair", pairing_broker).await?;
+        return Ok(true);
+    }
+    windows_pair(&device, name, "pairing", pairing_broker).await?;
+    Ok(false)
+}
+
 #[cfg(not(target_os = "windows"))]
-async fn platform_repair_pairing(_peripheral: &Peripheral, _name: &str) -> Result<bool> {
+async fn platform_pairing_hint(
+    _peripheral: &Peripheral,
+    _name: &str,
+    _reset_stale_pairing: bool,
+    _pairing_broker: &PairingBroker,
+) -> Result<bool> {
+    Ok(false)
+}
+
+#[cfg(target_os = "windows")]
+async fn platform_repair_pairing(
+    _peripheral: &Peripheral,
+    name: &str,
+    pairing_broker: &PairingBroker,
+) -> Result<bool> {
+    use windows::Devices::Enumeration::DeviceUnpairingResultStatus;
+
+    let Some(device) = windows_device_information(_peripheral, name).await? else {
+        return Ok(false);
+    };
+    let pairing = device.Pairing()?;
+    if pairing.IsPaired()? {
+        let unpair = pairing.UnpairAsync()?.await?;
+        match unpair.Status()? {
+            DeviceUnpairingResultStatus::Unpaired
+            | DeviceUnpairingResultStatus::AlreadyUnpaired => {}
+            status => bail!("Windows BLE unpair failed: {status:?}"),
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let device = windows_device_information(_peripheral, name)
+        .await?
+        .ok_or_else(|| anyhow!("Windows BLE device disappeared before re-pair"))?;
+    windows_pair(&device, name, "re-pair", pairing_broker).await?;
+    Ok(true)
+}
+
+#[cfg(not(target_os = "windows"))]
+async fn platform_repair_pairing(
+    _peripheral: &Peripheral,
+    _name: &str,
+    _pairing_broker: &PairingBroker,
+) -> Result<bool> {
     Ok(false)
 }

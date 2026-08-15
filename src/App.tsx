@@ -898,6 +898,7 @@ function App() {
   const [enrollmentUntil, setEnrollmentUntil] = useState(0)
   const [resetOpen, setResetOpen] = useState(false)
   const [resetCode, setResetCode] = useState('')
+  const [pairingPin, setPairingPin] = useState('')
   const [logLevel, setLogLevel] = useState<LogLevel>('all')
   const [logScope, setLogScope] = useState('all')
   const [followLogs, setFollowLogs] = useState(true)
@@ -925,6 +926,11 @@ function App() {
   }, [])
 
   const config = snapshot?.device.config
+  const pairing = snapshot?.device.pairing
+  useEffect(() => {
+    setPairingPin('')
+  }, [pairing?.request_id])
+
   useEffect(() => {
     if (!config) return
     setConfigDraft(structuredClone(config))
@@ -1095,6 +1101,25 @@ function App() {
 
   function autoConnectDevice() {
     void perform('ble.auto', agentApi.autoConnectDevice, '自动连接已启动')
+  }
+
+  function submitPairingPin() {
+    if (!pairing || pairingPin.length !== 6) return
+    void perform(
+      'ble.pairing.submit',
+      () => agentApi.submitPairingPin(pairing.request_id, pairingPin),
+      '配对码已提交，正在完成安全连接',
+    )
+  }
+
+  function cancelPairing() {
+    if (!pairing || operation) return
+    setPairingPin('')
+    void perform(
+      'ble.pairing.cancel',
+      () => agentApi.cancelPairing(pairing.request_id),
+      '蓝牙配对已取消',
+    )
   }
 
   if (bootError) {
@@ -1361,6 +1386,37 @@ function App() {
 
       <Dialog open={detailOpen} onOpenChange={setDetailOpen}><DialogContent><DialogHeader><DialogTitle>资源内容</DialogTitle><DialogDescription>设备返回的完整语义资源</DialogDescription></DialogHeader><pre className="dialog-json">{JSON.stringify(resourceDetail, null, 2)}</pre><DialogFooter><DialogClose asChild><Button variant="outline">关闭</Button></DialogClose></DialogFooter></DialogContent></Dialog>
       <Dialog open={resetOpen} onOpenChange={setResetOpen}><DialogContent><DialogHeader><DialogTitle>确认恢复出厂</DialogTitle><DialogDescription>输入墨水屏显示的六位确认码。确认后设备会清除 v4 namespace 与全部 bond 并重启。</DialogDescription></DialogHeader><label className="field"><span>六位确认码</span><Input inputMode="numeric" maxLength={6} value={resetCode} onChange={(event) => setResetCode(event.target.value.replace(/\D/g, '').slice(0, 6))} /></label><DialogFooter><DialogClose asChild><Button variant="outline">取消</Button></DialogClose><Button variant="destructive" disabled={resetCode.length !== 6 || !!operation} onClick={() => void perform('reset.commit', () => agentApi.commitFactoryReset(Number(resetCode)), '设备已恢复出厂').then((ok) => ok && setResetOpen(false))}>确认清除</Button></DialogFooter></DialogContent></Dialog>
+      <Dialog open={Boolean(pairing)} onOpenChange={(open) => { if (!open) cancelPairing() }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>完成蓝牙配对</DialogTitle>
+            <DialogDescription>
+              输入 {pairing?.device_name ?? 'EPD-KIT'} 屏上显示的六位配对码。
+            </DialogDescription>
+          </DialogHeader>
+          <label className="field">
+            <span>配对码</span>
+            <Input
+              autoFocus
+              autoComplete="one-time-code"
+              inputMode="numeric"
+              maxLength={6}
+              placeholder="000000"
+              value={pairingPin}
+              onChange={(event) => setPairingPin(event.target.value.replace(/\D/g, '').slice(0, 6))}
+              onKeyDown={(event) => { if (event.key === 'Enter') submitPairingPin() }}
+            />
+          </label>
+          <p className="pairing-expiry">本次请求将在 {formatTime(pairing?.expires_at)} 失效。</p>
+          <DialogFooter>
+            <Button variant="outline" disabled={!!operation} onClick={cancelPairing}>取消</Button>
+            <Button disabled={pairingPin.length !== 6 || !!operation} onClick={submitPairingPin}>
+              {operation === 'ble.pairing.submit' ? <LoaderCircle className="spin" /> : <KeyRound />}
+              验证并配对
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
       <Toaster position="bottom-right" richColors closeButton />
     </div>
   )

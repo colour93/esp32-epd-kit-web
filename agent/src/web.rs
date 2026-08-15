@@ -79,6 +79,10 @@ pub fn router(context: WebContext) -> Router {
         .route("/api/v1/device/connect", post(device_connect))
         .route("/api/v1/device/disconnect", post(device_disconnect))
         .route("/api/v1/device/auto-connect", post(device_auto_connect))
+        .route(
+            "/api/v1/device/pairing",
+            post(device_pairing_submit).delete(device_pairing_cancel),
+        )
         .route("/api/v1/device/reload", post(device_reload))
         .route("/api/v1/device/config", patch(config_patch))
         .route(
@@ -233,6 +237,41 @@ async fn device_auto_connect(
 ) -> ApiResult<Json<Value>> {
     mutation_auth(&context, &headers)?;
     context.ble.auto_connect().await;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct DevicePairingInput {
+    request_id: String,
+    #[serde(default)]
+    pin: String,
+}
+
+async fn device_pairing_submit(
+    State(context): State<WebContext>,
+    headers: HeaderMap,
+    Json(input): Json<DevicePairingInput>,
+) -> ApiResult<Json<Value>> {
+    mutation_auth(&context, &headers)?;
+    context
+        .ble
+        .submit_pairing_pin(&input.request_id, input.pin)
+        .await
+        .map_err(ApiError::invalid)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn device_pairing_cancel(
+    State(context): State<WebContext>,
+    headers: HeaderMap,
+    Json(input): Json<DevicePairingInput>,
+) -> ApiResult<Json<Value>> {
+    mutation_auth(&context, &headers)?;
+    context
+        .ble
+        .cancel_pairing(&input.request_id)
+        .await
+        .map_err(ApiError::invalid)?;
     Ok(Json(json!({ "ok": true })))
 }
 

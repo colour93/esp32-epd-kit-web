@@ -81,7 +81,14 @@ export interface DeviceStatus {
   resources: ResourceSummary[]
   bonds: Bond[]
   diagnostics?: JsonObject
+  pairing?: PairingStatus
   last_error?: string
+}
+
+export interface PairingStatus {
+  request_id: string
+  device_name: string
+  expires_at: number
 }
 
 export interface BleCandidate {
@@ -222,6 +229,12 @@ export const agentApi = {
   }),
   disconnectDevice: () => request('/api/v1/device/disconnect', { method: 'POST', body: '{}' }),
   autoConnectDevice: () => request('/api/v1/device/auto-connect', { method: 'POST', body: '{}' }),
+  submitPairingPin: (requestId: string, pin: string) => request('/api/v1/device/pairing', {
+    method: 'POST', body: JSON.stringify({ request_id: requestId, pin }),
+  }),
+  cancelPairing: (requestId: string) => request('/api/v1/device/pairing', {
+    method: 'DELETE', body: JSON.stringify({ request_id: requestId }),
+  }),
   reloadDevice: () => request('/api/v1/device/reload', { method: 'POST', body: '{}' }),
   patchConfig: (patch: JsonObject) => request<{ result: { revision: number; restart_required: boolean } }>(
     '/api/v1/device/config',

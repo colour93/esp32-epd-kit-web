@@ -76,7 +76,7 @@ pub struct SourceTypeStatus {
     pub auto_sync: bool,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SourceStatus {
     pub id: String,
     pub type_id: String,
@@ -88,6 +88,23 @@ pub struct SourceStatus {
     pub next_sync_at: Option<u64>,
     pub last_error: Option<String>,
     pub details: Value,
+}
+
+impl Default for SourceStatus {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            type_id: String::new(),
+            title: String::new(),
+            enabled: false,
+            phase: String::new(),
+            resource_keys: Vec::new(),
+            last_sync_at: None,
+            next_sync_at: None,
+            last_error: None,
+            details: Value::Object(Default::default()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -244,6 +261,11 @@ pub fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{SharedState, SourceStatus};
+
+    #[test]
+    fn source_details_default_to_an_object() {
+        assert!(SourceStatus::default().details.is_object());
+    }
 
     #[tokio::test]
     async fn source_id_reservation_is_atomic() {

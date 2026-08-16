@@ -58,11 +58,19 @@ interface LimitBucket {
   rateLimitReachedType?: string | null
 }
 
+const isJsonObject = (value: unknown): value is JsonObject => (
+  typeof value === 'object' && value !== null && !Array.isArray(value)
+)
+
 const getCodexBucket = (snapshot: Snapshot | null): LimitBucket | null => {
-  const raw = snapshot?.sources.find((source) => source.id === 'codex')?.details.rate_limits as JsonObject | undefined
-  if (!raw) return null
-  const byId = raw.rateLimitsByLimitId as Record<string, LimitBucket> | undefined
-  return byId?.codex ?? raw.rateLimits as LimitBucket | undefined ?? null
+  const details = snapshot?.sources.find((source) => source.id === 'codex')?.details
+  if (!isJsonObject(details)) return null
+  const raw = details.rate_limits
+  if (!isJsonObject(raw)) return null
+  const byId = raw.rateLimitsByLimitId
+  const selected = isJsonObject(byId) ? byId.codex : undefined
+  if (isJsonObject(selected)) return selected as LimitBucket
+  return isJsonObject(raw.rateLimits) ? raw.rateLimits as LimitBucket : null
 }
 
 const slotWidgets = (slot?: PageSlotCapability, pageId?: string): PageWidgetCapability[] => {

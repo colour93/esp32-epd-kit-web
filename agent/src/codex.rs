@@ -130,7 +130,11 @@ impl AppServer {
     async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id;
         self.next_id += 1;
-        let line = serde_json::to_vec(&json!({ "id": id, "method": method, "params": params }))?;
+        let line = if params.is_null() {
+            serde_json::to_vec(&json!({ "id": id, "method": method }))?
+        } else {
+            serde_json::to_vec(&json!({ "id": id, "method": method, "params": params }))?
+        };
         self.stdin.write_all(&line).await?;
         self.stdin.write_all(b"\n").await?;
         self.stdin.flush().await?;
@@ -405,7 +409,10 @@ async fn sync_once(
             "request method=account/rateLimits/read",
         )
         .await;
-    let rate_limits = server.request("account/rateLimits/read", json!({})).await?;
+    // The current app-server protocol declares this request with no params.
+    let rate_limits = server
+        .request("account/rateLimits/read", Value::Null)
+        .await?;
     state
         .log(
             "info",
@@ -416,10 +423,7 @@ async fn sync_once(
             ),
         )
         .await;
-    let selected = rate_limits
-        .get("rateLimitsByLimitId")
-        .and_then(|value| value.get("codex"))
-        .or_else(|| rate_limits.get("rateLimits"))
+    let selected = select_rate_limit(&rate_limits)
         .cloned()
         .ok_or_else(|| anyhow!("app-server returned no Codex rate-limit bucket"))?;
     let snapshot = state.snapshot().await;
@@ -497,6 +501,15 @@ async fn sync_once(
         )
         .await;
     Ok(())
+}
+
+fn select_rate_limit(rate_limits: &Value) -> Option<&Value> {
+    rate_limits
+        .get("rateLimitsByLimitId")
+        .and_then(|value| value.get("codex"))
+        .filter(|value| value.is_object())
+        .or_else(|| rate_limits.get("rateLimits"))
+        .filter(|value| value.is_object())
 }
 
 fn normalized_windows<'a>(
@@ -608,4 +621,38 @@ fn find_codex() -> Result<PathBuf> {
         .into_values()
         .find(|path| path.is_file())
         .ok_or_else(|| anyhow!("找不到 codex；请设置 EPD_CODEX_PATH 或把 codex 加入 PATH"))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::select_rate_limit;
+
+    #[test]
+    fn selects_codex_bucket_from_current_response() {
+        let response = json!({
+            "rateLimits": { "limitId": "fallback" },
+            "rateLimitsByLimitId": { "codex": { "limitId": "codex" } },
+        });
+
+        assert_eq!(select_rate_limit(&response).unwrap()["limitId"], "codex");
+    }
+
+    #[test]
+    fn falls_back_when_bucket_map_is_null() {
+        let response = json!({
+            "rateLimits": { "limitId": "codex" },
+            "rateLimitsByLimitId": null,
+        });
+
+        assert_eq!(select_rate_limit(&response).unwrap()["limitId"], "codex");
+    }
+
+    #[test]
+    fn rejects_null_rate_limit_values() {
+        let response = json!({ "rateLimits": null, "rateLimitsByLimitId": null });
+
+        assert!(select_rate_limit(&response).is_none());
+    }
 }

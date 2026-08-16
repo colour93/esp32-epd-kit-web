@@ -35,7 +35,9 @@ if (process.platform === 'darwin') {
   await chmod(bundledBinary, 0o755)
   await copyFile(join(root, 'agent', 'macos', 'Info.plist'), join(contents, 'Info.plist'))
   await run('codesign', ['--force', '--deep', '--sign', '-', bundle])
-  await run('open', ['-n', '-W', bundle, '--args', ...process.argv.slice(2)])
+  // Launch the bundled executable directly so the tokenized URL and logs stay
+  // attached to this terminal. `open -W` discards the app's stdout on macOS.
+  await run(bundledBinary, ['--no-open', ...process.argv.slice(2)])
   process.exit(0)
 }
 

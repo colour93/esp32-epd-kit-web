@@ -56,19 +56,19 @@ bun install
 bun run build
 ```
 
-运行包含内嵌 Web 产物的 Agent：
+开发时先运行 Agent（终端会打印带 token 的 URL）：
 
 ```bash
 bun run dev:agent
 ```
 
-React 热更新：
+再开一个终端运行 Vite，实现 React Fast Refresh/HMR：
 
 ```bash
 bun run dev
 ```
 
-Vite 将 `/api` 代理到 `http://127.0.0.1:38473`。需要有效 session 时，使用 Agent 打印的 tokenized URL，并把 origin 替换为 Vite origin。
+Vite 将 `/api`（包括 SSE）代理到 `http://127.0.0.1:38473`。把 Agent 打印 URL 的 origin 从 `http://127.0.0.1:38473` 改为 Vite 显示的 origin（默认 `http://localhost:5173`），保留完整的 `#token=...`；首次访问会建立 session，之后编辑 `src/` 即可热更新。
 
 Agent 单独检查：
 

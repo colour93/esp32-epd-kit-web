@@ -10,7 +10,7 @@ Browser -> 127.0.0.1 HTTP/SSE -> Rust Agent -> BLE v4 -> ESP32
                                            -> SyncCoordinator
 ```
 
-Agent 是唯一 BLE 主机。React 不使用 Web Bluetooth，不直接访问云服务。数据源分为两层：`source_types[]` 是静态能力目录，`sources[]` 是具有独立 ID、配置、状态和资源键的实例。Codex 通过本机 `codex app-server` 读取现有登录；`cli.jmespath` 类型可创建多个实例，把不同 CLI JSON 输出分别投影为通用指标。
+Agent 是唯一 BLE 主机。React 不使用 Web Bluetooth，不直接访问云服务。数据源分为两层：`source_types[]` 是静态能力目录，`sources[]` 是具有独立 ID、配置、状态和资源键的实例。Codex 通过本机 `codex app-server` 读取现有登录；CC Switch 内置源从本机数据库只读统计今日 Token；`cli.jmespath` 与 `http.jmespath` 可创建多个实例，把 CLI 或 HTTP JSON 分别投影为通用指标。HTTP 类型内置 DeepSeek 与 Moonshot（Kimi）余额 preset。
 
 ## 核心模块
 
@@ -18,12 +18,15 @@ Agent 是唯一 BLE 主机。React 不使用 Web Bluetooth，不直接访问云�
 - `agent/src/publisher.rs`：revision、hash、heartbeat、reconcile 和串行 Resource 写；
 - `agent/src/coordinator.rs`：battery auto-sync cycle 与唯一 `system.sync.complete`；
 - `agent/src/codex.rs`：Codex app-server 客户端、采集和 schema 投影；
+- `agent/src/ccswitch.rs`：CC Switch 今日 Token 的只读 SQLite 聚合与通用指标发布；
 - `agent/src/cli.rs`：多实例 CLI 数据源管理、JMESPath 投影和本机私有配置；
+- `agent/src/http.rs`：多实例 HTTP JSON 数据源、网络边界、系统凭据和余额 preset；
+- `agent/src/metrics.rs`：CLI/HTTP 共用的 JMESPath 校验与 `generic.metrics/v1` 投影；
 - `agent/src/ble.rs`：v4 扫描、重新配对、分帧、RPC 和重连；
 - `agent/src/web.rs`：loopback Axum API、SSE、本地 session 与静态资源；
 - `src/App.tsx`：动态 Page/Binding、Resource JSON、数据源类型与实例、安全和诊断界面。
 
-新增数据源类型或 Page 通常不修改 React：Page 表单来自 `capabilities.pages`，类型与实例分别来自 `source_types[]`、`sources[]`。CLI 实例持久化在本机 `cli-sources.json`，每个实例发布 `cli/{id}`。完整注册规则见固件仓库的[功能组件开发规范](../esp32-epd-kit/docs/feature_component_development.md)。
+新增数据源类型或 Page 通常不修改 React：Page 表单来自 `capabilities.pages`，类型与实例分别来自 `source_types[]`、`sources[]`。CLI 与 HTTP 实例分别持久化在本机 `cli-sources.json`、`http-sources.json`，发布 `cli/{id}`、`http/{id}`；HTTP 密钥只存系统凭据库。完整注册规则见固件仓库的[功能组件开发规范](../esp32-epd-kit/docs/feature_component_development.md)。
 
 ## 本地 API
 
@@ -36,6 +39,9 @@ Agent 是唯一 BLE 主机。React 不使用 Web Bluetooth，不直接访问云�
 | `POST /api/v1/sources/{id}/refresh` | 刷新单个数据源实例 |
 | `GET/POST /api/v1/source-types/cli.jmespath/sources` | 列出或创建 CLI 实例 |
 | `PUT/DELETE /api/v1/source-types/cli.jmespath/sources/{id}` | 更新或删除 CLI 实例 |
+| `GET/POST /api/v1/source-types/http.jmespath/sources` | 列出或创建 HTTP 实例 |
+| `PUT/DELETE /api/v1/source-types/http.jmespath/sources/{id}` | 更新或删除 HTTP 实例 |
+| `POST /api/v1/source-types/http.jmespath/test` | 测试 HTTP 请求与 JMESPath 投影 |
 | `POST /api/v1/device/page` | 提交 PageSettings |
 | `GET/PUT/DELETE /api/v1/device/resource` | 读取、owner 发布、删除 Resource |
 | `PATCH /api/v1/device/config` | staged patch + commit |
@@ -89,8 +95,9 @@ bun run package:agent
 - mutation 校验 loopback Origin；
 - installation secret 保存于用户配置目录的私有文件；
 - URL fragment 一次性交换 `HttpOnly; SameSite=Strict` cookie；
+- HTTP source 密钥只存系统凭据库，不进入配置文件、浏览器响应或 ESP32；
 - 浏览器无 BLE、Codex stdio 或云凭据访问能力。
 
-协议与数据契约见 [BLE Protocol v4](../esp32-epd-kit/docs/ble_protocol_v4.md)、[v4 架构](../esp32-epd-kit/docs/architecture_v4.md)和 [Codex schema](../esp32-epd-kit/docs/openai_codex_usage.md)。
+协议与数据契约见 [BLE Protocol v4](../esp32-epd-kit/docs/ble_protocol_v4.md)、[v4 架构](../esp32-epd-kit/docs/architecture_v4.md)、[Codex schema](../esp32-epd-kit/docs/openai_codex_usage.md)、[HTTP 数据源](../esp32-epd-kit/docs/generic_http.md)和 [CC Switch 今日用量源](docs/cc_switch_usage.md)。
 
 设备通过物理串口执行 `setup` 后会广播 setup 标志 120 秒。Windows 若保留了设备端已经丢失的旧配对，Agent 会在该窗口内首次安全握手失败后清除本机旧记录并重新触发系统配对；正常重连不会清除 bond。

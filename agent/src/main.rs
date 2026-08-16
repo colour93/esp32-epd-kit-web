@@ -1,9 +1,12 @@
 mod autostart;
 mod ble;
+mod ccswitch;
 mod cli;
 mod codex;
 mod coordinator;
+mod http;
 mod instance;
+mod metrics;
 mod producer;
 mod protocol;
 mod publisher;
@@ -75,8 +78,25 @@ async fn prepare_service() -> Result<Service> {
         state: state.clone(),
         publisher: publisher.clone(),
     })?;
-    let producers =
-        producer::ProducerRegistry::new(&state, vec![codex.control(), cli.control()]).await?;
+    let http = http::HttpMetricControl::spawn(producer::ProducerContext {
+        state: state.clone(),
+        publisher: publisher.clone(),
+    })?;
+    let ccswitch = ccswitch::CcSwitchControl::spawn(producer::ProducerContext {
+        state: state.clone(),
+        publisher: publisher.clone(),
+    });
+    let producers = producer::ProducerRegistry::new(
+        &state,
+        vec![
+            codex.control(),
+            ccswitch.control(),
+            cli.control(),
+            http.control(),
+        ],
+    )
+    .await?;
+    ccswitch.control().refresh().await?;
     coordinator::SyncCoordinator::spawn(
         state.clone(),
         ble.clone(),
@@ -84,7 +104,7 @@ async fn prepare_service() -> Result<Service> {
         publisher.clone(),
         completion_rx,
     );
-    let context = web::WebContext::new(state.clone(), ble, producers, cli, publisher)?;
+    let context = web::WebContext::new(state.clone(), ble, producers, cli, http, publisher)?;
     let port = configured_port()?;
     let launch_url = context.launch_url(port);
     let app = web::router(context);

@@ -1,23 +1,27 @@
-import { useEffect, useState } from 'react'
-import { FlaskConical, LoaderCircle, Pencil, Plus, RefreshCw, Save, Trash2 } from 'lucide-react'
+import { useEffect, useRef, useState } from 'react'
+import { Download, FlaskConical, Globe2, LoaderCircle, Pencil, RefreshCw, Save, Terminal, Trash2, Upload, X } from 'lucide-react'
 import { toast } from 'sonner'
 import {
   AgentApiError,
   agentApi,
   type CliMetricConfig,
   type CliMetricPreview,
+  type HttpMetricConfig,
   type SourceStatus,
   type SourceTypeStatus,
 } from '@/lib/agent'
+import { createSourceTransferFile, parseSourceTransferFile } from '@/lib/source-transfer'
+import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { Card, CardAction, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
-import { Field, FieldGroup, FieldLabel } from '@/components/ui/field'
-import { Input } from '@/components/ui/input'
-import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
-import { Switch } from '@/components/ui/switch'
+import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
-import { Textarea } from '@/components/ui/textarea'
+import { CliSourceEditor } from '@/components/sources/cli-source-editor'
+import { HttpSourceEditor } from '@/components/sources/http-source-editor'
+import { newHttpSource } from '@/components/sources/http-source-config'
 import { DashboardEmpty, StatusBadge } from '@/components/dashboard/dashboard-components'
+
+const CLI_TYPE = 'cli.jmespath'
+const HTTP_TYPE = 'http.jmespath'
 
 const errorText = (error: unknown) => error instanceof AgentApiError
   ? error.message
@@ -35,44 +39,142 @@ const newCliSource = (): CliMetricConfig => ({
   items: [{ label: '数据', data_expression: '', description_expression: '', progress_expression: '', format: 'text' }],
 })
 
+type SourceDraft =
+  | { type: 'cli'; creating: boolean; config: CliMetricConfig }
+  | { type: 'http'; creating: boolean; config: HttpMetricConfig }
+
+const Preview = ({ preview }: { preview: CliMetricPreview }) => (
+  <div className="grid gap-3 rounded-lg border bg-muted/30 p-3 sm:grid-cols-2 lg:grid-cols-4">
+    {preview.items.map((item, index) => (
+      <div key={index} className="min-w-0">
+        <div className="truncate text-xs text-muted-foreground">{item.label}</div>
+        <div className="mt-1 truncate font-mono text-xl font-medium">{String(item.data)}</div>
+        {item.description ? <div className="truncate text-xs text-muted-foreground">{item.description}</div> : null}
+      </div>
+    ))}
+  </div>
+)
+
 export const DataSourceManager = ({ sourceTypes, sources }: {
   sourceTypes: SourceTypeStatus[]
   sources: SourceStatus[]
 }) => {
-  const [configs, setConfigs] = useState<CliMetricConfig[]>([])
-  const [draft, setDraft] = useState<CliMetricConfig | null>(null)
-  const [creating, setCreating] = useState(false)
+  const [cliConfigs, setCliConfigs] = useState<CliMetricConfig[]>([])
+  const [httpConfigs, setHttpConfigs] = useState<HttpMetricConfig[]>([])
+  const [draft, setDraft] = useState<SourceDraft | null>(null)
   const [preview, setPreview] = useState<CliMetricPreview | null>(null)
   const [busy, setBusy] = useState<string | null>('load')
+  const importInput = useRef<HTMLInputElement>(null)
+
+  const reloadConfigs = async () => {
+    const [cli, http] = await Promise.all([agentApi.getCliMetricSources(), agentApi.getHttpMetricSources()])
+    setCliConfigs(cli.sources)
+    setHttpConfigs(http.sources)
+  }
 
   useEffect(() => {
     let active = true
-    agentApi.getCliMetricSources()
-      .then(({ sources: cliSources }) => { if (active) setConfigs(cliSources) })
+    Promise.all([agentApi.getCliMetricSources(), agentApi.getHttpMetricSources()])
+      .then(([cli, http]) => {
+        if (!active) return
+        setCliConfigs(cli.sources)
+        setHttpConfigs(http.sources)
+      })
       .catch((error) => { if (active) toast.error(errorText(error)) })
       .finally(() => { if (active) setBusy(null) })
     return () => { active = false }
   }, [])
 
-  const beginCreate = () => {
-    setCreating(true)
-    setPreview(null)
-    setDraft(newCliSource())
+  const exportSources = () => {
+    if (busy) return
+    const contents = JSON.stringify(createSourceTransferFile(cliConfigs, httpConfigs), null, 2)
+    const url = URL.createObjectURL(new Blob([`${contents}\n`], { type: 'application/json' }))
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `epd-agent-sources-${new Date().toISOString().slice(0, 10)}.json`
+    document.body.append(link)
+    link.click()
+    link.remove()
+    window.setTimeout(() => URL.revokeObjectURL(url), 0)
+    toast.success(`已导出 ${cliConfigs.length + httpConfigs.length} 个数据源`, {
+      description: 'HTTP 密钥未包含在文件中',
+    })
   }
 
-  const beginEdit = (id: string) => {
-    const config = configs.find((source) => source.id === id)
-    if (!config) return
-    setCreating(false)
+  const importSources = async (file: File) => {
+    if (busy) return
+    setBusy('import')
+    try {
+      if (file.size > 1024 * 1024) throw new Error('导入文件不能超过 1 MiB')
+      const imported = parseSourceTransferFile(await file.text())
+      const importedCount = imported.cli.length + imported.http.length
+      if (!importedCount) throw new Error('导入文件中没有数据源')
+
+      const cliIds = new Set(cliConfigs.map((source) => source.id))
+      const httpIds = new Set(httpConfigs.map((source) => source.id))
+      const collision = imported.cli.find((source) => httpIds.has(source.id))
+        ?? imported.http.find((source) => cliIds.has(source.id))
+      if (collision) throw new Error(`数据源 ${collision.id} 已被其他类型使用`)
+      const newHttpCount = imported.http.filter((source) => !httpIds.has(source.id)).length
+      if (httpConfigs.length + newHttpCount > 16) throw new Error('HTTP 数据源总数不能超过 16 个')
+
+      const overwriteCount = imported.cli.filter((source) => cliIds.has(source.id)).length
+        + imported.http.filter((source) => httpIds.has(source.id)).length
+      if (overwriteCount && !window.confirm(`将覆盖 ${overwriteCount} 个同 ID 数据源，继续导入？`)) return
+
+      for (const source of imported.cli) {
+        await (cliIds.has(source.id)
+          ? agentApi.updateCliMetricSource(source)
+          : agentApi.createCliMetricSource(source))
+      }
+      for (const source of imported.http) {
+        await (httpIds.has(source.id)
+          ? agentApi.updateHttpMetricSource(source)
+          : agentApi.createHttpMetricSource(source))
+      }
+      await reloadConfigs()
+      setDraft(null)
+      setPreview(null)
+      const needsSecret = imported.http.filter((source) => source.auth.type !== 'none').length
+      toast.success(`已导入 ${importedCount} 个数据源`, needsSecret ? {
+        description: `${needsSecret} 个 HTTP 数据源可能需要重新填写密钥`,
+      } : undefined)
+    } catch (error) {
+      try { await reloadConfigs() } catch { /* Preserve the original import error. */ }
+      toast.error(errorText(error))
+    } finally {
+      setBusy(null)
+      if (importInput.current) importInput.current.value = ''
+    }
+  }
+
+  const beginCreate = (type: SourceDraft['type']) => {
     setPreview(null)
-    setDraft(structuredClone(config))
+    setDraft(type === 'cli'
+      ? { type, creating: true, config: newCliSource() }
+      : { type, creating: true, config: newHttpSource() })
+  }
+
+  const beginEdit = (source: SourceStatus) => {
+    setPreview(null)
+    if (source.type_id === CLI_TYPE) {
+      const config = cliConfigs.find((item) => item.id === source.id)
+      if (config) setDraft({ type: 'cli', creating: false, config: structuredClone(config) })
+      return
+    }
+    if (source.type_id === HTTP_TYPE) {
+      const config = httpConfigs.find((item) => item.id === source.id)
+      if (config) setDraft({ type: 'http', creating: false, config: structuredClone(config) })
+    }
   }
 
   const testDraft = async () => {
     if (!draft || busy) return
     setBusy('test')
     try {
-      const result = await agentApi.testCliMetricConfig(draft)
+      const result = draft.type === 'cli'
+        ? await agentApi.testCliMetricConfig(draft.config)
+        : await agentApi.testHttpMetricConfig(draft.config)
       setPreview(result.preview)
       toast.success('测试成功')
     } catch (error) {
@@ -86,14 +188,23 @@ export const DataSourceManager = ({ sourceTypes, sources }: {
     if (!draft || busy) return
     setBusy('save')
     try {
-      const result = creating
-        ? await agentApi.createCliMetricSource(draft)
-        : await agentApi.updateCliMetricSource(draft)
-      setConfigs((current) => creating
-        ? [...current, result.source]
-        : current.map((source) => source.id === result.source.id ? result.source : source))
-      setDraft(result.source)
-      setCreating(false)
+      if (draft.type === 'cli') {
+        const result = draft.creating
+          ? await agentApi.createCliMetricSource(draft.config)
+          : await agentApi.updateCliMetricSource(draft.config)
+        setCliConfigs((current) => draft.creating
+          ? [...current, result.source]
+          : current.map((source) => source.id === result.source.id ? result.source : source))
+        setDraft({ type: 'cli', creating: false, config: result.source })
+      } else {
+        const result = draft.creating
+          ? await agentApi.createHttpMetricSource(draft.config)
+          : await agentApi.updateHttpMetricSource(draft.config)
+        setHttpConfigs((current) => draft.creating
+          ? [...current, result.source]
+          : current.map((source) => source.id === result.source.id ? result.source : source))
+        setDraft({ type: 'http', creating: false, config: result.source })
+      }
       toast.success('已保存')
     } catch (error) {
       toast.error(errorText(error))
@@ -115,13 +226,18 @@ export const DataSourceManager = ({ sourceTypes, sources }: {
     }
   }
 
-  const deleteSource = async (id: string) => {
-    if (busy || !window.confirm(`删除 ${id}？`)) return
-    setBusy(`delete:${id}`)
+  const deleteSource = async (source: SourceStatus) => {
+    if (busy || !window.confirm(`删除 ${source.id}？`)) return
+    setBusy(`delete:${source.id}`)
     try {
-      await agentApi.deleteCliMetricSource(id)
-      setConfigs((current) => current.filter((source) => source.id !== id))
-      if (draft?.id === id) setDraft(null)
+      if (source.type_id === CLI_TYPE) {
+        await agentApi.deleteCliMetricSource(source.id)
+        setCliConfigs((current) => current.filter((item) => item.id !== source.id))
+      } else {
+        await agentApi.deleteHttpMetricSource(source.id)
+        setHttpConfigs((current) => current.filter((item) => item.id !== source.id))
+      }
+      if (draft?.config.id === source.id) setDraft(null)
       toast.success('已删除')
     } catch (error) {
       toast.error(errorText(error))
@@ -130,30 +246,66 @@ export const DataSourceManager = ({ sourceTypes, sources }: {
     }
   }
 
+  const editable = (source: SourceStatus) => source.type_id === CLI_TYPE || source.type_id === HTTP_TYPE
+  const typeTitle = (id: string) => sourceTypes.find((type) => type.id === id)?.title ?? id
+
   return (
     <>
       <Card>
         <CardHeader>
           <CardTitle>数据源</CardTitle>
-          <CardAction><Button size="sm" onClick={beginCreate}><Plus data-icon="inline-start" />添加</Button></CardAction>
+          <CardDescription>CLI、HTTP 与内置本地指标源</CardDescription>
+          <CardAction className="flex flex-wrap justify-end gap-2">
+            <input
+              ref={importInput}
+              className="sr-only"
+              type="file"
+              accept="application/json,.json"
+              tabIndex={-1}
+              onChange={(event) => {
+                const file = event.target.files?.[0]
+                if (file) void importSources(file)
+              }}
+            />
+            <Button variant="outline" size="sm" disabled={!!busy} onClick={() => importInput.current?.click()}>
+              {busy === 'import' ? <LoaderCircle className="animate-spin" data-icon="inline-start" /> : <Upload data-icon="inline-start" />}
+              导入
+            </Button>
+            <Button variant="outline" size="sm" disabled={!!busy} onClick={exportSources}>
+              <Download data-icon="inline-start" />
+              导出
+            </Button>
+            <Button variant="outline" size="sm" disabled={!!busy} onClick={() => beginCreate('cli')}>
+              <Terminal data-icon="inline-start" />
+              CLI
+            </Button>
+            <Button size="sm" disabled={!!busy} onClick={() => beginCreate('http')}>
+              <Globe2 data-icon="inline-start" />
+              HTTP
+            </Button>
+          </CardAction>
         </CardHeader>
         <CardContent className="overflow-x-auto px-0">
           {sources.length ? (
             <Table>
-              <TableHeader><TableRow><TableHead>名称</TableHead><TableHead>类型</TableHead><TableHead>状态</TableHead><TableHead>资源</TableHead><TableHead>同步</TableHead><TableHead className="text-right">操作</TableHead></TableRow></TableHeader>
+              <TableHeader>
+                <TableRow><TableHead>名称</TableHead><TableHead>类型</TableHead><TableHead>状态</TableHead><TableHead>资源</TableHead><TableHead>同步</TableHead><TableHead className="text-right">操作</TableHead></TableRow>
+              </TableHeader>
               <TableBody>
                 {sources.map((source) => (
                   <TableRow key={source.id}>
                     <TableCell><div className="font-medium">{source.title}</div><div className="font-mono text-xs text-muted-foreground">{source.id}</div></TableCell>
-                    <TableCell className="font-mono text-xs">{source.type_id}</TableCell>
+                    <TableCell><Badge variant="outline">{typeTitle(source.type_id)}</Badge></TableCell>
                     <TableCell><StatusBadge phase={source.phase} /></TableCell>
                     <TableCell className="max-w-56 truncate font-mono text-xs">{source.resource_keys.join(', ') || '—'}</TableCell>
                     <TableCell className="font-mono text-xs">{formatTime(source.last_sync_at)}</TableCell>
-                    <TableCell><div className="flex justify-end gap-1">
-                      <Button variant="ghost" size="icon-sm" disabled={!!busy || !source.enabled} onClick={() => void refreshSource(source.id)}><RefreshCw className={busy === `refresh:${source.id}` ? 'animate-spin' : undefined} /><span className="sr-only">刷新</span></Button>
-                      {source.type_id === 'cli.jmespath' ? <Button variant="ghost" size="icon-sm" disabled={!!busy} onClick={() => beginEdit(source.id)}><Pencil /><span className="sr-only">编辑</span></Button> : null}
-                      {source.type_id === 'cli.jmespath' ? <Button variant="ghost" size="icon-sm" disabled={!!busy} onClick={() => void deleteSource(source.id)}><Trash2 /><span className="sr-only">删除</span></Button> : null}
-                    </div></TableCell>
+                    <TableCell>
+                      <div className="flex justify-end gap-1">
+                        <Button variant="ghost" size="icon-sm" disabled={!!busy || !source.enabled} title="刷新" onClick={() => void refreshSource(source.id)}><RefreshCw className={busy === `refresh:${source.id}` ? 'animate-spin' : undefined} /><span className="sr-only">刷新</span></Button>
+                        {editable(source) ? <Button variant="ghost" size="icon-sm" disabled={!!busy} title="编辑" onClick={() => beginEdit(source)}><Pencil /><span className="sr-only">编辑</span></Button> : null}
+                        {editable(source) ? <Button variant="ghost" size="icon-sm" disabled={!!busy} title="删除" onClick={() => void deleteSource(source)}><Trash2 /><span className="sr-only">删除</span></Button> : null}
+                      </div>
+                    </TableCell>
                   </TableRow>
                 ))}
               </TableBody>
@@ -165,54 +317,30 @@ export const DataSourceManager = ({ sourceTypes, sources }: {
       {draft ? (
         <Card>
           <CardHeader>
-            <CardTitle>{creating ? '添加数据源' : draft.title}</CardTitle>
-            <CardAction><div className="flex gap-2">
-              <Button variant="outline" size="sm" onClick={() => setDraft(null)}>取消</Button>
-              <Button variant="outline" size="sm" disabled={!!busy || !draft.id} onClick={() => void testDraft()}>
-                {busy === 'test' ? <LoaderCircle className="animate-spin" data-icon="inline-start" /> : <FlaskConical data-icon="inline-start" />}
-                测试
+            <CardTitle>{draft.creating ? `添加 ${draft.type === 'cli' ? 'CLI' : 'HTTP'} 数据源` : draft.config.title}</CardTitle>
+            <CardDescription>{draft.type === 'cli' ? '执行本机命令并投影 JSON 输出' : '请求 JSON 接口并投影指标'}</CardDescription>
+            <CardAction className="flex gap-1">
+              <Button variant="ghost" size="icon-sm" disabled={!!busy} title="取消" onClick={() => setDraft(null)}><X /><span className="sr-only">取消</span></Button>
+              <Button variant="outline" size="icon-sm" disabled={!!busy || !draft.config.id} title="测试" onClick={() => void testDraft()}>
+                {busy === 'test' ? <LoaderCircle className="animate-spin" /> : <FlaskConical />}
+                <span className="sr-only">测试</span>
               </Button>
-              <Button size="sm" disabled={!!busy || !draft.id} onClick={() => void saveDraft()}>
-                {busy === 'save' ? <LoaderCircle className="animate-spin" data-icon="inline-start" /> : <Save data-icon="inline-start" />}
-                保存
+              <Button size="icon-sm" disabled={!!busy || !draft.config.id} title="保存" onClick={() => void saveDraft()}>
+                {busy === 'save' ? <LoaderCircle className="animate-spin" /> : <Save />}
+                <span className="sr-only">保存</span>
               </Button>
-            </div></CardAction>
+            </CardAction>
           </CardHeader>
-          <CardContent className="flex flex-col gap-6">
-            <Field orientation="horizontal">
-              <FieldLabel>启用</FieldLabel>
-              <Switch checked={draft.enabled} onCheckedChange={(enabled) => setDraft({ ...draft, enabled })} />
-            </Field>
-            <FieldGroup className="grid gap-4 md:grid-cols-2">
-              <Field><FieldLabel>实例 ID</FieldLabel><Input maxLength={32} disabled={!creating} value={draft.id} onChange={(event) => setDraft({ ...draft, id: event.target.value.toLowerCase().replace(/[^a-z0-9_-]/g, '') })} /></Field>
-              <Field><FieldLabel>名称</FieldLabel><Input maxLength={32} value={draft.title} onChange={(event) => setDraft({ ...draft, title: event.target.value })} /></Field>
-              <Field className="md:col-span-2"><FieldLabel>命令</FieldLabel><Textarea className="min-h-24 font-mono" value={draft.command} onChange={(event) => setDraft({ ...draft, command: event.target.value })} /></Field>
-            </FieldGroup>
-
-            <div className="flex flex-col gap-3">
-              {draft.items.map((item, index) => (
-                <div key={index} className="grid gap-3 rounded-lg border p-3 md:grid-cols-2 xl:grid-cols-[120px_1fr_1fr_1fr_120px_auto]">
-                  <Field><FieldLabel>标签</FieldLabel><Input value={item.label} onChange={(event) => setDraft({ ...draft, items: draft.items.map((value, itemIndex) => itemIndex === index ? { ...value, label: event.target.value } : value) })} /></Field>
-                  <Field><FieldLabel>数据</FieldLabel><Input value={item.data_expression} onChange={(event) => setDraft({ ...draft, items: draft.items.map((value, itemIndex) => itemIndex === index ? { ...value, data_expression: event.target.value } : value) })} /></Field>
-                  <Field><FieldLabel>描述</FieldLabel><Input value={item.description_expression} onChange={(event) => setDraft({ ...draft, items: draft.items.map((value, itemIndex) => itemIndex === index ? { ...value, description_expression: event.target.value } : value) })} /></Field>
-                  <Field><FieldLabel>进度</FieldLabel><Input value={item.progress_expression} onChange={(event) => setDraft({ ...draft, items: draft.items.map((value, itemIndex) => itemIndex === index ? { ...value, progress_expression: event.target.value } : value) })} /></Field>
-                  <Field><FieldLabel>格式</FieldLabel><NativeSelect className="w-full" value={item.format} onChange={(event) => setDraft({ ...draft, items: draft.items.map((value, itemIndex) => itemIndex === index ? { ...value, format: event.target.value as typeof value.format } : value) })}><NativeSelectOption value="text">文本</NativeSelectOption><NativeSelectOption value="percent">百分比</NativeSelectOption><NativeSelectOption value="countdown">倒计时</NativeSelectOption></NativeSelect></Field>
-                  <div className="flex items-end"><Button variant="ghost" size="icon" disabled={draft.items.length === 1} onClick={() => setDraft({ ...draft, items: draft.items.filter((_, itemIndex) => itemIndex !== index) })}><Trash2 /><span className="sr-only">删除</span></Button></div>
-                </div>
-              ))}
-              <Button variant="outline" size="sm" className="self-start" disabled={draft.items.length >= 4} onClick={() => setDraft({ ...draft, items: [...draft.items, { label: `数据 ${draft.items.length + 1}`, data_expression: '', description_expression: '', progress_expression: '', format: 'text' }] })}><Plus data-icon="inline-start" />添加数据项</Button>
-            </div>
-
-            {preview ? (
-              <div className="grid gap-3 rounded-lg border bg-muted/30 p-3 sm:grid-cols-2 lg:grid-cols-4">
-                {preview.items.map((item, index) => <div key={index}><div className="text-xs text-muted-foreground">{item.label}</div><div className="mt-1 font-mono text-xl font-medium">{String(item.data)}</div></div>)}
-              </div>
-            ) : null}
+          <CardContent className="flex min-w-0 flex-col gap-6">
+            {draft.type === 'cli'
+              ? <CliSourceEditor value={draft.config} creating={draft.creating} onChange={(config) => setDraft({ ...draft, config })} />
+              : <HttpSourceEditor value={draft.config} creating={draft.creating} onChange={(config) => setDraft({ ...draft, config })} />}
+            {preview ? <Preview preview={preview} /> : null}
           </CardContent>
         </Card>
       ) : null}
 
-      {sourceTypes.length ? <div className="flex flex-wrap gap-2">{sourceTypes.map((type) => <span key={type.id} className="font-mono text-xs text-muted-foreground">{type.id}</span>)}</div> : null}
+      {sourceTypes.length ? <div className="flex flex-wrap gap-2">{sourceTypes.map((type) => <Badge key={type.id} variant="outline">{type.id}</Badge>)}</div> : null}
     </>
   )
 }

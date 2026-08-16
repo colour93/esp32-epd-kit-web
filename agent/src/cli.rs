@@ -16,6 +16,7 @@ use tokio::{
 };
 
 use crate::{
+    metrics::{project_metrics, truncate_text, validate_metric_config},
     producer::{ProducerContext, ProducerControl, ProducerManifest, ProducerTrigger},
     publisher::{ResourcePublisher, SemanticResource},
     state::{SharedState, unix_now},
@@ -25,13 +26,11 @@ const POLL_SEC: u64 = 300;
 const RESOURCE_TTL_SEC: u64 = 900;
 const COMMAND_TIMEOUT_SEC: u64 = 30;
 const MAX_COMMAND_BYTES: usize = 8192;
-const MAX_EXPRESSION_BYTES: usize = 1024;
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
-const MAX_TITLE_CHARS: usize = 32;
-const MAX_LABEL_CHARS: usize = 24;
-const MAX_DATA_CHARS: usize = 48;
-const MAX_DESCRIPTION_CHARS: usize = 96;
-const MAX_ITEMS: usize = 4;
+
+pub use crate::metrics::{
+    MetricItemConfig as CliMetricItemConfig, MetricPreview as CliMetricPreview,
+};
 
 pub static MANIFEST: ProducerManifest = ProducerManifest {
     id: "cli.jmespath",
@@ -42,25 +41,6 @@ pub static MANIFEST: ProducerManifest = ProducerManifest {
     auto_sync: true,
     built_in_source: None,
 };
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MetricFormat {
-    #[default]
-    Text,
-    Percent,
-    Countdown,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub struct CliMetricItemConfig {
-    pub label: String,
-    pub data_expression: String,
-    pub description_expression: String,
-    pub progress_expression: String,
-    #[serde(default)]
-    pub format: MetricFormat,
-}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CliMetricConfig {
@@ -102,52 +82,13 @@ impl CliMetricConfig {
 
     fn validate(&self, require_complete: bool) -> Result<()> {
         validate_source_id(&self.id)?;
-        if self.title.chars().count() > MAX_TITLE_CHARS {
-            bail!("标题最多 {MAX_TITLE_CHARS} 个字符");
-        }
         if self.command.len() > MAX_COMMAND_BYTES {
             bail!("CLI 命令不能超过 {MAX_COMMAND_BYTES} bytes");
         }
-        if self.items.len() > MAX_ITEMS {
-            bail!("最多配置 {MAX_ITEMS} 个数据项");
-        }
-        for (index, item) in self.items.iter().enumerate() {
-            if item.label.chars().count() > MAX_LABEL_CHARS {
-                bail!(
-                    "数据项 {} 的 label 最多 {MAX_LABEL_CHARS} 个字符",
-                    index + 1
-                );
-            }
-            for expression in [
-                &item.data_expression,
-                &item.description_expression,
-                &item.progress_expression,
-            ] {
-                if expression.len() > MAX_EXPRESSION_BYTES {
-                    bail!("JMESPath 表达式不能超过 {MAX_EXPRESSION_BYTES} bytes");
-                }
-            }
-        }
+        validate_metric_config(&self.title, &self.items, false)?;
         if require_complete || self.enabled || self.configured() {
-            if self.title.trim().is_empty() {
-                bail!("标题不能为空");
-            }
             parse_command(&self.command)?;
-            if self.items.is_empty() {
-                bail!("至少需要一个数据项");
-            }
-            for (index, item) in self.items.iter().enumerate() {
-                if item.label.trim().is_empty() {
-                    bail!("数据项 {} 的 label 不能为空", index + 1);
-                }
-                compile_expression("data", &item.data_expression)?;
-                if !item.description_expression.trim().is_empty() {
-                    compile_expression("description", &item.description_expression)?;
-                }
-                if !item.progress_expression.trim().is_empty() {
-                    compile_expression("progress", &item.progress_expression)?;
-                }
-            }
+            validate_metric_config(&self.title, &self.items, true)?;
         }
         Ok(())
     }
@@ -156,24 +97,6 @@ impl CliMetricConfig {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct CliMetricSourcesFile {
     sources: Vec<CliMetricConfig>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct CliMetricPreviewItem {
-    pub label: String,
-    pub data: Value,
-    pub description: Option<String>,
-    pub progress: Option<f64>,
-    pub format: MetricFormat,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct CliMetricPreview {
-    pub source_status: &'static str,
-    pub title: String,
-    pub items: Vec<CliMetricPreviewItem>,
-    pub elapsed_ms: u128,
-    pub output_bytes: usize,
 }
 
 #[derive(Clone)]
@@ -208,7 +131,11 @@ impl CliMetricControl {
     }
 
     pub fn control(&self) -> ProducerControl {
-        ProducerControl::new(&MANIFEST, self.trigger.clone())
+        ProducerControl::with_instance_refresh(
+            &MANIFEST,
+            self.trigger.clone(),
+            self.source_trigger.clone(),
+        )
     }
 
     pub async fn sources(&self) -> Vec<CliMetricConfig> {
@@ -221,16 +148,13 @@ impl CliMetricControl {
         config: CliMetricConfig,
     ) -> Result<CliMetricConfig> {
         config.validate(false)?;
-        if state
-            .snapshot()
+        if !state
+            .register_source_if_absent(source_status(&config))
             .await
-            .sources
-            .iter()
-            .any(|source| source.id == config.id)
         {
             bail!("数据源 ID 已存在：{}", config.id);
         }
-        {
+        let result: Result<()> = async {
             let mut sources = self.sources.write().await;
             if sources.iter().any(|source| source.id == config.id) {
                 bail!("数据源 ID 已存在：{}", config.id);
@@ -239,8 +163,13 @@ impl CliMetricControl {
             next.push(config.clone());
             save_sources(&self.config_path, &next)?;
             *sources = next;
+            Ok(())
         }
-        state.register_source(source_status(&config)).await;
+        .await;
+        if let Err(error) = result {
+            state.remove_source(&config.id).await;
+            return Err(error);
+        }
         self.refresh_source(&config.id).await?;
         Ok(config)
     }
@@ -536,36 +465,13 @@ async fn execute_and_project(config: &CliMetricConfig) -> Result<CliMetricPrevie
     let stdout = run_command(&spec).await?;
     let output_bytes = stdout.len();
     let input: Value = serde_json::from_str(&stdout).context("CLI stdout 不是有效 JSON")?;
-    let mut items = Vec::with_capacity(config.items.len());
-    for item in &config.items {
-        let data = evaluate_value(&input, &item.data_expression, MAX_DATA_CHARS)?;
-        let description = if item.description_expression.trim().is_empty() {
-            None
-        } else {
-            let value =
-                evaluate_value(&input, &item.description_expression, MAX_DESCRIPTION_CHARS)?;
-            display_text(value).filter(|value| !value.is_empty() && value != "--")
-        };
-        let progress = if item.progress_expression.trim().is_empty() {
-            None
-        } else {
-            Some(evaluate_number(&input, &item.progress_expression)?.clamp(0.0, 100.0))
-        };
-        items.push(CliMetricPreviewItem {
-            label: item.label.trim().to_owned(),
-            data,
-            description,
-            progress,
-            format: item.format.clone(),
-        });
-    }
-    Ok(CliMetricPreview {
-        source_status: "ok",
-        title: config.title.trim().to_owned(),
-        items,
-        elapsed_ms: started.elapsed().as_millis(),
+    project_metrics(
+        &config.title,
+        &config.items,
+        &input,
+        started.elapsed().as_millis(),
         output_bytes,
-    })
+    )
 }
 
 #[derive(Debug)]
@@ -594,8 +500,8 @@ fn validate_source_id(id: &str) -> Result<()> {
     }) {
         bail!("数据源 ID 只能包含小写字母、数字、- 和 _，且必须以字母或数字开头");
     }
-    if id == "codex" {
-        bail!("数据源 ID codex 为内置实例保留");
+    if matches!(id, "codex" | "cc-switch") {
+        bail!("数据源 ID {id} 为内置实例保留");
     }
     Ok(())
 }
@@ -627,60 +533,6 @@ async fn run_command(spec: &CommandSpec) -> Result<String> {
         bail!("CLI 命令失败 ({}): {}", output.status, message);
     }
     String::from_utf8(output.stdout).context("CLI stdout 不是 UTF-8")
-}
-
-fn compile_expression(label: &str, expression: &str) -> Result<()> {
-    if expression.trim().is_empty() {
-        bail!("{label} 表达式不能为空");
-    }
-    jmespath::compile(expression)
-        .map(|_| ())
-        .with_context(|| format!("{label} JMESPath 无效"))
-}
-
-fn evaluate_value(input: &Value, expression: &str, max_chars: usize) -> Result<Value> {
-    let compiled =
-        jmespath::compile(expression).with_context(|| format!("JMESPath 无效: {expression}"))?;
-    let data = jmespath::Variable::from_json(&serde_json::to_string(input)?)
-        .map_err(|error| anyhow!("无法构造 JMESPath 输入: {error}"))?;
-    let projected = compiled
-        .search(data)
-        .with_context(|| format!("JMESPath 执行失败: {expression}"))?;
-    let value: Value =
-        serde_json::from_str(&projected.to_string()).context("无法编码 JMESPath 结果")?;
-    Ok(match value {
-        Value::Null => Value::String("--".into()),
-        Value::String(value) => Value::String(truncate_text(value.trim(), max_chars)),
-        Value::Bool(_) | Value::Number(_) => value,
-        value => Value::String(truncate_text(&serde_json::to_string(&value)?, max_chars)),
-    })
-}
-
-fn evaluate_number(input: &Value, expression: &str) -> Result<f64> {
-    let value = evaluate_value(input, expression, MAX_DATA_CHARS)?;
-    match value {
-        Value::Number(value) => value
-            .as_f64()
-            .ok_or_else(|| anyhow!("progress 不是有限数字")),
-        Value::String(value) => value
-            .parse::<f64>()
-            .with_context(|| format!("progress 不是数字: {value}")),
-        _ => bail!("progress 必须投影为数字"),
-    }
-}
-
-fn display_text(value: Value) -> Option<String> {
-    match value {
-        Value::String(value) => Some(value),
-        Value::Bool(value) => Some(value.to_string()),
-        Value::Number(value) => Some(value.to_string()),
-        Value::Null => None,
-        value => serde_json::to_string(&value).ok(),
-    }
-}
-
-fn truncate_text(value: &str, max_chars: usize) -> String {
-    value.chars().take(max_chars).collect()
 }
 
 fn config_path() -> Result<PathBuf> {

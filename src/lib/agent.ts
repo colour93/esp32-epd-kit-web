@@ -159,6 +159,40 @@ export interface CliMetricConfig {
   items: CliMetricItemConfig[]
 }
 
+export type HttpMetricPreset = 'custom' | 'deepseek_balance' | 'moonshot_balance'
+export type HttpMetricMethod = 'GET' | 'POST'
+export type HttpMetricNetworkAccess = 'public' | 'private' | 'localhost'
+export type HttpMetricAuthType = 'none' | 'bearer' | 'header'
+
+export interface HttpMetricHeaderConfig {
+  name: string
+  value: string
+}
+
+export interface HttpMetricAuthConfig {
+  type: HttpMetricAuthType
+  header_name?: string
+  secret?: string
+  secret_configured?: boolean
+  clear_secret?: boolean
+}
+
+export interface HttpMetricConfig {
+  id: string
+  enabled: boolean
+  title: string
+  preset: HttpMetricPreset
+  interval_sec: number
+  timeout_ms: number
+  method: HttpMetricMethod
+  url: string
+  network_access: HttpMetricNetworkAccess
+  headers: HttpMetricHeaderConfig[]
+  body: string
+  auth: HttpMetricAuthConfig
+  items: CliMetricItemConfig[]
+}
+
 export interface CliMetricPreviewItem {
   label: string
   data: unknown
@@ -174,6 +208,8 @@ export interface CliMetricPreview {
   elapsed_ms: number
   output_bytes: number
 }
+
+export type HttpMetricPreview = CliMetricPreview
 
 export interface LogEntry {
   at: number
@@ -267,6 +303,25 @@ export const agentApi = {
   ),
   testCliMetricConfig: (config: CliMetricConfig) => request<{ preview: CliMetricPreview }>(
     '/api/v1/source-types/cli.jmespath/test',
+    { method: 'POST', body: JSON.stringify(config) },
+  ),
+  getHttpMetricSources: () => request<{ sources: HttpMetricConfig[] }>(
+    '/api/v1/source-types/http.jmespath/sources',
+  ),
+  createHttpMetricSource: (source: HttpMetricConfig) => request<{ source: HttpMetricConfig }>(
+    '/api/v1/source-types/http.jmespath/sources',
+    { method: 'POST', body: JSON.stringify(source) },
+  ),
+  updateHttpMetricSource: (source: HttpMetricConfig) => request<{ source: HttpMetricConfig }>(
+    `/api/v1/source-types/http.jmespath/sources/${encodeURIComponent(source.id)}`,
+    { method: 'PUT', body: JSON.stringify(source) },
+  ),
+  deleteHttpMetricSource: (id: string) => request(
+    `/api/v1/source-types/http.jmespath/sources/${encodeURIComponent(id)}`,
+    { method: 'DELETE' },
+  ),
+  testHttpMetricConfig: (config: HttpMetricConfig) => request<{ preview: HttpMetricPreview }>(
+    '/api/v1/source-types/http.jmespath/test',
     { method: 'POST', body: JSON.stringify(config) },
   ),
   setPaused: (enabled: boolean) => request('/api/v1/agent/pause', {

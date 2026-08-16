@@ -22,6 +22,7 @@ use crate::{
     autostart,
     ble::BleGateway,
     cli::{CliMetricConfig, CliMetricControl},
+    http::{HttpMetricControl, HttpMetricInput},
     producer::ProducerRegistry,
     publisher::ResourcePublisher,
     state::SharedState,
@@ -35,6 +36,7 @@ pub struct WebContext {
     pub ble: BleGateway,
     pub producers: ProducerRegistry,
     pub cli: CliMetricControl,
+    pub http: HttpMetricControl,
     pub publisher: ResourcePublisher,
     auth: Arc<Auth>,
 }
@@ -50,6 +52,7 @@ impl WebContext {
         ble: BleGateway,
         producers: ProducerRegistry,
         cli: CliMetricControl,
+        http: HttpMetricControl,
         publisher: ResourcePublisher,
     ) -> Result<Self> {
         Ok(Self {
@@ -57,6 +60,7 @@ impl WebContext {
             ble,
             producers,
             cli,
+            http,
             publisher,
             auth: Arc::new(Auth {
                 install_token: load_install_token()?,
@@ -108,6 +112,18 @@ pub fn router(context: WebContext) -> Router {
         .route(
             "/api/v1/source-types/cli.jmespath/test",
             post(cli_source_test),
+        )
+        .route(
+            "/api/v1/source-types/http.jmespath/sources",
+            get(http_sources_get).post(http_source_create),
+        )
+        .route(
+            "/api/v1/source-types/http.jmespath/sources/{id}",
+            axum::routing::put(http_source_update).delete(http_source_delete),
+        )
+        .route(
+            "/api/v1/source-types/http.jmespath/test",
+            post(http_source_test),
         )
         .route("/api/v1/agent/pause", post(agent_pause))
         .route("/api/v1/agent/autostart", post(agent_autostart))
@@ -513,19 +529,11 @@ async fn source_refresh(
         .into_iter()
         .find(|source| source.id == id)
         .ok_or_else(|| ApiError::invalid(anyhow!("unknown data source: {id}")))?;
-    if source.type_id == "cli.jmespath" {
-        context
-            .cli
-            .refresh_source(&source.id)
-            .await
-            .map_err(ApiError::internal)?;
-    } else {
-        context
-            .producers
-            .refresh(&source.type_id)
-            .await
-            .map_err(ApiError::internal)?;
-    }
+    context
+        .producers
+        .refresh_source(&source.type_id, &source.id)
+        .await
+        .map_err(ApiError::internal)?;
     context
         .state
         .log("info", "web", format!("source {id} refresh queued"))
@@ -616,6 +624,92 @@ async fn cli_source_test(
     context
         .state
         .log("info", "web", "CLI data source instance tested")
+        .await;
+    Ok(Json(json!({ "ok": true, "preview": preview })))
+}
+
+async fn http_sources_get(
+    State(context): State<WebContext>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    authenticate(&context, &headers)?;
+    let sources = context.http.sources().await.map_err(ApiError::internal)?;
+    Ok(Json(json!({ "ok": true, "sources": sources })))
+}
+
+async fn http_source_create(
+    State(context): State<WebContext>,
+    headers: HeaderMap,
+    Json(input): Json<HttpMetricInput>,
+) -> ApiResult<Json<Value>> {
+    mutation_auth(&context, &headers)?;
+    let source = context
+        .http
+        .create_source(&context.state, input)
+        .await
+        .map_err(ApiError::invalid)?;
+    context
+        .state
+        .log(
+            "info",
+            "web",
+            format!("HTTP data source {} created", source.id),
+        )
+        .await;
+    Ok(Json(json!({ "ok": true, "source": source })))
+}
+
+async fn http_source_update(
+    State(context): State<WebContext>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<HttpMetricInput>,
+) -> ApiResult<Json<Value>> {
+    mutation_auth(&context, &headers)?;
+    let source = context
+        .http
+        .update_source(&context.state, &id, input)
+        .await
+        .map_err(ApiError::invalid)?;
+    context
+        .state
+        .log("info", "web", format!("HTTP data source {id} updated"))
+        .await;
+    Ok(Json(json!({ "ok": true, "source": source })))
+}
+
+async fn http_source_delete(
+    State(context): State<WebContext>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    mutation_auth(&context, &headers)?;
+    context
+        .http
+        .delete_source(&context.state, &id)
+        .await
+        .map_err(ApiError::invalid)?;
+    context
+        .state
+        .log("info", "web", format!("HTTP data source {id} deleted"))
+        .await;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn http_source_test(
+    State(context): State<WebContext>,
+    headers: HeaderMap,
+    Json(input): Json<HttpMetricInput>,
+) -> ApiResult<Json<Value>> {
+    mutation_auth(&context, &headers)?;
+    let preview = context
+        .http
+        .test_config(input)
+        .await
+        .map_err(ApiError::invalid)?;
+    context
+        .state
+        .log("info", "web", "HTTP data source instance tested")
         .await;
     Ok(Json(json!({ "ok": true, "preview": preview })))
 }

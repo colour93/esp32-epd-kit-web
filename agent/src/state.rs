@@ -167,6 +167,16 @@ impl SharedState {
         self.publish_locked(&snapshot);
     }
 
+    pub async fn register_source_if_absent(&self, source: SourceStatus) -> bool {
+        let mut snapshot = self.snapshot.write().await;
+        if snapshot.sources.iter().any(|item| item.id == source.id) {
+            return false;
+        }
+        snapshot.sources.push(source);
+        self.publish_locked(&snapshot);
+        true
+    }
+
     pub async fn update_source(&self, id: &str, update: impl FnOnce(&mut SourceStatus)) {
         let mut snapshot = self.snapshot.write().await;
         if let Some(source) = snapshot.sources.iter_mut().find(|item| item.id == id) {
@@ -229,4 +239,24 @@ pub fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SharedState, SourceStatus};
+
+    #[tokio::test]
+    async fn source_id_reservation_is_atomic() {
+        let state = SharedState::new();
+        let source = SourceStatus {
+            id: "shared-id".into(),
+            ..Default::default()
+        };
+        let (first, second) = tokio::join!(
+            state.register_source_if_absent(source.clone()),
+            state.register_source_if_absent(source),
+        );
+        assert_ne!(first, second);
+        assert_eq!(state.snapshot().await.sources.len(), 1);
+    }
 }

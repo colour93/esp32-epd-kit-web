@@ -9,6 +9,7 @@
     "build": "tsc -b && vite build",
     "build:agent": "cargo build --release --manifest-path agent/Cargo.toml",
     "package:agent": "cargo packager --release --manifest-path agent/Cargo.toml",
+    "test": "bun test",
     "lint": "oxlint",
     "preview": "vite preview"
   },

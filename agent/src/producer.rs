@@ -41,6 +41,7 @@ pub struct BuiltInSourceManifest {
 pub struct ProducerControl {
     pub manifest: &'static ProducerManifest,
     trigger: mpsc::Sender<ProducerTrigger>,
+    instance_trigger: Option<mpsc::Sender<String>>,
 }
 
 impl ProducerControl {
@@ -48,7 +49,23 @@ impl ProducerControl {
         manifest: &'static ProducerManifest,
         trigger: mpsc::Sender<ProducerTrigger>,
     ) -> Self {
-        Self { manifest, trigger }
+        Self {
+            manifest,
+            trigger,
+            instance_trigger: None,
+        }
+    }
+
+    pub fn with_instance_refresh(
+        manifest: &'static ProducerManifest,
+        trigger: mpsc::Sender<ProducerTrigger>,
+        instance_trigger: mpsc::Sender<String>,
+    ) -> Self {
+        Self {
+            manifest,
+            trigger,
+            instance_trigger: Some(instance_trigger),
+        }
     }
 
     pub async fn refresh(&self) -> Result<()> {
@@ -63,6 +80,17 @@ impl ProducerControl {
             .send(ProducerTrigger::SyncCycle(cycle_id))
             .await
             .map_err(|_| anyhow!("producer {} stopped", self.manifest.id))
+    }
+
+    pub async fn refresh_source(&self, source_id: &str) -> Result<()> {
+        if let Some(trigger) = &self.instance_trigger {
+            trigger
+                .send(source_id.to_owned())
+                .await
+                .map_err(|_| anyhow!("producer {} stopped", self.manifest.id))
+        } else {
+            self.refresh().await
+        }
     }
 }
 
@@ -120,6 +148,15 @@ impl ProducerRegistry {
             .find(|item| item.manifest.id == id)
             .ok_or_else(|| anyhow!("unknown producer id: {id}"))?;
         producer.refresh().await
+    }
+
+    pub async fn refresh_source(&self, type_id: &str, source_id: &str) -> Result<()> {
+        let producer = self
+            .items
+            .iter()
+            .find(|item| item.manifest.id == type_id)
+            .ok_or_else(|| anyhow!("unknown producer id: {type_id}"))?;
+        producer.refresh_source(source_id).await
     }
 
     pub fn auto_sync_ids(&self) -> Vec<&'static str> {

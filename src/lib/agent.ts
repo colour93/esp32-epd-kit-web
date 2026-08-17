@@ -141,7 +141,7 @@ export interface SourceStatus {
   details: JsonObject
 }
 
-export type GenericMetricFormat = 'text' | 'percent' | 'countdown'
+export type GenericMetricFormat = 'text' | 'percent' | 'countdown' | 'compact_number'
 
 export interface CliMetricItemConfig {
   label: string

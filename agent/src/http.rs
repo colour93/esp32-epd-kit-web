@@ -10,6 +10,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use chrono::Local;
 use futures::{StreamExt, stream};
 use reqwest::{
     Client, Method, Url,
@@ -43,6 +44,7 @@ const MAX_TIMEOUT_MS: u64 = 30_000;
 const MAX_CONCURRENT_REQUESTS: usize = 4;
 const CREDENTIAL_TIMEOUT_SEC: u64 = 5;
 const SECRET_SERVICE: &str = "dev.epd-kit.agent.http";
+const TODAY_PLACEHOLDER: &str = "{{today}}";
 
 pub static MANIFEST: ProducerManifest = ProducerManifest {
     id: "http.jmespath",
@@ -272,7 +274,7 @@ impl HttpMetricConfig {
             }
         }
         if require_complete || self.enabled || self.configured() {
-            validate_url(&self.url, self.network_access)?;
+            validate_url(&render_url_template(&self.url), self.network_access)?;
             validate_metric_config(&self.title, &self.items, true)?;
         }
         Ok(())
@@ -971,7 +973,7 @@ async fn execute_and_project_inner(
     secret: Option<&str>,
 ) -> Result<MetricPreview> {
     let started = Instant::now();
-    let url = validate_url(&config.url, config.network_access)?;
+    let url = validate_url(&render_url_template(&config.url), config.network_access)?;
     let pinned = resolve_and_validate(
         &url,
         config.network_access,
@@ -1150,6 +1152,14 @@ fn validate_url(value: &str, network_access: NetworkAccess) -> Result<Url> {
         bail!("HTTP URL query 不得包含凭据，请使用 auth 配置");
     }
     Ok(url)
+}
+
+fn render_url_template(value: &str) -> String {
+    if !value.contains(TODAY_PLACEHOLDER) {
+        return value.to_owned();
+    }
+    let today = Local::now().format("%Y-%m-%d").to_string();
+    value.replace(TODAY_PLACEHOLDER, &today)
 }
 
 async fn resolve_and_validate(

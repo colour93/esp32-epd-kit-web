@@ -52,6 +52,7 @@ export const MetricItemsEditor = ({
               <NativeSelectOption value="text">文本</NativeSelectOption>
               <NativeSelectOption value="percent">百分比</NativeSelectOption>
               <NativeSelectOption value="countdown">倒计时</NativeSelectOption>
+              <NativeSelectOption value="compact_number">紧凑数字</NativeSelectOption>
             </NativeSelect>
           </Field>
           <Field className="justify-end">

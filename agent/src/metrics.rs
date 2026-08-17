@@ -16,6 +16,7 @@ pub enum MetricFormat {
     Text,
     Percent,
     Countdown,
+    CompactNumber,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -106,7 +107,10 @@ pub fn project_metrics(
 ) -> Result<MetricPreview> {
     let mut preview_items = Vec::with_capacity(items.len());
     for item in items {
-        let data = evaluate_value(input, &item.data_expression, MAX_DATA_CHARS)?;
+        let mut data = evaluate_value(input, &item.data_expression, MAX_DATA_CHARS)?;
+        if matches!(&item.format, MetricFormat::CompactNumber) {
+            data = Value::String(compact_number(data)?);
+        }
         let description = if item.description_expression.trim().is_empty() {
             None
         } else {
@@ -183,6 +187,45 @@ fn display_text(value: Value) -> Option<String> {
         Value::Null => None,
         value => serde_json::to_string(&value).ok(),
     }
+}
+
+fn compact_number(value: Value) -> Result<String> {
+    let number = match value {
+        Value::Number(value) => value
+            .as_f64()
+            .ok_or_else(|| anyhow!("紧凑数字不是有限数字"))?,
+        Value::String(value) => value
+            .parse::<f64>()
+            .with_context(|| format!("紧凑数字不是数字: {value}"))?,
+        _ => bail!("紧凑数字必须投影为数字"),
+    };
+    if !number.is_finite() {
+        bail!("紧凑数字不是有限数字");
+    }
+
+    const UNITS: [&str; 5] = ["", "K", "M", "B", "T"];
+    let mut scaled = number;
+    let mut unit = 0;
+    while scaled.abs() >= 1000.0 && unit < UNITS.len() - 1 {
+        scaled /= 1000.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        return Ok(number.to_string());
+    }
+
+    let precision = if scaled.abs() >= 100.0 {
+        0
+    } else if scaled.abs() >= 10.0 {
+        1
+    } else {
+        2
+    };
+    let mut value = format!("{scaled:.precision$}");
+    if value.contains('.') {
+        value = value.trim_end_matches('0').trim_end_matches('.').to_owned();
+    }
+    Ok(format!("{value}{}", UNITS[unit]))
 }
 
 pub fn truncate_text(value: &str, max_chars: usize) -> String {

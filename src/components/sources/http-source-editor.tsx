@@ -125,6 +125,7 @@ export const HttpSourceEditor = ({
             <Field className="lg:col-span-2">
               <FieldLabel>URL</FieldLabel>
               <Input className="font-mono" type="url" placeholder="https://api.example.com/usage" value={value.url} onChange={(event) => onChange({ ...value, url: event.target.value })} />
+              <FieldDescription>使用 {'{{today}}'} 插入本机当日日期（YYYY-MM-DD）。</FieldDescription>
             </Field>
       </FieldGroup>
 

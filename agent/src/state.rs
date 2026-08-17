@@ -127,7 +127,7 @@ impl SharedState {
         Arc::new(Self {
             snapshot: RwLock::new(Snapshot {
                 agent: AgentStatus {
-                    version: env!("CARGO_PKG_VERSION"),
+                    version: env!("EPD_AGENT_VERSION"),
                     paused: false,
                     platform: std::env::consts::OS,
                     autostart_enabled: crate::autostart::is_enabled(),

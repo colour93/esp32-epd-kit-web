@@ -7,6 +7,7 @@ use std::{
 fn main() {
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("manifest dir"));
     let web_root = manifest.parent().expect("web root");
+    configure_version(web_root);
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         let info_plist = manifest.join("macos/Info.plist");
         println!("cargo:rerun-if-changed={}", info_plist.display());
@@ -38,6 +39,53 @@ fn main() {
     collect(&dist, &dist, &mut generated);
     generated.push_str("];\n");
     fs::write(output, generated).expect("write embedded assets");
+}
+
+fn configure_version(web_root: &Path) {
+    println!("cargo:rerun-if-env-changed=EPD_AGENT_VERSION");
+    track_git_revision(web_root);
+    let version = env::var("EPD_AGENT_VERSION")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            git(web_root, &["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".into())
+        });
+    println!("cargo:rustc-env=EPD_AGENT_VERSION={}", version.trim());
+}
+
+fn track_git_revision(web_root: &Path) {
+    for name in [
+        Some("HEAD".to_owned()),
+        git(web_root, &["symbolic-ref", "-q", "HEAD"]),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let Some(path) = git(web_root, &["rev-parse", "--git-path", &name]) else {
+            continue;
+        };
+        let path = PathBuf::from(path);
+        let path = if path.is_absolute() {
+            path
+        } else {
+            web_root.join(path)
+        };
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+}
+
+fn git(web_root: &Path, args: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(web_root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?;
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_owned())
 }
 
 fn collect(root: &Path, directory: &Path, generated: &mut String) {

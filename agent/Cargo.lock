@@ -885,6 +885,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64",
  "btleplug",
  "chrono",
  "crc32fast",
@@ -901,6 +902,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "shell-words",
  "tao",
  "tokio",
@@ -908,6 +910,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tray-icon",
+ "url",
  "uuid",
  "windows 0.62.2",
 ]

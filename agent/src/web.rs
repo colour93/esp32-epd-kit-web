@@ -20,8 +20,12 @@ use tokio_stream::wrappers::BroadcastStream;
 
 use crate::{
     autostart,
+    balance::{BalanceControl, BalanceInput},
     ble::BleGateway,
     cli::{CliMetricConfig, CliMetricControl},
+    codex_oauth::{
+        CodexOAuthCompleteInput, CodexOAuthControl, CodexOAuthStartInput, CodexOAuthUpdateInput,
+    },
     http::{HttpMetricControl, HttpMetricInput},
     producer::ProducerRegistry,
     publisher::ResourcePublisher,
@@ -35,8 +39,10 @@ pub struct WebContext {
     pub state: Arc<SharedState>,
     pub ble: BleGateway,
     pub producers: ProducerRegistry,
+    pub codex_oauth: CodexOAuthControl,
     pub cli: CliMetricControl,
     pub http: HttpMetricControl,
+    pub balance: BalanceControl,
     pub publisher: ResourcePublisher,
     auth: Arc<Auth>,
 }
@@ -51,16 +57,20 @@ impl WebContext {
         state: Arc<SharedState>,
         ble: BleGateway,
         producers: ProducerRegistry,
+        codex_oauth: CodexOAuthControl,
         cli: CliMetricControl,
         http: HttpMetricControl,
+        balance: BalanceControl,
         publisher: ResourcePublisher,
     ) -> Result<Self> {
         Ok(Self {
             state,
             ble,
             producers,
+            codex_oauth,
             cli,
             http,
+            balance,
             publisher,
             auth: Arc::new(Auth {
                 install_token: load_install_token()?,
@@ -102,6 +112,22 @@ pub fn router(context: WebContext) -> Router {
         )
         .route("/api/v1/sources/{id}/refresh", post(source_refresh))
         .route(
+            "/api/v1/source-types/codex.oauth/sources",
+            get(codex_oauth_sources_get),
+        )
+        .route(
+            "/api/v1/source-types/codex.oauth/sources/{id}",
+            axum::routing::put(codex_oauth_source_update).delete(codex_oauth_source_delete),
+        )
+        .route(
+            "/api/v1/source-types/codex.oauth/oauth/start",
+            post(codex_oauth_start),
+        )
+        .route(
+            "/api/v1/source-types/codex.oauth/oauth/complete",
+            post(codex_oauth_complete),
+        )
+        .route(
             "/api/v1/source-types/cli.jmespath/sources",
             get(cli_sources_get).post(cli_source_create),
         )
@@ -124,6 +150,18 @@ pub fn router(context: WebContext) -> Router {
         .route(
             "/api/v1/source-types/http.jmespath/test",
             post(http_source_test),
+        )
+        .route(
+            "/api/v1/source-types/platform.balance/sources",
+            get(balance_sources_get).post(balance_source_create),
+        )
+        .route(
+            "/api/v1/source-types/platform.balance/sources/{id}",
+            axum::routing::put(balance_source_update).delete(balance_source_delete),
+        )
+        .route(
+            "/api/v1/source-types/platform.balance/test",
+            post(balance_source_test),
         )
         .route("/api/v1/agent/pause", post(agent_pause))
         .route("/api/v1/agent/autostart", post(agent_autostart))
@@ -541,6 +579,88 @@ async fn source_refresh(
     Ok(Json(json!({ "ok": true, "queued": true })))
 }
 
+async fn codex_oauth_sources_get(
+    State(context): State<WebContext>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    authenticate(&context, &headers)?;
+    let sources = context
+        .codex_oauth
+        .sources()
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(json!({ "ok": true, "sources": sources })))
+}
+
+async fn codex_oauth_start(
+    State(context): State<WebContext>,
+    headers: HeaderMap,
+    Json(input): Json<CodexOAuthStartInput>,
+) -> ApiResult<Json<Value>> {
+    mutation_auth(&context, &headers)?;
+    let result = context
+        .codex_oauth
+        .start_oauth(&context.state, input)
+        .await
+        .map_err(ApiError::invalid)?;
+    Ok(Json(json!({ "ok": true, "result": result })))
+}
+
+async fn codex_oauth_complete(
+    State(context): State<WebContext>,
+    headers: HeaderMap,
+    Json(input): Json<CodexOAuthCompleteInput>,
+) -> ApiResult<Json<Value>> {
+    mutation_auth(&context, &headers)?;
+    let source = context
+        .codex_oauth
+        .complete_oauth(&context.state, input)
+        .await
+        .map_err(ApiError::invalid)?;
+    context
+        .state
+        .log(
+            "info",
+            "web",
+            format!("Codex OAuth source {} authorized", source.id),
+        )
+        .await;
+    Ok(Json(json!({ "ok": true, "source": source })))
+}
+
+async fn codex_oauth_source_update(
+    State(context): State<WebContext>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<CodexOAuthUpdateInput>,
+) -> ApiResult<Json<Value>> {
+    mutation_auth(&context, &headers)?;
+    let source = context
+        .codex_oauth
+        .update_source(&context.state, &id, input)
+        .await
+        .map_err(ApiError::invalid)?;
+    Ok(Json(json!({ "ok": true, "source": source })))
+}
+
+async fn codex_oauth_source_delete(
+    State(context): State<WebContext>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    mutation_auth(&context, &headers)?;
+    context
+        .codex_oauth
+        .delete_source(&context.state, &id)
+        .await
+        .map_err(ApiError::invalid)?;
+    context
+        .state
+        .log("info", "web", format!("Codex OAuth source {id} deleted"))
+        .await;
+    Ok(Json(json!({ "ok": true })))
+}
+
 async fn cli_sources_get(
     State(context): State<WebContext>,
     headers: HeaderMap,
@@ -710,6 +830,104 @@ async fn http_source_test(
     context
         .state
         .log("info", "web", "HTTP data source instance tested")
+        .await;
+    Ok(Json(json!({ "ok": true, "preview": preview })))
+}
+
+async fn balance_sources_get(
+    State(context): State<WebContext>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    authenticate(&context, &headers)?;
+    let sources = context
+        .balance
+        .sources()
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(json!({ "ok": true, "sources": sources })))
+}
+
+async fn balance_source_create(
+    State(context): State<WebContext>,
+    headers: HeaderMap,
+    Json(input): Json<BalanceInput>,
+) -> ApiResult<Json<Value>> {
+    mutation_auth(&context, &headers)?;
+    let source = context
+        .balance
+        .create_source(&context.state, input)
+        .await
+        .map_err(ApiError::invalid)?;
+    context
+        .state
+        .log(
+            "info",
+            "web",
+            format!("platform balance data source {} created", source.id),
+        )
+        .await;
+    Ok(Json(json!({ "ok": true, "source": source })))
+}
+
+async fn balance_source_update(
+    State(context): State<WebContext>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<BalanceInput>,
+) -> ApiResult<Json<Value>> {
+    mutation_auth(&context, &headers)?;
+    let source = context
+        .balance
+        .update_source(&context.state, &id, input)
+        .await
+        .map_err(ApiError::invalid)?;
+    context
+        .state
+        .log(
+            "info",
+            "web",
+            format!("platform balance data source {id} updated"),
+        )
+        .await;
+    Ok(Json(json!({ "ok": true, "source": source })))
+}
+
+async fn balance_source_delete(
+    State(context): State<WebContext>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    mutation_auth(&context, &headers)?;
+    context
+        .balance
+        .delete_source(&context.state, &id)
+        .await
+        .map_err(ApiError::invalid)?;
+    context
+        .state
+        .log(
+            "info",
+            "web",
+            format!("platform balance data source {id} deleted"),
+        )
+        .await;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn balance_source_test(
+    State(context): State<WebContext>,
+    headers: HeaderMap,
+    Json(input): Json<BalanceInput>,
+) -> ApiResult<Json<Value>> {
+    mutation_auth(&context, &headers)?;
+    let preview = context
+        .balance
+        .test_config(input)
+        .await
+        .map_err(ApiError::invalid)?;
+    context
+        .state
+        .log("info", "web", "platform balance data source tested")
         .await;
     Ok(Json(json!({ "ok": true, "preview": preview })))
 }

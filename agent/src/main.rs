@@ -1,8 +1,10 @@
 mod autostart;
+mod balance;
 mod ble;
 mod ccswitch;
 mod cli;
 mod codex;
+mod codex_oauth;
 mod coordinator;
 mod http;
 mod instance;
@@ -62,7 +64,7 @@ async fn prepare_service() -> Result<Service> {
             "agent",
             format!(
                 "EPD Agent {} starting on {}",
-                env!("CARGO_PKG_VERSION"),
+                env!("EPD_AGENT_VERSION"),
                 std::env::consts::OS,
             ),
         )
@@ -74,11 +76,19 @@ async fn prepare_service() -> Result<Service> {
         state: state.clone(),
         publisher: publisher.clone(),
     });
+    let codex_oauth = codex_oauth::CodexOAuthControl::spawn(producer::ProducerContext {
+        state: state.clone(),
+        publisher: publisher.clone(),
+    })?;
     let cli = cli::CliMetricControl::spawn(producer::ProducerContext {
         state: state.clone(),
         publisher: publisher.clone(),
     })?;
     let http = http::HttpMetricControl::spawn(producer::ProducerContext {
+        state: state.clone(),
+        publisher: publisher.clone(),
+    })?;
+    let balance = balance::BalanceControl::spawn(producer::ProducerContext {
         state: state.clone(),
         publisher: publisher.clone(),
     })?;
@@ -90,9 +100,11 @@ async fn prepare_service() -> Result<Service> {
         &state,
         vec![
             codex.control(),
+            codex_oauth.control(),
             ccswitch.control(),
             cli.control(),
             http.control(),
+            balance.control(),
         ],
     )
     .await?;
@@ -104,7 +116,16 @@ async fn prepare_service() -> Result<Service> {
         publisher.clone(),
         completion_rx,
     );
-    let context = web::WebContext::new(state.clone(), ble, producers, cli, http, publisher)?;
+    let context = web::WebContext::new(
+        state.clone(),
+        ble,
+        producers,
+        codex_oauth,
+        cli,
+        http,
+        balance,
+        publisher,
+    )?;
     let port = configured_port()?;
     let launch_url = context.launch_url(port);
     let app = web::router(context);

@@ -1,4 +1,4 @@
-import type { CliMetricConfig, HttpMetricConfig } from '@/lib/agent'
+import type { BalanceConfig, CliMetricConfig, HttpMetricConfig } from '@/lib/agent'
 
 const FILE_FORMAT = 'epd-agent-sources'
 const FILE_VERSION = 1
@@ -9,6 +9,7 @@ const MAX_HTTP_SOURCE_COUNT = 16
 type SourceTransferEntry =
   | { type: 'cli.jmespath'; config: CliMetricConfig }
   | { type: 'http.jmespath'; config: HttpMetricConfig }
+  | { type: 'platform.balance'; config: BalanceConfig }
 
 export interface SourceTransferFile {
   format: typeof FILE_FORMAT
@@ -20,6 +21,7 @@ export interface SourceTransferFile {
 export interface ParsedSourceTransfer {
   cli: CliMetricConfig[]
   http: HttpMetricConfig[]
+  balance: BalanceConfig[]
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> => (
@@ -31,16 +33,19 @@ const requireConfig = (value: unknown, type: SourceTransferEntry['type'], index:
   if (typeof value.id !== 'string' || !value.id) throw new Error(`第 ${index + 1} 个数据源缺少 ID`)
   if (typeof value.title !== 'string') throw new Error(`数据源 ${value.id} 缺少名称`)
   if (typeof value.enabled !== 'boolean') throw new Error(`数据源 ${value.id} 的启用状态无效`)
-  if (!Array.isArray(value.items)) throw new Error(`数据源 ${value.id} 的指标配置无效`)
   if (!/^[a-z0-9][a-z0-9_-]{0,31}$/.test(value.id)) throw new Error(`数据源 ID 无效：${value.id}`)
   if (value.id === 'codex' || value.id === 'cc-switch') throw new Error(`数据源 ID 为内置实例保留：${value.id}`)
 
   if (type === 'cli.jmespath') {
+    if (!Array.isArray(value.items)) throw new Error(`数据源 ${value.id} 的指标配置无效`)
     if (typeof value.command !== 'string') throw new Error(`CLI 数据源 ${value.id} 缺少命令`)
-  } else {
+  } else if (type === 'http.jmespath') {
+    if (!Array.isArray(value.items)) throw new Error(`数据源 ${value.id} 的指标配置无效`)
     if (typeof value.url !== 'string' || !isRecord(value.auth)) {
       throw new Error(`HTTP 数据源 ${value.id} 配置无效`)
     }
+  } else if (value.platform !== 'deepseek' && value.platform !== 'moonshot') {
+    throw new Error(`平台余额数据源 ${value.id} 配置无效`)
   }
   return value
 }
@@ -53,9 +58,18 @@ const portableHttpConfig = (config: HttpMetricConfig): HttpMetricConfig => ({
   },
 })
 
+const portableBalanceConfig = (config: BalanceConfig): BalanceConfig => {
+  const portable = structuredClone(config)
+  delete portable.api_key
+  delete portable.secret_configured
+  delete portable.clear_secret
+  return portable
+}
+
 export const createSourceTransferFile = (
   cli: CliMetricConfig[],
   http: HttpMetricConfig[],
+  balance: BalanceConfig[],
 ): SourceTransferFile => ({
   format: FILE_FORMAT,
   version: FILE_VERSION,
@@ -68,6 +82,10 @@ export const createSourceTransferFile = (
     ...http.map((config): SourceTransferEntry => ({
       type: 'http.jmespath',
       config: portableHttpConfig(config),
+    })),
+    ...balance.map((config): SourceTransferEntry => ({
+      type: 'platform.balance',
+      config: portableBalanceConfig(config),
     })),
   ],
 })
@@ -86,10 +104,10 @@ export const parseSourceTransferFile = (text: string): ParsedSourceTransfer => {
   if (!Array.isArray(value.sources)) throw new Error('数据源文件缺少 sources 数组')
   if (value.sources.length > MAX_SOURCE_COUNT) throw new Error(`一次最多导入 ${MAX_SOURCE_COUNT} 个数据源`)
 
-  const parsed: ParsedSourceTransfer = { cli: [], http: [] }
+  const parsed: ParsedSourceTransfer = { cli: [], http: [], balance: [] }
   const ids = new Set<string>()
   value.sources.forEach((entry, index) => {
-    if (!isRecord(entry) || (entry.type !== 'cli.jmespath' && entry.type !== 'http.jmespath')) {
+    if (!isRecord(entry) || (entry.type !== 'cli.jmespath' && entry.type !== 'http.jmespath' && entry.type !== 'platform.balance')) {
       throw new Error(`第 ${index + 1} 个数据源类型无效`)
     }
     const config = requireConfig(entry.config, entry.type, index)
@@ -99,9 +117,12 @@ export const parseSourceTransferFile = (text: string): ParsedSourceTransfer => {
 
     if (entry.type === 'cli.jmespath') {
       parsed.cli.push(structuredClone(config) as unknown as CliMetricConfig)
-    } else {
+    } else if (entry.type === 'http.jmespath') {
       const http = structuredClone(config) as unknown as HttpMetricConfig
       parsed.http.push(portableHttpConfig(http))
+    } else {
+      const balance = structuredClone(config) as unknown as BalanceConfig
+      parsed.balance.push(portableBalanceConfig(balance))
     }
   })
   if (parsed.http.length > MAX_HTTP_SOURCE_COUNT) {

@@ -106,7 +106,7 @@ impl AppServer {
             "clientInfo": {
                 "name": "epd_agent",
                 "title": "EPD Agent",
-                "version": env!("CARGO_PKG_VERSION")
+                "version": env!("EPD_AGENT_VERSION")
             },
             "capabilities": {
                 "optOutNotificationMethods": ["item/agentMessage/delta", "item/commandExecution/outputDelta"]

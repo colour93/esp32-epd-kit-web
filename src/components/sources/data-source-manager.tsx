@@ -1,11 +1,14 @@
 import { useEffect, useRef, useState } from 'react'
-import { Download, FlaskConical, Globe2, LoaderCircle, Pencil, RefreshCw, Save, Terminal, Trash2, Upload, X } from 'lucide-react'
+import { CircleDollarSign, Download, ExternalLink, FlaskConical, Globe2, KeyRound, LoaderCircle, Pencil, Plus, RefreshCw, Save, Terminal, Trash2, Upload, X } from 'lucide-react'
 import { toast } from 'sonner'
 import {
   AgentApiError,
   agentApi,
+  type BalanceConfig,
   type CliMetricConfig,
   type CliMetricPreview,
+  type CodexOAuthConfig,
+  type CodexOAuthStartResult,
   type HttpMetricConfig,
   type SourceStatus,
   type SourceTypeStatus,
@@ -18,10 +21,18 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { CliSourceEditor } from '@/components/sources/cli-source-editor'
 import { HttpSourceEditor } from '@/components/sources/http-source-editor'
 import { newHttpSource } from '@/components/sources/http-source-config'
+import { BalanceSourceEditor } from '@/components/sources/balance-source-editor'
+import { newBalanceSource } from '@/components/sources/balance-source-config'
 import { DashboardEmpty, StatusBadge } from '@/components/dashboard/dashboard-components'
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { Switch } from '@/components/ui/switch'
 
 const CLI_TYPE = 'cli.jmespath'
 const HTTP_TYPE = 'http.jmespath'
+const BALANCE_TYPE = 'platform.balance'
+const CODEX_OAUTH_TYPE = 'codex.oauth'
 
 const errorText = (error: unknown) => error instanceof AgentApiError
   ? error.message
@@ -42,6 +53,7 @@ const newCliSource = (): CliMetricConfig => ({
 type SourceDraft =
   | { type: 'cli'; creating: boolean; config: CliMetricConfig }
   | { type: 'http'; creating: boolean; config: HttpMetricConfig }
+  | { type: 'balance'; creating: boolean; config: BalanceConfig }
 
 const Preview = ({ preview }: { preview: CliMetricPreview }) => (
   <div className="grid gap-3 rounded-lg border bg-muted/30 p-3 sm:grid-cols-2 lg:grid-cols-4">
@@ -61,24 +73,34 @@ export const DataSourceManager = ({ sourceTypes, sources }: {
 }) => {
   const [cliConfigs, setCliConfigs] = useState<CliMetricConfig[]>([])
   const [httpConfigs, setHttpConfigs] = useState<HttpMetricConfig[]>([])
+  const [balanceConfigs, setBalanceConfigs] = useState<BalanceConfig[]>([])
+  const [codexConfigs, setCodexConfigs] = useState<CodexOAuthConfig[]>([])
+  const [codexDraft, setCodexDraft] = useState<CodexOAuthConfig | null>(null)
+  const [oauthFlow, setOauthFlow] = useState<CodexOAuthStartResult | null>(null)
+  const [callbackUrl, setCallbackUrl] = useState('')
   const [draft, setDraft] = useState<SourceDraft | null>(null)
+  const [createDialogOpen, setCreateDialogOpen] = useState(false)
   const [preview, setPreview] = useState<CliMetricPreview | null>(null)
   const [busy, setBusy] = useState<string | null>('load')
   const importInput = useRef<HTMLInputElement>(null)
 
   const reloadConfigs = async () => {
-    const [cli, http] = await Promise.all([agentApi.getCliMetricSources(), agentApi.getHttpMetricSources()])
+    const [cli, http, balance, codex] = await Promise.all([agentApi.getCliMetricSources(), agentApi.getHttpMetricSources(), agentApi.getBalanceSources(), agentApi.getCodexOAuthSources()])
     setCliConfigs(cli.sources)
     setHttpConfigs(http.sources)
+    setBalanceConfigs(balance.sources)
+    setCodexConfigs(codex.sources)
   }
 
   useEffect(() => {
     let active = true
-    Promise.all([agentApi.getCliMetricSources(), agentApi.getHttpMetricSources()])
-      .then(([cli, http]) => {
+    Promise.all([agentApi.getCliMetricSources(), agentApi.getHttpMetricSources(), agentApi.getBalanceSources(), agentApi.getCodexOAuthSources()])
+      .then(([cli, http, balance, codex]) => {
         if (!active) return
         setCliConfigs(cli.sources)
         setHttpConfigs(http.sources)
+        setBalanceConfigs(balance.sources)
+        setCodexConfigs(codex.sources)
       })
       .catch((error) => { if (active) toast.error(errorText(error)) })
       .finally(() => { if (active) setBusy(null) })
@@ -87,7 +109,7 @@ export const DataSourceManager = ({ sourceTypes, sources }: {
 
   const exportSources = () => {
     if (busy) return
-    const contents = JSON.stringify(createSourceTransferFile(cliConfigs, httpConfigs), null, 2)
+    const contents = JSON.stringify(createSourceTransferFile(cliConfigs, httpConfigs, balanceConfigs), null, 2)
     const url = URL.createObjectURL(new Blob([`${contents}\n`], { type: 'application/json' }))
     const link = document.createElement('a')
     link.href = url
@@ -96,8 +118,8 @@ export const DataSourceManager = ({ sourceTypes, sources }: {
     link.click()
     link.remove()
     window.setTimeout(() => URL.revokeObjectURL(url), 0)
-    toast.success(`已导出 ${cliConfigs.length + httpConfigs.length} 个数据源`, {
-      description: 'HTTP 密钥未包含在文件中',
+    toast.success(`已导出 ${cliConfigs.length + httpConfigs.length + balanceConfigs.length} 个数据源`, {
+      description: 'HTTP 与平台 API Key 未包含在文件中',
     })
   }
 
@@ -107,19 +129,24 @@ export const DataSourceManager = ({ sourceTypes, sources }: {
     try {
       if (file.size > 1024 * 1024) throw new Error('导入文件不能超过 1 MiB')
       const imported = parseSourceTransferFile(await file.text())
-      const importedCount = imported.cli.length + imported.http.length
+      const importedCount = imported.cli.length + imported.http.length + imported.balance.length
       if (!importedCount) throw new Error('导入文件中没有数据源')
 
       const cliIds = new Set(cliConfigs.map((source) => source.id))
       const httpIds = new Set(httpConfigs.map((source) => source.id))
-      const collision = imported.cli.find((source) => httpIds.has(source.id))
-        ?? imported.http.find((source) => cliIds.has(source.id))
+      const balanceIds = new Set(balanceConfigs.map((source) => source.id))
+      const collision = imported.cli.find((source) => httpIds.has(source.id) || balanceIds.has(source.id))
+        ?? imported.http.find((source) => cliIds.has(source.id) || balanceIds.has(source.id))
+        ?? imported.balance.find((source) => cliIds.has(source.id) || httpIds.has(source.id))
       if (collision) throw new Error(`数据源 ${collision.id} 已被其他类型使用`)
       const newHttpCount = imported.http.filter((source) => !httpIds.has(source.id)).length
       if (httpConfigs.length + newHttpCount > 16) throw new Error('HTTP 数据源总数不能超过 16 个')
+      const newBalanceCount = imported.balance.filter((source) => !balanceIds.has(source.id)).length
+      if (balanceConfigs.length + newBalanceCount > 16) throw new Error('平台余额数据源总数不能超过 16 个')
 
       const overwriteCount = imported.cli.filter((source) => cliIds.has(source.id)).length
         + imported.http.filter((source) => httpIds.has(source.id)).length
+        + imported.balance.filter((source) => balanceIds.has(source.id)).length
       if (overwriteCount && !window.confirm(`将覆盖 ${overwriteCount} 个同 ID 数据源，继续导入？`)) return
 
       for (const source of imported.cli) {
@@ -132,12 +159,17 @@ export const DataSourceManager = ({ sourceTypes, sources }: {
           ? agentApi.updateHttpMetricSource(source)
           : agentApi.createHttpMetricSource(source))
       }
+      for (const source of imported.balance) {
+        await (balanceIds.has(source.id)
+          ? agentApi.updateBalanceSource(source)
+          : agentApi.createBalanceSource(source))
+      }
       await reloadConfigs()
       setDraft(null)
       setPreview(null)
-      const needsSecret = imported.http.filter((source) => source.auth.type !== 'none').length
+      const needsSecret = imported.http.filter((source) => source.auth.type !== 'none').length + imported.balance.length
       toast.success(`已导入 ${importedCount} 个数据源`, needsSecret ? {
-        description: `${needsSecret} 个 HTTP 数据源可能需要重新填写密钥`,
+        description: `${needsSecret} 个数据源可能需要重新填写密钥`,
       } : undefined)
     } catch (error) {
       try { await reloadConfigs() } catch { /* Preserve the original import error. */ }
@@ -149,14 +181,32 @@ export const DataSourceManager = ({ sourceTypes, sources }: {
   }
 
   const beginCreate = (type: SourceDraft['type']) => {
+    setCreateDialogOpen(false)
+    setCodexDraft(null)
     setPreview(null)
-    setDraft(type === 'cli'
-      ? { type, creating: true, config: newCliSource() }
-      : { type, creating: true, config: newHttpSource() })
+    if (type === 'cli') setDraft({ type, creating: true, config: newCliSource() })
+    else if (type === 'http') setDraft({ type, creating: true, config: newHttpSource() })
+    else setDraft({ type, creating: true, config: newBalanceSource() })
+  }
+
+  const beginCodexCreate = () => {
+    setCreateDialogOpen(false)
+    setDraft(null)
+    setPreview(null)
+    setOauthFlow(null)
+    setCallbackUrl('')
+    setCodexDraft({
+      id: '',
+      enabled: true,
+      title: 'Codex 账号',
+      interval_sec: 60,
+      authenticated: false,
+    })
   }
 
   const beginEdit = (source: SourceStatus) => {
     setPreview(null)
+    setCodexDraft(null)
     if (source.type_id === CLI_TYPE) {
       const config = cliConfigs.find((item) => item.id === source.id)
       if (config) setDraft({ type: 'cli', creating: false, config: structuredClone(config) })
@@ -165,6 +215,70 @@ export const DataSourceManager = ({ sourceTypes, sources }: {
     if (source.type_id === HTTP_TYPE) {
       const config = httpConfigs.find((item) => item.id === source.id)
       if (config) setDraft({ type: 'http', creating: false, config: structuredClone(config) })
+      return
+    }
+    if (source.type_id === BALANCE_TYPE) {
+      const config = balanceConfigs.find((item) => item.id === source.id)
+      if (config) setDraft({ type: 'balance', creating: false, config: structuredClone(config) })
+      return
+    }
+    if (source.type_id === CODEX_OAUTH_TYPE) {
+      const config = codexConfigs.find((item) => item.id === source.id)
+      if (config) {
+        setDraft(null)
+        setOauthFlow(null)
+        setCallbackUrl('')
+        setCodexDraft(structuredClone(config))
+      }
+    }
+  }
+
+  const startCodexOAuth = async () => {
+    if (!codexDraft || busy) return
+    setBusy('oauth-start')
+    try {
+      const { result } = await agentApi.startCodexOAuth(codexDraft)
+      setOauthFlow(result)
+      setCallbackUrl('')
+      window.open(result.auth_url, '_blank', 'noopener,noreferrer')
+    } catch (error) {
+      toast.error(errorText(error))
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const completeCodexOAuth = async () => {
+    if (!codexDraft || !oauthFlow || !callbackUrl.trim() || busy) return
+    setBusy('oauth-complete')
+    try {
+      const { source } = await agentApi.completeCodexOAuth(oauthFlow.session_id, callbackUrl)
+      setCodexConfigs((current) => current.some((item) => item.id === source.id)
+        ? current.map((item) => item.id === source.id ? source : item)
+        : [...current, source])
+      setCodexDraft(source)
+      setOauthFlow(null)
+      setCallbackUrl('')
+      toast.success('Codex 账号已登录')
+    } catch (error) {
+      toast.error(errorText(error))
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const saveCodexSource = async () => {
+    if (!codexDraft || busy) return
+    setBusy('codex-save')
+    try {
+      const { source } = await agentApi.updateCodexOAuthSource(codexDraft)
+      setCodexConfigs((current) => current.map((item) => item.id === source.id ? source : item))
+      setCodexDraft(source)
+      toast.success('已保存')
+    } catch (error) {
+      toast.error(errorText(error))
+    } finally {
+      setBusy(null)
     }
   }
 
@@ -174,7 +288,9 @@ export const DataSourceManager = ({ sourceTypes, sources }: {
     try {
       const result = draft.type === 'cli'
         ? await agentApi.testCliMetricConfig(draft.config)
-        : await agentApi.testHttpMetricConfig(draft.config)
+        : draft.type === 'http'
+          ? await agentApi.testHttpMetricConfig(draft.config)
+          : await agentApi.testBalanceConfig(draft.config)
       setPreview(result.preview)
       toast.success('测试成功')
     } catch (error) {
@@ -196,7 +312,7 @@ export const DataSourceManager = ({ sourceTypes, sources }: {
           ? [...current, result.source]
           : current.map((source) => source.id === result.source.id ? result.source : source))
         setDraft({ type: 'cli', creating: false, config: result.source })
-      } else {
+      } else if (draft.type === 'http') {
         const result = draft.creating
           ? await agentApi.createHttpMetricSource(draft.config)
           : await agentApi.updateHttpMetricSource(draft.config)
@@ -204,6 +320,14 @@ export const DataSourceManager = ({ sourceTypes, sources }: {
           ? [...current, result.source]
           : current.map((source) => source.id === result.source.id ? result.source : source))
         setDraft({ type: 'http', creating: false, config: result.source })
+      } else {
+        const result = draft.creating
+          ? await agentApi.createBalanceSource(draft.config)
+          : await agentApi.updateBalanceSource(draft.config)
+        setBalanceConfigs((current) => draft.creating
+          ? [...current, result.source]
+          : current.map((source) => source.id === result.source.id ? result.source : source))
+        setDraft({ type: 'balance', creating: false, config: result.source })
       }
       toast.success('已保存')
     } catch (error) {
@@ -233,11 +357,18 @@ export const DataSourceManager = ({ sourceTypes, sources }: {
       if (source.type_id === CLI_TYPE) {
         await agentApi.deleteCliMetricSource(source.id)
         setCliConfigs((current) => current.filter((item) => item.id !== source.id))
-      } else {
+      } else if (source.type_id === HTTP_TYPE) {
         await agentApi.deleteHttpMetricSource(source.id)
         setHttpConfigs((current) => current.filter((item) => item.id !== source.id))
+      } else if (source.type_id === BALANCE_TYPE) {
+        await agentApi.deleteBalanceSource(source.id)
+        setBalanceConfigs((current) => current.filter((item) => item.id !== source.id))
+      } else if (source.type_id === CODEX_OAUTH_TYPE) {
+        await agentApi.deleteCodexOAuthSource(source.id)
+        setCodexConfigs((current) => current.filter((item) => item.id !== source.id))
       }
       if (draft?.config.id === source.id) setDraft(null)
+      if (codexDraft?.id === source.id) setCodexDraft(null)
       toast.success('已删除')
     } catch (error) {
       toast.error(errorText(error))
@@ -246,7 +377,7 @@ export const DataSourceManager = ({ sourceTypes, sources }: {
     }
   }
 
-  const editable = (source: SourceStatus) => source.type_id === CLI_TYPE || source.type_id === HTTP_TYPE
+  const editable = (source: SourceStatus) => source.type_id === CLI_TYPE || source.type_id === HTTP_TYPE || source.type_id === BALANCE_TYPE || source.type_id === CODEX_OAUTH_TYPE
   const typeTitle = (id: string) => sourceTypes.find((type) => type.id === id)?.title ?? id
 
   return (
@@ -254,7 +385,7 @@ export const DataSourceManager = ({ sourceTypes, sources }: {
       <Card>
         <CardHeader>
           <CardTitle>数据源</CardTitle>
-          <CardDescription>CLI、HTTP 与内置本地指标源</CardDescription>
+          <CardDescription>Codex、CLI、HTTP、平台余额与内置本地指标源</CardDescription>
           <CardAction className="flex flex-wrap justify-end gap-2">
             <input
               ref={importInput}
@@ -275,13 +406,9 @@ export const DataSourceManager = ({ sourceTypes, sources }: {
               <Download data-icon="inline-start" />
               导出
             </Button>
-            <Button variant="outline" size="sm" disabled={!!busy} onClick={() => beginCreate('cli')}>
-              <Terminal data-icon="inline-start" />
-              CLI
-            </Button>
-            <Button size="sm" disabled={!!busy} onClick={() => beginCreate('http')}>
-              <Globe2 data-icon="inline-start" />
-              HTTP
+            <Button size="sm" disabled={!!busy} onClick={() => setCreateDialogOpen(true)}>
+              <Plus data-icon="inline-start" />
+              新增
             </Button>
           </CardAction>
         </CardHeader>
@@ -314,11 +441,95 @@ export const DataSourceManager = ({ sourceTypes, sources }: {
         </CardContent>
       </Card>
 
+      <Dialog open={createDialogOpen} onOpenChange={setCreateDialogOpen}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>选择数据源类型</DialogTitle>
+            <DialogDescription>选择后进入对应配置。</DialogDescription>
+          </DialogHeader>
+          <div className="grid gap-2">
+            <Button variant="outline" className="h-auto justify-start gap-3 px-3 py-3 text-left" onClick={beginCodexCreate}>
+              <span className="flex size-9 shrink-0 items-center justify-center rounded-md bg-muted"><KeyRound /></span>
+              <span className="min-w-0"><span className="block font-medium">Codex OAuth</span><span className="block text-xs font-normal text-muted-foreground">独立登录并自动维护账号令牌</span></span>
+            </Button>
+            <Button variant="outline" className="h-auto justify-start gap-3 px-3 py-3 text-left" onClick={() => beginCreate('cli')}>
+              <span className="flex size-9 shrink-0 items-center justify-center rounded-md bg-muted"><Terminal /></span>
+              <span className="min-w-0"><span className="block font-medium">CLI</span><span className="block text-xs font-normal text-muted-foreground">执行本机命令并投影 JSON 输出</span></span>
+            </Button>
+            <Button variant="outline" className="h-auto justify-start gap-3 px-3 py-3 text-left" onClick={() => beginCreate('http')}>
+              <span className="flex size-9 shrink-0 items-center justify-center rounded-md bg-muted"><Globe2 /></span>
+              <span className="min-w-0"><span className="block font-medium">HTTP</span><span className="block text-xs font-normal text-muted-foreground">请求自定义 JSON 接口并投影指标</span></span>
+            </Button>
+            <Button variant="outline" className="h-auto justify-start gap-3 px-3 py-3 text-left" onClick={() => beginCreate('balance')}>
+              <span className="flex size-9 shrink-0 items-center justify-center rounded-md bg-muted"><CircleDollarSign /></span>
+              <span className="min-w-0"><span className="block font-medium">平台余额</span><span className="block text-xs font-normal text-muted-foreground">DeepSeek、Moonshot 等平台账户余额</span></span>
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {codexDraft ? (
+        <Card>
+          <CardHeader>
+            <CardTitle>{codexDraft.authenticated ? codexDraft.title : '添加 Codex OAuth 账号'}</CardTitle>
+            <CardDescription>{codexDraft.email || 'OpenAI Codex OAuth'}</CardDescription>
+            <CardAction className="flex gap-1">
+              <Button variant="ghost" size="icon-sm" disabled={!!busy} title="取消" onClick={() => setCodexDraft(null)}><X /><span className="sr-only">取消</span></Button>
+              {codexConfigs.some((item) => item.id === codexDraft.id) ? (
+                <Button variant="outline" size="icon-sm" disabled={!!busy || !codexDraft.id} title="保存" onClick={() => void saveCodexSource()}>
+                  {busy === 'codex-save' ? <LoaderCircle className="animate-spin" /> : <Save />}
+                  <span className="sr-only">保存</span>
+                </Button>
+              ) : null}
+            </CardAction>
+          </CardHeader>
+          <CardContent className="flex min-w-0 flex-col gap-5">
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div className="grid gap-2">
+                <Label htmlFor="codex-id">数据源 ID</Label>
+                <Input id="codex-id" value={codexDraft.id} disabled={codexDraft.authenticated} placeholder="codex-work" onChange={(event) => setCodexDraft({ ...codexDraft, id: event.target.value })} />
+              </div>
+              <div className="grid gap-2">
+                <Label htmlFor="codex-title">名称</Label>
+                <Input id="codex-title" value={codexDraft.title} onChange={(event) => setCodexDraft({ ...codexDraft, title: event.target.value })} />
+              </div>
+              <div className="grid gap-2">
+                <Label htmlFor="codex-interval">同步间隔（秒）</Label>
+                <Input id="codex-interval" type="number" min={60} max={3600} value={codexDraft.interval_sec} onChange={(event) => setCodexDraft({ ...codexDraft, interval_sec: Number(event.target.value) })} />
+              </div>
+              <div className="flex items-end justify-between gap-3 rounded-lg border px-3 py-2">
+                <div><div className="text-sm font-medium">启用</div><div className="text-xs text-muted-foreground">{codexDraft.plan_type || 'Codex'}</div></div>
+                <Switch checked={codexDraft.enabled} onCheckedChange={(enabled) => setCodexDraft({ ...codexDraft, enabled })} />
+              </div>
+            </div>
+            {oauthFlow ? (
+              <div className="flex flex-col gap-3 border-t pt-4">
+                <div className="flex gap-2">
+                  <Input value={callbackUrl} placeholder="http://localhost:1455/auth/callback?code=...&state=..." onChange={(event) => setCallbackUrl(event.target.value)} />
+                  <Button disabled={!!busy || !callbackUrl.trim()} onClick={() => void completeCodexOAuth()}>
+                    {busy === 'oauth-complete' ? <LoaderCircle className="animate-spin" data-icon="inline-start" /> : <KeyRound data-icon="inline-start" />}
+                    完成登录
+                  </Button>
+                </div>
+                <Button variant="outline" className="self-start" onClick={() => window.open(oauthFlow.auth_url, '_blank', 'noopener,noreferrer')}>
+                  <ExternalLink data-icon="inline-start" />重新打开授权页
+                </Button>
+              </div>
+            ) : (
+              <Button className="self-start" disabled={!!busy || !codexDraft.id || !codexDraft.title} onClick={() => void startCodexOAuth()}>
+                {busy === 'oauth-start' ? <LoaderCircle className="animate-spin" data-icon="inline-start" /> : <ExternalLink data-icon="inline-start" />}
+                {codexDraft.authenticated ? '重新登录' : '登录 OpenAI'}
+              </Button>
+            )}
+          </CardContent>
+        </Card>
+      ) : null}
+
       {draft ? (
         <Card>
           <CardHeader>
-            <CardTitle>{draft.creating ? `添加 ${draft.type === 'cli' ? 'CLI' : 'HTTP'} 数据源` : draft.config.title}</CardTitle>
-            <CardDescription>{draft.type === 'cli' ? '执行本机命令并投影 JSON 输出' : '请求 JSON 接口并投影指标'}</CardDescription>
+            <CardTitle>{draft.creating ? (draft.type === 'balance' ? '添加平台余额数据源' : `添加 ${draft.type === 'cli' ? 'CLI' : 'HTTP'} 数据源`) : draft.config.title}</CardTitle>
+            <CardDescription>{draft.type === 'cli' ? '执行本机命令并投影 JSON 输出' : draft.type === 'http' ? '请求 JSON 接口并投影指标' : '查询 AI 平台账户余额'}</CardDescription>
             <CardAction className="flex gap-1">
               <Button variant="ghost" size="icon-sm" disabled={!!busy} title="取消" onClick={() => setDraft(null)}><X /><span className="sr-only">取消</span></Button>
               <Button variant="outline" size="icon-sm" disabled={!!busy || !draft.config.id} title="测试" onClick={() => void testDraft()}>
@@ -334,7 +545,9 @@ export const DataSourceManager = ({ sourceTypes, sources }: {
           <CardContent className="flex min-w-0 flex-col gap-6">
             {draft.type === 'cli'
               ? <CliSourceEditor value={draft.config} creating={draft.creating} onChange={(config) => setDraft({ ...draft, config })} />
-              : <HttpSourceEditor value={draft.config} creating={draft.creating} onChange={(config) => setDraft({ ...draft, config })} />}
+              : draft.type === 'http'
+                ? <HttpSourceEditor value={draft.config} creating={draft.creating} onChange={(config) => setDraft({ ...draft, config })} />
+                : <BalanceSourceEditor value={draft.config} creating={draft.creating} onChange={(config) => setDraft({ ...draft, config })} />}
             {preview ? <Preview preview={preview} /> : null}
           </CardContent>
         </Card>

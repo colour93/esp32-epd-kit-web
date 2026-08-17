@@ -1,9 +1,11 @@
 use std::{
+    env,
+    ffi::OsString,
     fs::OpenOptions,
     io::Write,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -27,6 +29,8 @@ const RESOURCE_TTL_SEC: u64 = 900;
 const COMMAND_TIMEOUT_SEC: u64 = 30;
 const MAX_COMMAND_BYTES: usize = 8192;
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
+
+static COMMAND_PATH: OnceLock<OsString> = OnceLock::new();
 
 pub use crate::metrics::{
     MetricItemConfig as CliMetricItemConfig, MetricPreview as CliMetricPreview,
@@ -110,6 +114,7 @@ pub struct CliMetricControl {
 
 impl CliMetricControl {
     pub fn spawn(context: ProducerContext) -> Result<Self> {
+        let _ = command_path();
         let config_path = config_path()?;
         let sources = Arc::new(RwLock::new(load_sources(&config_path)?));
         let publisher = context.publisher.clone();
@@ -510,6 +515,7 @@ async fn run_command(spec: &CommandSpec) -> Result<String> {
     let mut command = Command::new(&spec.executable);
     command
         .args(&spec.args)
+        .env("PATH", command_path())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -533,6 +539,64 @@ async fn run_command(spec: &CommandSpec) -> Result<String> {
         bail!("CLI 命令失败 ({}): {}", output.status, message);
     }
     String::from_utf8(output.stdout).context("CLI stdout 不是 UTF-8")
+}
+
+fn command_path() -> &'static OsString {
+    COMMAND_PATH.get_or_init(resolve_command_path)
+}
+
+fn resolve_command_path() -> OsString {
+    let inherited = env::var_os("PATH").unwrap_or_default();
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut paths = Vec::new();
+        if let Some(shell_path) = macos_shell_path() {
+            paths.extend(env::split_paths(&shell_path));
+        }
+        paths.extend(env::split_paths(&inherited));
+        paths.extend(
+            [
+                "/opt/homebrew/bin",
+                "/opt/homebrew/sbin",
+                "/usr/local/bin",
+                "/usr/local/sbin",
+                "/usr/bin",
+                "/bin",
+                "/usr/sbin",
+                "/sbin",
+            ]
+            .into_iter()
+            .map(PathBuf::from),
+        );
+        paths.dedup();
+        return env::join_paths(paths).unwrap_or(inherited);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    inherited
+}
+
+#[cfg(target_os = "macos")]
+fn macos_shell_path() -> Option<OsString> {
+    const BEGIN: &str = "__EPD_PATH_BEGIN__";
+    const END: &str = "__EPD_PATH_END__";
+    let output = std::process::Command::new("/bin/zsh")
+        .args([
+            "-ilc",
+            "printf '__EPD_PATH_BEGIN__%s__EPD_PATH_END__' \"$PATH\"",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let start = stdout.rfind(BEGIN)? + BEGIN.len();
+    let end = stdout[start..].find(END)? + start;
+    let path = &stdout[start..end];
+    (!path.is_empty()).then(|| OsString::from(path))
 }
 
 fn config_path() -> Result<PathBuf> {

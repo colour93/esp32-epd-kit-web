@@ -21,9 +21,7 @@ use serde_json::{Value, json};
 use tokio::sync::{RwLock, mpsc};
 
 use crate::{
-    metrics::{
-        MetricFormat, MetricItemConfig, MetricPreview, project_metrics, validate_metric_config,
-    },
+    metrics::{MetricItemConfig, MetricPreview, project_metrics, validate_metric_config},
     producer::{ProducerContext, ProducerControl, ProducerManifest, ProducerTrigger},
     publisher::{ResourcePublisher, SemanticResource},
     state::{SharedState, SourceStatus, unix_now},
@@ -55,15 +53,6 @@ pub static MANIFEST: ProducerManifest = ProducerManifest {
     auto_sync: true,
     built_in_source: None,
 };
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HttpPreset {
-    #[default]
-    Custom,
-    DeepseekBalance,
-    MoonshotBalance,
-}
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub enum HttpMethod {
@@ -146,8 +135,6 @@ pub struct HttpMetricInput {
     pub id: String,
     pub enabled: bool,
     pub title: String,
-    #[serde(default)]
-    pub preset: HttpPreset,
     pub interval_sec: u64,
     pub timeout_ms: u64,
     #[serde(default)]
@@ -170,8 +157,6 @@ struct HttpMetricConfig {
     id: String,
     enabled: bool,
     title: String,
-    #[serde(default)]
-    preset: HttpPreset,
     interval_sec: u64,
     timeout_ms: u64,
     #[serde(default)]
@@ -194,7 +179,6 @@ pub struct HttpMetricView {
     pub id: String,
     pub enabled: bool,
     pub title: String,
-    pub preset: HttpPreset,
     pub interval_sec: u64,
     pub timeout_ms: u64,
     pub method: HttpMethod,
@@ -223,11 +207,10 @@ impl HttpMetricConfig {
         } else {
             SecretUpdate::Keep
         };
-        let mut config = Self {
+        let config = Self {
             id: input.id,
             enabled: input.enabled,
             title: input.title,
-            preset: input.preset,
             interval_sec: input.interval_sec,
             timeout_ms: input.timeout_ms,
             method: input.method,
@@ -241,58 +224,7 @@ impl HttpMetricConfig {
             },
             items: input.items,
         };
-        config.apply_preset();
         Ok((config, secret_update))
-    }
-
-    fn apply_preset(&mut self) {
-        match self.preset {
-            HttpPreset::Custom => {}
-            HttpPreset::DeepseekBalance => {
-                self.method = HttpMethod::Get;
-                self.url = "https://api.deepseek.com/user/balance".into();
-                self.network_access = NetworkAccess::Public;
-                self.headers.clear();
-                self.body.clear();
-                self.auth = HttpAuthConfig {
-                    kind: HttpAuthType::Bearer,
-                    header_name: String::new(),
-                };
-                self.items = vec![
-                    preset_item(
-                        "总余额",
-                        "balance_infos[0].total_balance",
-                        "balance_infos[0].currency",
-                    ),
-                    preset_item(
-                        "充值",
-                        "balance_infos[0].topped_up_balance",
-                        "balance_infos[0].currency",
-                    ),
-                    preset_item(
-                        "赠送",
-                        "balance_infos[0].granted_balance",
-                        "balance_infos[0].currency",
-                    ),
-                ];
-            }
-            HttpPreset::MoonshotBalance => {
-                self.method = HttpMethod::Get;
-                self.url = "https://api.moonshot.cn/v1/users/me/balance".into();
-                self.network_access = NetworkAccess::Public;
-                self.headers.clear();
-                self.body.clear();
-                self.auth = HttpAuthConfig {
-                    kind: HttpAuthType::Bearer,
-                    header_name: String::new(),
-                };
-                self.items = vec![
-                    preset_item("可用", "data.available_balance", ""),
-                    preset_item("现金", "data.cash_balance", ""),
-                    preset_item("赠送", "data.voucher_balance", ""),
-                ];
-            }
-        }
     }
 
     fn resource_key(&self) -> String {
@@ -348,20 +280,6 @@ impl HttpMetricConfig {
 
     fn ttl_sec(&self) -> u64 {
         self.interval_sec.saturating_mul(3).clamp(300, 604_800)
-    }
-}
-
-fn preset_item(
-    label: &str,
-    data_expression: &str,
-    description_expression: &str,
-) -> MetricItemConfig {
-    MetricItemConfig {
-        label: label.into(),
-        data_expression: data_expression.into(),
-        description_expression: description_expression.into(),
-        progress_expression: String::new(),
-        format: MetricFormat::Text,
     }
 }
 
@@ -737,7 +655,6 @@ fn source_view(config: HttpMetricConfig, secret_configured: bool) -> HttpMetricV
         id: config.id,
         enabled: config.enabled,
         title: config.title,
-        preset: config.preset,
         interval_sec: config.interval_sec,
         timeout_ms: config.timeout_ms,
         method: config.method,
@@ -1032,7 +949,6 @@ fn source_status(config: &HttpMetricConfig, secret_configured: bool) -> SourceSt
         details: json!({
             "item_count": config.items.len(),
             "interval_sec": config.interval_sec,
-            "preset": config.preset,
         }),
         ..Default::default()
     }
@@ -1071,7 +987,7 @@ async fn execute_and_project_inner(
         .timeout(Duration::from_millis(config.timeout_ms))
         .connect_timeout(Duration::from_millis(config.timeout_ms))
         .resolve(host, pinned)
-        .user_agent(concat!("epd-agent/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("epd-agent/", env!("EPD_AGENT_VERSION")))
         .build()
         .map_err(|_| anyhow!("HTTP 客户端初始化失败"))?;
     let mut request = client
@@ -1435,16 +1351,13 @@ fn load_sources(path: &Path) -> Result<Vec<HttpMetricConfig>> {
         return Ok(Vec::new());
     }
     let contents = std::fs::read(path).context("读取 HTTP 数据源实例失败")?;
-    let mut file: HttpMetricSourcesFile =
+    let file: HttpMetricSourcesFile =
         serde_json::from_slice(&contents).context("HTTP 数据源配置 JSON 无效")?;
     if file.version != CONFIG_VERSION {
         bail!("不支持的 HTTP 数据源配置版本：{}", file.version);
     }
     if file.sources.len() > MAX_SOURCES {
         bail!("HTTP 数据源数量超过上限 {MAX_SOURCES}");
-    }
-    for source in &mut file.sources {
-        source.apply_preset();
     }
     for (index, source) in file.sources.iter().enumerate() {
         source
@@ -1557,11 +1470,13 @@ mod tests {
         net::TcpListener,
     };
 
+    use crate::metrics::{MetricFormat, MetricItemConfig};
+
     use super::{
         HttpAuthConfig, HttpAuthInput, HttpAuthType, HttpHeaderConfig, HttpMethod,
-        HttpMetricConfig, HttpMetricInput, HttpPreset, MAX_RESPONSE_BYTES, NetworkAccess,
-        SecretUpdate, credential_scope_changed, execute_and_project, is_sensitive_name,
-        load_sources, network_access_allows, preset_item, save_sources, source_view,
+        HttpMetricConfig, HttpMetricInput, MAX_RESPONSE_BYTES, NetworkAccess, SecretUpdate,
+        credential_scope_changed, execute_and_project, is_sensitive_name, load_sources,
+        network_access_allows, save_sources, source_view,
     };
 
     struct ConfigDirectory {
@@ -1588,7 +1503,6 @@ mod tests {
             id: "test-http".into(),
             enabled: true,
             title: "HTTP".into(),
-            preset: HttpPreset::Custom,
             interval_sec: 300,
             timeout_ms: 5_000,
             method: HttpMethod::Get,
@@ -1603,7 +1517,13 @@ mod tests {
                 kind: HttpAuthType::Bearer,
                 header_name: String::new(),
             },
-            items: vec![preset_item("余额", "data.balance", "data.currency")],
+            items: vec![MetricItemConfig {
+                label: "余额".into(),
+                data_expression: "data.balance".into(),
+                description_expression: "data.currency".into(),
+                progress_expression: String::new(),
+                format: MetricFormat::Text,
+            }],
         }
     }
 
@@ -1621,43 +1541,11 @@ mod tests {
     }
 
     #[test]
-    fn presets_override_endpoint_method_and_items() {
-        let mut config = custom_config("http://127.0.0.1/ignored".into());
-        config.preset = HttpPreset::DeepseekBalance;
-        config.method = HttpMethod::Post;
-        config.network_access = NetworkAccess::Localhost;
-        config.headers.push(HttpHeaderConfig {
-            name: "X-Untrusted".into(),
-            value: "value".into(),
-        });
-        config.body = "{}".into();
-        config.auth = HttpAuthConfig {
-            kind: HttpAuthType::Header,
-            header_name: "X-Secret".into(),
-        };
-        config.items.clear();
-        config.apply_preset();
-        assert_eq!(config.method, HttpMethod::Get);
-        assert_eq!(config.url, "https://api.deepseek.com/user/balance");
-        assert_eq!(config.network_access, NetworkAccess::Public);
-        assert!(config.headers.is_empty());
-        assert!(config.body.is_empty());
-        assert_eq!(config.auth.kind, HttpAuthType::Bearer);
-        assert!(config.auth.header_name.is_empty());
-        assert_eq!(config.items.len(), 3);
-        assert_eq!(
-            config.items[0].data_expression,
-            "balance_infos[0].total_balance"
-        );
-    }
-
-    #[test]
     fn omitted_secret_is_kept_for_updates_and_never_serialized() {
         let input = HttpMetricInput {
-            id: "deepseek-main".into(),
+            id: "secret-main".into(),
             enabled: true,
-            title: "DeepSeek".into(),
-            preset: HttpPreset::DeepseekBalance,
+            title: "Secret HTTP".into(),
             interval_sec: 300,
             timeout_ms: 10_000,
             method: HttpMethod::Post,
@@ -1728,12 +1616,12 @@ mod tests {
 
     #[test]
     fn changing_credential_host_requires_a_new_secret() {
-        let previous = custom_config("https://api.deepseek.com/user/balance".into());
+        let previous = custom_config("https://api.example.com/metrics".into());
         let mut next = previous.clone();
-        next.url = "https://api.moonshot.cn/v1/users/me/balance".into();
+        next.url = "https://metrics.example.net/usage".into();
         assert!(credential_scope_changed(&previous, &next).unwrap());
 
-        next.url = "https://api.deepseek.com/v1/other".into();
+        next.url = "https://api.example.com/v1/other".into();
         assert!(!credential_scope_changed(&previous, &next).unwrap());
     }
 

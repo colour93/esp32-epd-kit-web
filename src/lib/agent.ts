@@ -159,7 +159,6 @@ export interface CliMetricConfig {
   items: CliMetricItemConfig[]
 }
 
-export type HttpMetricPreset = 'custom' | 'deepseek_balance' | 'moonshot_balance'
 export type HttpMetricMethod = 'GET' | 'POST'
 export type HttpMetricNetworkAccess = 'public' | 'private' | 'localhost'
 export type HttpMetricAuthType = 'none' | 'bearer' | 'header'
@@ -181,7 +180,6 @@ export interface HttpMetricConfig {
   id: string
   enabled: boolean
   title: string
-  preset: HttpMetricPreset
   interval_sec: number
   timeout_ms: number
   method: HttpMetricMethod
@@ -210,6 +208,36 @@ export interface CliMetricPreview {
 }
 
 export type HttpMetricPreview = CliMetricPreview
+
+export type BalancePlatform = 'deepseek' | 'moonshot'
+
+export interface BalanceConfig {
+  id: string
+  enabled: boolean
+  title: string
+  platform: BalancePlatform
+  interval_sec: number
+  timeout_ms: number
+  api_key?: string
+  secret_configured?: boolean
+  clear_secret?: boolean
+}
+
+export interface CodexOAuthConfig {
+  id: string
+  enabled: boolean
+  title: string
+  interval_sec: number
+  authenticated: boolean
+  email?: string
+  plan_type?: string
+  expires_at?: number
+}
+
+export interface CodexOAuthStartResult {
+  session_id: string
+  auth_url: string
+}
 
 export interface LogEntry {
   at: number
@@ -286,6 +314,25 @@ export const agentApi = {
   refreshSource: (id: string) => request(`/api/v1/sources/${encodeURIComponent(id)}/refresh`, {
     method: 'POST', body: '{}',
   }),
+  getCodexOAuthSources: () => request<{ sources: CodexOAuthConfig[] }>(
+    '/api/v1/source-types/codex.oauth/sources',
+  ),
+  startCodexOAuth: (source: Pick<CodexOAuthConfig, 'id' | 'enabled' | 'title' | 'interval_sec'>) => request<{ result: CodexOAuthStartResult }>(
+    '/api/v1/source-types/codex.oauth/oauth/start',
+    { method: 'POST', body: JSON.stringify(source) },
+  ),
+  completeCodexOAuth: (sessionId: string, callbackUrl: string) => request<{ source: CodexOAuthConfig }>(
+    '/api/v1/source-types/codex.oauth/oauth/complete',
+    { method: 'POST', body: JSON.stringify({ session_id: sessionId, callback_url: callbackUrl }) },
+  ),
+  updateCodexOAuthSource: (source: Pick<CodexOAuthConfig, 'id' | 'enabled' | 'title' | 'interval_sec'>) => request<{ source: CodexOAuthConfig }>(
+    `/api/v1/source-types/codex.oauth/sources/${encodeURIComponent(source.id)}`,
+    { method: 'PUT', body: JSON.stringify(source) },
+  ),
+  deleteCodexOAuthSource: (id: string) => request(
+    `/api/v1/source-types/codex.oauth/sources/${encodeURIComponent(id)}`,
+    { method: 'DELETE' },
+  ),
   getCliMetricSources: () => request<{ sources: CliMetricConfig[] }>(
     '/api/v1/source-types/cli.jmespath/sources',
   ),
@@ -322,6 +369,25 @@ export const agentApi = {
   ),
   testHttpMetricConfig: (config: HttpMetricConfig) => request<{ preview: HttpMetricPreview }>(
     '/api/v1/source-types/http.jmespath/test',
+    { method: 'POST', body: JSON.stringify(config) },
+  ),
+  getBalanceSources: () => request<{ sources: BalanceConfig[] }>(
+    '/api/v1/source-types/platform.balance/sources',
+  ),
+  createBalanceSource: (source: BalanceConfig) => request<{ source: BalanceConfig }>(
+    '/api/v1/source-types/platform.balance/sources',
+    { method: 'POST', body: JSON.stringify(source) },
+  ),
+  updateBalanceSource: (source: BalanceConfig) => request<{ source: BalanceConfig }>(
+    `/api/v1/source-types/platform.balance/sources/${encodeURIComponent(source.id)}`,
+    { method: 'PUT', body: JSON.stringify(source) },
+  ),
+  deleteBalanceSource: (id: string) => request(
+    `/api/v1/source-types/platform.balance/sources/${encodeURIComponent(id)}`,
+    { method: 'DELETE' },
+  ),
+  testBalanceConfig: (config: BalanceConfig) => request<{ preview: HttpMetricPreview }>(
+    '/api/v1/source-types/platform.balance/test',
     { method: 'POST', body: JSON.stringify(config) },
   ),
   setPaused: (enabled: boolean) => request('/api/v1/agent/pause', {

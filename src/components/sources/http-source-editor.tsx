@@ -1,9 +1,7 @@
-import { Globe2, Plus, ShieldAlert, Trash2, Undo2 } from 'lucide-react'
+import { Plus, ShieldAlert, Trash2, Undo2 } from 'lucide-react'
 import type {
-  CliMetricItemConfig,
   HttpMetricAuthConfig,
   HttpMetricConfig,
-  HttpMetricPreset,
 } from '@/lib/agent'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
@@ -14,77 +12,6 @@ import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
 import { MetricItemsEditor } from '@/components/sources/metric-items-editor'
-
-const DEEPSEEK_ITEMS: CliMetricItemConfig[] = [
-  { label: '总余额', data_expression: 'balance_infos[0].total_balance', description_expression: 'balance_infos[0].currency', progress_expression: '', format: 'text' },
-  { label: '充值余额', data_expression: 'balance_infos[0].topped_up_balance', description_expression: 'balance_infos[0].currency', progress_expression: '', format: 'text' },
-  { label: '赠送余额', data_expression: 'balance_infos[0].granted_balance', description_expression: 'balance_infos[0].currency', progress_expression: '', format: 'text' },
-]
-
-const MOONSHOT_ITEMS: CliMetricItemConfig[] = [
-  { label: '可用余额', data_expression: 'data.available_balance', description_expression: '', progress_expression: '', format: 'text' },
-  { label: '现金余额', data_expression: 'data.cash_balance', description_expression: '', progress_expression: '', format: 'text' },
-  { label: '赠送余额', data_expression: 'data.voucher_balance', description_expression: '', progress_expression: '', format: 'text' },
-]
-
-const PRESETS: Record<Exclude<HttpMetricPreset, 'custom'>, {
-  title: string
-  url: string
-  items: CliMetricItemConfig[]
-}> = {
-  deepseek_balance: {
-    title: 'DeepSeek 余额',
-    url: 'https://api.deepseek.com/user/balance',
-    items: DEEPSEEK_ITEMS,
-  },
-  moonshot_balance: {
-    title: 'Moonshot 余额',
-    url: 'https://api.moonshot.cn/v1/users/me/balance',
-    items: MOONSHOT_ITEMS,
-  },
-}
-
-const customItems = (): CliMetricItemConfig[] => [
-  { label: '数据', data_expression: '', description_expression: '', progress_expression: '', format: 'text' },
-]
-
-const presetConfig = (current: HttpMetricConfig, preset: Exclude<HttpMetricPreset, 'custom'>): HttpMetricConfig => ({
-  ...current,
-  title: PRESETS[preset].title,
-  preset,
-  method: 'GET',
-  url: PRESETS[preset].url,
-  network_access: 'public',
-  headers: [],
-  body: '',
-  auth: {
-    type: 'bearer',
-    secret: current.preset === preset ? current.auth.secret : undefined,
-    secret_configured: current.auth.secret_configured,
-    clear_secret: current.preset !== preset && Boolean(current.auth.secret_configured),
-  },
-  items: structuredClone(PRESETS[preset].items),
-})
-
-const choosePreset = (current: HttpMetricConfig, preset: HttpMetricPreset): HttpMetricConfig => {
-  if (preset !== 'custom') return presetConfig(current, preset)
-  return {
-    ...current,
-    title: 'HTTP 数据',
-    preset: 'custom',
-    method: 'GET',
-    url: '',
-    network_access: 'public',
-    headers: [],
-    body: '',
-    auth: {
-      type: 'none',
-      secret_configured: current.auth.secret_configured,
-      clear_secret: Boolean(current.auth.secret_configured),
-    },
-    items: customItems(),
-  }
-}
 
 const updateAuthType = (current: HttpMetricAuthConfig, type: HttpMetricAuthConfig['type']): HttpMetricAuthConfig => ({
   type,
@@ -141,18 +68,8 @@ export const HttpSourceEditor = ({
   creating: boolean
   onChange: (value: HttpMetricConfig) => void
 }) => {
-  const preset = value.preset === 'custom' ? null : PRESETS[value.preset]
   return (
     <FieldGroup className="gap-6">
-      <Field>
-        <FieldLabel>来源类型</FieldLabel>
-        <ToggleGroup className="grid w-full grid-cols-1 sm:grid-cols-3" value={[value.preset]} onValueChange={(selected) => selected[0] && onChange(choosePreset(value, selected[0] as HttpMetricPreset))} variant="outline" spacing={0}>
-          <ToggleGroupItem value="custom">自定义 HTTP</ToggleGroupItem>
-          <ToggleGroupItem value="deepseek_balance">DeepSeek 余额</ToggleGroupItem>
-          <ToggleGroupItem value="moonshot_balance">Moonshot 余额</ToggleGroupItem>
-        </ToggleGroup>
-      </Field>
-
       <Field orientation="horizontal">
         <FieldTitle>启用</FieldTitle>
         <Switch checked={value.enabled} onCheckedChange={(enabled) => onChange({ ...value, enabled })} />
@@ -189,21 +106,7 @@ export const HttpSourceEditor = ({
         </Field>
       </FieldGroup>
 
-      {preset ? (
-        <>
-          <Alert>
-            <Globe2 />
-            <AlertTitle>{preset.title}</AlertTitle>
-            <AlertDescription>
-              <div className="break-all font-mono text-xs">{preset.url}</div>
-              <div className="mt-2">{preset.items.map((item) => item.label).join(' / ')}</div>
-            </AlertDescription>
-          </Alert>
-          <SecretField auth={value.auth} label="API Key" onChange={(auth) => onChange({ ...value, auth })} />
-        </>
-      ) : (
-        <>
-          <FieldGroup className="grid gap-4 lg:grid-cols-2">
+      <FieldGroup className="grid gap-4 lg:grid-cols-2">
             <Field>
               <FieldLabel>请求方法</FieldLabel>
               <ToggleGroup className="w-full" value={[value.method]} onValueChange={(selected) => selected[0] && onChange({ ...value, method: selected[0] as HttpMetricConfig['method'], body: selected[0] === 'GET' ? '' : value.body })} variant="outline" spacing={0}>
@@ -223,17 +126,17 @@ export const HttpSourceEditor = ({
               <FieldLabel>URL</FieldLabel>
               <Input className="font-mono" type="url" placeholder="https://api.example.com/usage" value={value.url} onChange={(event) => onChange({ ...value, url: event.target.value })} />
             </Field>
-          </FieldGroup>
+      </FieldGroup>
 
-          {value.network_access === 'public' ? null : (
-            <Alert>
-              <ShieldAlert />
-              <AlertTitle>{value.network_access === 'localhost' ? '允许访问本机服务' : '允许访问内网服务'}</AlertTitle>
-              <AlertDescription>仅为可信目标启用此范围。</AlertDescription>
-            </Alert>
-          )}
+      {value.network_access === 'public' ? null : (
+        <Alert>
+          <ShieldAlert />
+          <AlertTitle>{value.network_access === 'localhost' ? '允许访问本机服务' : '允许访问内网服务'}</AlertTitle>
+          <AlertDescription>仅为可信目标启用此范围。</AlertDescription>
+        </Alert>
+      )}
 
-          <FieldGroup className="grid gap-4 lg:grid-cols-2">
+      <FieldGroup className="grid gap-4 lg:grid-cols-2">
             <Field>
               <FieldLabel>认证方式</FieldLabel>
               <ToggleGroup className="grid w-full grid-cols-3" value={[value.auth.type]} onValueChange={(selected) => selected[0] && onChange({ ...value, auth: updateAuthType(value.auth, selected[0] as HttpMetricAuthConfig['type']) })} variant="outline" spacing={0}>
@@ -249,9 +152,9 @@ export const HttpSourceEditor = ({
               </Field>
             ) : null}
             <SecretField auth={value.auth} onChange={(auth) => onChange({ ...value, auth })} />
-          </FieldGroup>
+      </FieldGroup>
 
-          <FieldGroup className="gap-3">
+      <FieldGroup className="gap-3">
             <FieldLabel>请求 Header</FieldLabel>
             {value.headers.map((header, index) => (
               <FieldGroup key={index} className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]">
@@ -264,18 +167,16 @@ export const HttpSourceEditor = ({
               <Plus data-icon="inline-start" />
               添加 Header
             </Button>
-          </FieldGroup>
+      </FieldGroup>
 
-          {value.method === 'POST' ? (
-            <Field>
-              <FieldLabel>JSON Body</FieldLabel>
-              <Textarea className="min-h-32 font-mono" spellCheck={false} value={value.body} onChange={(event) => onChange({ ...value, body: event.target.value })} />
-            </Field>
-          ) : null}
+      {value.method === 'POST' ? (
+        <Field>
+          <FieldLabel>JSON Body</FieldLabel>
+          <Textarea className="min-h-32 font-mono" spellCheck={false} value={value.body} onChange={(event) => onChange({ ...value, body: event.target.value })} />
+        </Field>
+      ) : null}
 
-          <MetricItemsEditor items={value.items} onChange={(items) => onChange({ ...value, items })} />
-        </>
-      )}
+      <MetricItemsEditor items={value.items} onChange={(items) => onChange({ ...value, items })} />
     </FieldGroup>
   )
 }

@@ -55,7 +55,7 @@ impl CodexControl {
     }
 }
 
-struct AppServer {
+pub(crate) struct AppServer {
     child: Child,
     stdin: ChildStdin,
     lines: Lines<BufReader<ChildStdout>>,
@@ -64,7 +64,11 @@ struct AppServer {
 }
 
 impl AppServer {
-    async fn start(path: &PathBuf, state: Arc<SharedState>) -> Result<Self> {
+    pub(crate) async fn start(
+        path: &PathBuf,
+        state: Arc<SharedState>,
+        scope: &'static str,
+    ) -> Result<Self> {
         let mut child = Command::new(path)
             .args(["app-server", "--listen", "stdio://"])
             .stdin(Stdio::piped())
@@ -89,7 +93,7 @@ impl AppServer {
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                stderr_state.log("warn", "codex.app-server", line).await;
+                stderr_state.log("warn", scope, line).await;
             }
         });
         let mut server = Self {
@@ -100,7 +104,7 @@ impl AppServer {
             notifications: VecDeque::new(),
         };
         state
-            .log("info", "codex", "initializing app-server stdio session")
+            .log("info", scope, "initializing app-server stdio session")
             .await;
         server.request("initialize", json!({
             "clientInfo": {
@@ -114,7 +118,7 @@ impl AppServer {
         })).await?;
         server.notify("initialized", json!({})).await?;
         state
-            .log("info", "codex", "app-server stdio session initialized")
+            .log("info", scope, "app-server stdio session initialized")
             .await;
         Ok(server)
     }
@@ -127,7 +131,7 @@ impl AppServer {
         Ok(())
     }
 
-    async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+    pub(crate) async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id;
         self.next_id += 1;
         let line = if params.is_null() {
@@ -217,7 +221,7 @@ async fn supervisor(
                 source.last_error = None;
             })
             .await;
-        match AppServer::start(&path, state.clone()).await {
+        match AppServer::start(&path, state.clone(), "codex").await {
             Ok(mut server) => {
                 restart_backoff = 1;
                 if let Err(error) =
@@ -268,7 +272,7 @@ async fn run_connected(
     let mut auth_status_logged = false;
     loop {
         state
-            .log("info", "codex.rpc", "request method=account/read")
+            .log("debug", "codex.rpc", "request method=account/read")
             .await;
         let started = Instant::now();
         let account = server
@@ -276,7 +280,7 @@ async fn run_connected(
             .await?;
         state
             .log(
-                "info",
+                "debug",
                 "codex.rpc",
                 format!(
                     "response method=account/read elapsed_ms={}",
@@ -368,7 +372,7 @@ async fn run_connected(
         }
         state
             .log(
-                "info",
+                "debug",
                 "codex",
                 format!("reading rate limits; reason={reason}"),
             )
@@ -404,7 +408,7 @@ async fn sync_once(
     let started = Instant::now();
     state
         .log(
-            "info",
+            "debug",
             "codex.rpc",
             "request method=account/rateLimits/read",
         )
@@ -415,7 +419,7 @@ async fn sync_once(
         .await?;
     state
         .log(
-            "info",
+            "debug",
             "codex.rpc",
             format!(
                 "response method=account/rateLimits/read elapsed_ms={}",
@@ -495,7 +499,7 @@ async fn sync_once(
         .await;
     state
         .log(
-            "info",
+            "debug",
             "codex",
             "rate-limit snapshot ready; next poll in 60s",
         )
@@ -596,7 +600,7 @@ async fn set_codex_error(state: &SharedState, phase: &str, error: String) {
         .await;
 }
 
-fn find_codex() -> Result<PathBuf> {
+pub(crate) fn find_codex() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("EPD_CODEX_PATH").map(PathBuf::from) {
         if path.is_file() {
             return Ok(path);

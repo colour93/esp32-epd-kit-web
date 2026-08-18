@@ -870,7 +870,7 @@ async fn collect_and_publish(
     context
         .state
         .log(
-            "info",
+            "debug",
             "http",
             format!(
                 "{} ready; items={} elapsed_ms={}",

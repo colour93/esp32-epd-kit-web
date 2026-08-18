@@ -1329,7 +1329,7 @@ async fn transact_with_timeout(
     let started = Instant::now();
     state
         .log(
-            "info",
+            "debug",
             "ble.rpc",
             format!("request id={id} op={op} frames={frame_count} bytes={encoded_bytes}"),
         )
@@ -1374,7 +1374,7 @@ async fn transact_with_timeout(
     if response.ok {
         state
             .log(
-                "info",
+                "debug",
                 "ble.rpc",
                 format!(
                     "response id={id} op={op} elapsed_ms={}",

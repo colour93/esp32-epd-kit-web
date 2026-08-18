@@ -229,7 +229,11 @@ impl SharedState {
         match level {
             "error" => tracing::error!(scope, "{message}"),
             "warn" => tracing::warn!(scope, "{message}"),
+            "debug" => tracing::debug!(scope, "{message}"),
             _ => tracing::info!(scope, "{message}"),
+        }
+        if level == "debug" && !tracing::enabled!(tracing::Level::DEBUG) {
+            return;
         }
         let mut snapshot = self.snapshot.write().await;
         let mut logs = VecDeque::from(std::mem::take(&mut snapshot.logs));

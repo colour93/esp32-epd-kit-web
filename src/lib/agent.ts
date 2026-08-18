@@ -241,7 +241,7 @@ export interface CodexOAuthStartResult {
 
 export interface LogEntry {
   at: number
-  level: 'info' | 'warn' | 'error'
+  level: 'debug' | 'info' | 'warn' | 'error'
   scope: string
   message: string
 }

@@ -443,6 +443,7 @@ const App = () => {
             config={config}
             pages={pages}
             resources={resources}
+            maxResources={snapshot.device.capabilities?.max_resources}
             sources={snapshot.sources}
             pageId={pageId}
             pageBindings={pageBindings}

@@ -9,7 +9,7 @@ import { Switch } from '@/components/ui/switch'
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
 import { DashboardEmpty, StatusBadge } from '@/components/dashboard/dashboard-components'
 
-export type LogLevel = 'all' | 'info' | 'warn' | 'error'
+export type LogLevel = 'all' | 'debug' | 'info' | 'warn' | 'error'
 
 const formatTime = (seconds: number) => new Intl.DateTimeFormat('zh-CN', {
   hour: '2-digit', minute: '2-digit', second: '2-digit',
@@ -70,7 +70,7 @@ export const DiagnosticsView = ({
       <CardHeader><CardTitle>日志</CardTitle><CardAction><StatusBadge phase={streamDown ? 'reconnecting' : 'ready'} /></CardAction></CardHeader>
       <CardContent className="flex flex-col gap-4 px-0">
         <div className="flex flex-wrap items-end gap-3 px-4">
-          <Field className="w-auto"><FieldLabel>级别</FieldLabel><ToggleGroup value={[logLevel]} onValueChange={(value) => value[0] && onLogLevelChange(value[0] as LogLevel)} variant="outline" spacing={0}>{(['all', 'info', 'warn', 'error'] as const).map((level) => <ToggleGroupItem key={level} value={level}>{level}</ToggleGroupItem>)}</ToggleGroup></Field>
+          <Field className="w-auto"><FieldLabel>级别</FieldLabel><ToggleGroup value={[logLevel]} onValueChange={(value) => value[0] && onLogLevelChange(value[0] as LogLevel)} variant="outline" spacing={0}>{(['all', 'debug', 'info', 'warn', 'error'] as const).map((level) => <ToggleGroupItem key={level} value={level}>{level}</ToggleGroupItem>)}</ToggleGroup></Field>
           <Field className="w-44"><FieldLabel>Scope</FieldLabel><NativeSelect className="w-full" value={logScope} onChange={(event) => onLogScopeChange(event.target.value)}><NativeSelectOption value="all">all</NativeSelectOption>{logScopes.map((scope) => <NativeSelectOption key={scope} value={scope}>{scope}</NativeSelectOption>)}</NativeSelect></Field>
           <Field orientation="horizontal" className="ml-auto w-auto pb-1"><FieldTitle>跟随</FieldTitle><Switch checked={followLogs} onCheckedChange={onFollowChange} /></Field>
         </div>

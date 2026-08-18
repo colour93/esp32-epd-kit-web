@@ -392,7 +392,7 @@ async fn collect_and_publish(
         .await;
     state
         .log(
-            "info",
+            "debug",
             "cli",
             format!(
                 "{} ready; items={} elapsed_ms={}",

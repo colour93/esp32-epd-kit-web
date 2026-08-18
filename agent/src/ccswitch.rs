@@ -121,7 +121,7 @@ async fn run(context: ProducerContext, mut triggers: mpsc::Receiver<ProducerTrig
         context
             .state
             .log(
-                "info",
+                "debug",
                 "ccswitch",
                 format!("reading today's usage; reason={reason}"),
             )
@@ -205,7 +205,7 @@ async fn sync_once(context: &ProducerContext) -> std::result::Result<(), ReadFai
     context
         .state
         .log(
-            "info",
+            "debug",
             "ccswitch",
             format!(
                 "today's usage ready; requests={} tokens={}",

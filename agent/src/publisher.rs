@@ -3,7 +3,7 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 
@@ -270,7 +270,7 @@ async fn publish_one(
     if !ble.is_connected() {
         state
             .log(
-                "info",
+                "debug",
                 "publisher",
                 format!("{} cached until BLE reconnects", entry.resource.key),
             )
@@ -278,6 +278,25 @@ async fn publish_one(
         return Ok(false);
     }
     let snapshot = state.snapshot().await;
+    let existing =
+        snapshot.device.resources.iter().any(|item| {
+            item.get("key").and_then(Value::as_str) == Some(entry.resource.key.as_str())
+        });
+    let max_resources = snapshot
+        .device
+        .capabilities
+        .as_ref()
+        .and_then(|capabilities| capabilities.get("max_resources"))
+        .and_then(Value::as_u64);
+    if !existing
+        && max_resources.is_some_and(|limit| snapshot.device.resources.len() as u64 >= limit)
+    {
+        let limit = max_resources.unwrap();
+        bail!(
+            "device resource store is full ({}/{limit}); update firmware or remove an unused resource",
+            snapshot.device.resources.len()
+        );
+    }
     let current_revision = snapshot
         .device
         .resources
@@ -315,7 +334,7 @@ async fn publish_one(
     }
     state
         .log(
-            "info",
+            "debug",
             "publisher",
             format!(
                 "{} synchronized by {}; revision={revision} hash={:08x}",

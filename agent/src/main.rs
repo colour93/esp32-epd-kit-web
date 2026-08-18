@@ -5,6 +5,7 @@ mod ccswitch;
 mod cli;
 mod codex;
 mod codex_oauth;
+mod codex_tasks;
 mod coordinator;
 mod http;
 mod instance;
@@ -76,6 +77,10 @@ async fn prepare_service() -> Result<Service> {
         state: state.clone(),
         publisher: publisher.clone(),
     });
+    let codex_tasks = codex_tasks::CodexTaskControl::spawn(producer::ProducerContext {
+        state: state.clone(),
+        publisher: publisher.clone(),
+    });
     let codex_oauth = codex_oauth::CodexOAuthControl::spawn(producer::ProducerContext {
         state: state.clone(),
         publisher: publisher.clone(),
@@ -100,6 +105,7 @@ async fn prepare_service() -> Result<Service> {
         &state,
         vec![
             codex.control(),
+            codex_tasks.control(),
             codex_oauth.control(),
             ccswitch.control(),
             cli.control(),

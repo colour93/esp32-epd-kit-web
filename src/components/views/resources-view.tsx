@@ -23,6 +23,7 @@ export const ResourcesView = ({
   config,
   pages,
   resources,
+  maxResources,
   sources,
   pageId,
   pageBindings,
@@ -43,6 +44,7 @@ export const ResourcesView = ({
   config: DeviceConfig | undefined
   pages: PageCapability[]
   resources: ResourceSummary[]
+  maxResources?: number
   sources: SourceStatus[]
   pageId: string
   pageBindings: Record<string, PageBinding>
@@ -93,7 +95,7 @@ export const ResourcesView = ({
 
     <Card>
       <CardHeader>
-        <CardTitle>资源</CardTitle>
+        <CardTitle>资源 <span className="text-xs font-normal text-muted-foreground">{resources.length} / {maxResources ?? '--'}</span></CardTitle>
         <CardAction><Button variant="outline" size="sm" disabled={!owner || busy} onClick={() => setResourceEditor('')}><Braces data-icon="inline-start" />新建</Button></CardAction>
       </CardHeader>
       <CardContent className="overflow-x-auto px-0">

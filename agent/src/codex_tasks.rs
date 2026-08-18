@@ -27,7 +27,7 @@ const RESOURCE_KEY: &str = "codex/tasks";
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const PUBLISH_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 const RESOURCE_TTL_SEC: u64 = 30;
-const MAX_TASKS: usize = 4;
+const MAX_TASKS: usize = 3;
 
 pub static MANIFEST: ProducerManifest = ProducerManifest {
     id: "codex.tasks",
@@ -40,6 +40,8 @@ pub static MANIFEST: ProducerManifest = ProducerManifest {
         id: SOURCE_ID,
         title: "Codex Tasks",
         resource_keys: &[RESOURCE_KEY],
+        default_interval_sec: 2,
+        realtime: true,
     }),
 };
 
@@ -106,6 +108,7 @@ impl TaskTracker {
             "data": status_text(status),
             "description": truncate(title, 64),
             "format": "text",
+            "icon": status_icon(status),
             "running": status == "running",
         })))
     }
@@ -217,10 +220,10 @@ async fn collect_tasks(
     tracker
         .rollouts
         .retain(|thread_id, _| visible_ids.contains(thread_id.as_str()));
-    let mut items = Vec::new();
+    let mut task_items = Vec::new();
     for thread in threads {
         match tracker.update(thread).await {
-            Ok(Some(item)) => items.push(item),
+            Ok(Some(item)) => task_items.push(item),
             Ok(None) => {}
             Err(error) => {
                 context
@@ -230,23 +233,31 @@ async fn collect_tasks(
             }
         }
     }
-    items.sort_by_key(|item| {
+    task_items.sort_by_key(|item| {
         !item
             .get("running")
             .and_then(Value::as_bool)
             .unwrap_or(false)
     });
-    for item in &mut items {
+    let running_count = task_items
+        .iter()
+        .filter(|item| item.get("running").and_then(Value::as_bool) == Some(true))
+        .count();
+    let interrupted_count = task_items
+        .iter()
+        .filter(|item| item.get("data").and_then(Value::as_str) == Some("已中止"))
+        .count();
+    for item in &mut task_items {
         item.as_object_mut().map(|object| object.remove("running"));
     }
-    if items.is_empty() {
-        items.push(json!({
-            "label": "状态",
-            "data": "暂无任务",
-            "description": "本机 Codex",
-            "format": "text",
-        }));
-    }
+    let mut items = vec![json!({
+        "label": "总览",
+        "data": if running_count > 0 { format!("{running_count} 个执行中") } else if task_items.is_empty() { "暂无任务".into() } else { "全部结束".into() },
+        "description": format!("最近 {} 个 · {} 个中止", task_items.len(), interrupted_count),
+        "format": "text",
+        "icon": if running_count > 0 { "sync" } else if task_items.is_empty() { "pause" } else { "check" },
+    })];
+    items.extend(task_items);
     Ok(CollectedTasks {
         payload: json!({
             "source_status": "ok",
@@ -357,6 +368,14 @@ fn status_text(status: &str) -> &'static str {
         "running" => "执行中",
         "interrupted" => "已中止",
         _ => "已完成",
+    }
+}
+
+fn status_icon(status: &str) -> &'static str {
+    match status {
+        "running" => "sync",
+        "interrupted" => "close",
+        _ => "check",
     }
 }
 

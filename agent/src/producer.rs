@@ -35,6 +35,8 @@ pub struct BuiltInSourceManifest {
     pub id: &'static str,
     pub title: &'static str,
     pub resource_keys: &'static [&'static str],
+    pub default_interval_sec: u64,
+    pub realtime: bool,
 }
 
 #[derive(Clone)]
@@ -125,6 +127,8 @@ impl ProducerRegistry {
                         type_id: item.manifest.id.into(),
                         title: source.title.into(),
                         enabled: true,
+                        interval_sec: Some(source.default_interval_sec),
+                        realtime: source.realtime,
                         phase: "starting".into(),
                         resource_keys: source
                             .resource_keys

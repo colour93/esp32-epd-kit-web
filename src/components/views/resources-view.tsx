@@ -1,10 +1,11 @@
 import { Braces, Eye, LayoutGrid, Save, Trash2 } from 'lucide-react'
-import type { Dispatch, SetStateAction } from 'react'
-import type { DeviceConfig, PageBinding, PageCapability, ResourceSummary, SourceStatus } from '@/lib/agent'
+import { useState, type Dispatch, type SetStateAction } from 'react'
+import type { DeviceConfig, PageBinding, PageCapability, PagePreset, ResourceSummary, SourceStatus } from '@/lib/agent'
 import { Button } from '@/components/ui/button'
 import { Card, CardAction, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Field, FieldLabel } from '@/components/ui/field'
 import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
+import { Input } from '@/components/ui/input'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Textarea } from '@/components/ui/textarea'
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
@@ -23,8 +24,10 @@ export const ResourcesView = ({
   config,
   pages,
   resources,
+  storedResources,
   maxResources,
   sources,
+  presets,
   pageId,
   pageBindings,
   selectedPage,
@@ -35,6 +38,9 @@ export const ResourcesView = ({
   busy,
   requiredBindingsReady,
   onChoosePage,
+  onChoosePreset,
+  onSavePreset,
+  onDeletePreset,
   onApplyPage,
   onInspect,
   onEdit,
@@ -44,8 +50,10 @@ export const ResourcesView = ({
   config: DeviceConfig | undefined
   pages: PageCapability[]
   resources: ResourceSummary[]
+  storedResources: ResourceSummary[]
   maxResources?: number
   sources: SourceStatus[]
+  presets: PagePreset[]
   pageId: string
   pageBindings: Record<string, PageBinding>
   selectedPage?: PageCapability
@@ -56,13 +64,20 @@ export const ResourcesView = ({
   busy: boolean
   requiredBindingsReady: boolean
   onChoosePage: (id: string) => void
+  onChoosePreset: (preset: PagePreset) => void
+  onSavePreset: (title: string) => void
+  onDeletePreset: (id: string) => void
   onApplyPage: () => void
   onInspect: (resource: ResourceSummary) => void
   onEdit: (resource: ResourceSummary) => void
   onDelete: (resource: ResourceSummary) => void
   onPublish: () => void
-}) => (
-  <>
+}) => {
+  const [presetTitle, setPresetTitle] = useState('')
+  const [presetId, setPresetId] = useState('')
+  const selectedPreset = presets.find((item) => item.id === presetId)
+  return (
+    <>
     <Card>
       <CardHeader>
         <CardTitle>页面</CardTitle>
@@ -74,6 +89,14 @@ export const ResourcesView = ({
           {pageId.startsWith('home') && pages.some((page) => page.id === 'home.three') ? (
             <Field><FieldLabel>布局</FieldLabel><ToggleGroup value={[pageId]} onValueChange={(value) => value[0] && onChoosePage(value[0])} variant="outline" spacing={0}><ToggleGroupItem value="home"><LayoutGrid />2</ToggleGroupItem><ToggleGroupItem value="home.three"><LayoutGrid />3</ToggleGroupItem></ToggleGroup></Field>
           ) : null}
+        </div>
+        <div className="grid gap-3 border-t px-4 pt-4 md:grid-cols-[1fr_1fr_auto]">
+          <Field><FieldLabel>页面预设</FieldLabel><NativeSelect className="w-full" value={presetId} onChange={(event) => { const id = event.target.value; setPresetId(id); const preset = presets.find((item) => item.id === id); if (preset) { setPresetTitle(preset.title); onChoosePreset(preset) } }}><NativeSelectOption value="">选择预设</NativeSelectOption>{presets.map((preset) => <NativeSelectOption key={preset.id} value={preset.id}>{preset.title}</NativeSelectOption>)}</NativeSelect></Field>
+          <Field><FieldLabel>预设名称</FieldLabel><Input value={presetTitle} placeholder="例如：工作台" onChange={(event) => setPresetTitle(event.target.value)} /></Field>
+          <div className="flex items-end gap-1">
+            <Button size="icon" disabled={!owner || busy || !presetTitle.trim()} title="保存为新预设" onClick={() => onSavePreset(presetTitle.trim())}><Save /><span className="sr-only">保存为新预设</span></Button>
+            <Button variant="ghost" size="icon" disabled={!owner || busy || !selectedPreset} title="删除预设" onClick={() => selectedPreset && onDeletePreset(selectedPreset.id)}><Trash2 /><span className="sr-only">删除预设</span></Button>
+          </div>
         </div>
         <div className="border-t">
           {selectedPage?.slots.map((slot) => slot.status === 'reserved' ? (
@@ -95,14 +118,14 @@ export const ResourcesView = ({
 
     <Card>
       <CardHeader>
-        <CardTitle>资源 <span className="text-xs font-normal text-muted-foreground">{resources.length} / {maxResources ?? '--'}</span></CardTitle>
+        <CardTitle>固件资源 <span className="text-xs font-normal text-muted-foreground">{storedResources.length} / {maxResources ?? '--'}</span></CardTitle>
         <CardAction><Button variant="outline" size="sm" disabled={!owner || busy} onClick={() => setResourceEditor('')}><Braces data-icon="inline-start" />新建</Button></CardAction>
       </CardHeader>
       <CardContent className="overflow-x-auto px-0">
-        {resources.length ? (
+        {storedResources.length ? (
           <Table>
             <TableHeader><TableRow><TableHead>Key</TableHead><TableHead>Schema</TableHead><TableHead>Revision</TableHead><TableHead>更新时间</TableHead><TableHead className="text-right">操作</TableHead></TableRow></TableHeader>
-            <TableBody>{resources.map((resource) => (
+            <TableBody>{storedResources.map((resource) => (
               <TableRow key={resource.key}>
                 <TableCell className="font-medium">{resource.key}</TableCell>
                 <TableCell className="font-mono text-xs">{resource.schema_id}/v{resource.schema_version}</TableCell>
@@ -124,5 +147,6 @@ export const ResourcesView = ({
       <CardHeader><CardTitle>JSON</CardTitle><CardAction><Button size="sm" disabled={!owner || busy} onClick={onPublish}><Save data-icon="inline-start" />发布</Button></CardAction></CardHeader>
       <CardContent><Textarea className="min-h-80 font-mono text-xs" spellCheck={false} value={resourceEditor} onChange={(event) => setResourceEditor(event.target.value)} /></CardContent>
     </Card>
-  </>
-)
+    </>
+  )
+}

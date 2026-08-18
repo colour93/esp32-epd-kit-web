@@ -5,6 +5,12 @@ export interface PageBinding {
   resource_key: string
 }
 
+export interface PagePreset {
+  id: string
+  title: string
+  page: { id: string; bindings: Record<string, PageBinding | string> }
+}
+
 export interface AgentStatus {
   version: string
   paused: boolean
@@ -133,6 +139,8 @@ export interface SourceStatus {
   type_id: string
   title: string
   enabled: boolean
+  interval_sec?: number
+  realtime: boolean
   phase: string
   resource_keys: string[]
   last_sync_at?: number
@@ -251,6 +259,8 @@ export interface Snapshot {
   device: DeviceStatus
   source_types: SourceTypeStatus[]
   sources: SourceStatus[]
+  page_presets: PagePreset[]
+  resource_catalog: ResourceSummary[]
   logs: LogEntry[]
 }
 
@@ -314,6 +324,10 @@ export const agentApi = {
   refreshSource: (id: string) => request(`/api/v1/sources/${encodeURIComponent(id)}/refresh`, {
     method: 'POST', body: '{}',
   }),
+  updateSourcePolicy: (id: string, policy: { enabled?: boolean; interval_sec?: number }) => request(
+    `/api/v1/sources/${encodeURIComponent(id)}/policy`,
+    { method: 'PATCH', body: JSON.stringify(policy) },
+  ),
   getCodexOAuthSources: () => request<{ sources: CodexOAuthConfig[] }>(
     '/api/v1/source-types/codex.oauth/sources',
   ),
@@ -416,6 +430,11 @@ export const agentApi = {
   setPage: (page: { id: string; bindings: Record<string, PageBinding | string> }) => request('/api/v1/device/page', {
     method: 'POST', body: JSON.stringify({ page }),
   }),
+  putPagePreset: (preset: PagePreset) => request<{ preset: PagePreset }>(
+    `/api/v1/page-presets/${encodeURIComponent(preset.id)}`,
+    { method: 'PUT', body: JSON.stringify({ title: preset.title, page: preset.page }) },
+  ),
+  deletePagePreset: (id: string) => request(`/api/v1/page-presets/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   prepareFactoryReset: () => request<{ result: { expires_in_sec: number } }>('/api/v1/factory/prepare', {
     method: 'POST', body: '{}',
   }),

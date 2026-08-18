@@ -515,7 +515,15 @@ async fn collect(context: &ProducerContext, config: &CodexOAuthConfig) -> bool {
 }
 
 async fn collect_inner(context: &ProducerContext, config: &CodexOAuthConfig) -> Result<()> {
-    if !config.enabled {
+    if !context
+        .state
+        .snapshot()
+        .await
+        .sources
+        .iter()
+        .find(|source| source.id == config.id)
+        .is_some_and(|source| source.enabled)
+    {
         context
             .state
             .update_source(&config.id, |source| {
@@ -851,6 +859,7 @@ fn source_status(config: &CodexOAuthConfig, credential: Option<&OAuthCredential>
         type_id: MANIFEST.id.into(),
         title: config.title.clone(),
         enabled: config.enabled,
+        interval_sec: Some(config.interval_sec),
         phase: if !config.enabled {
             "disabled"
         } else if credential.is_none() {

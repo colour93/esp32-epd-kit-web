@@ -350,6 +350,19 @@ export const DataSourceManager = ({ sourceTypes, sources }: {
     }
   }
 
+  const updatePolicy = async (source: SourceStatus, policy: { enabled?: boolean; interval_sec?: number }) => {
+    if (busy) return
+    setBusy(`policy:${source.id}`)
+    try {
+      await agentApi.updateSourcePolicy(source.id, policy)
+      toast.success(policy.enabled === false ? '已停用并清除资源' : '数据源策略已更新')
+    } catch (error) {
+      toast.error(errorText(error))
+    } finally {
+      setBusy(null)
+    }
+  }
+
   const deleteSource = async (source: SourceStatus) => {
     if (busy || !window.confirm(`删除 ${source.id}？`)) return
     setBusy(`delete:${source.id}`)
@@ -416,7 +429,7 @@ export const DataSourceManager = ({ sourceTypes, sources }: {
           {sources.length ? (
             <Table>
               <TableHeader>
-                <TableRow><TableHead>名称</TableHead><TableHead>类型</TableHead><TableHead>状态</TableHead><TableHead>资源</TableHead><TableHead>同步</TableHead><TableHead className="text-right">操作</TableHead></TableRow>
+                <TableRow><TableHead>名称</TableHead><TableHead>类型</TableHead><TableHead>状态</TableHead><TableHead>启用</TableHead><TableHead>周期</TableHead><TableHead>资源</TableHead><TableHead>同步</TableHead><TableHead className="text-right">操作</TableHead></TableRow>
               </TableHeader>
               <TableBody>
                 {sources.map((source) => (
@@ -424,6 +437,8 @@ export const DataSourceManager = ({ sourceTypes, sources }: {
                     <TableCell><div className="font-medium">{source.title}</div><div className="font-mono text-xs text-muted-foreground">{source.id}</div></TableCell>
                     <TableCell><Badge variant="outline">{typeTitle(source.type_id)}</Badge></TableCell>
                     <TableCell><StatusBadge phase={source.phase} /></TableCell>
+                    <TableCell><Switch checked={source.enabled} disabled={!!busy} aria-label={`${source.title} 启用状态`} onCheckedChange={(enabled) => void updatePolicy(source, { enabled })} /></TableCell>
+                    <TableCell>{source.realtime ? <Badge variant="outline">被动实时</Badge> : <div className="flex items-center gap-1"><Input key={`${source.id}:${source.interval_sec}`} className="h-8 w-20 font-mono text-xs" type="number" min={10} max={86400} defaultValue={source.interval_sec ?? 60} disabled={!!busy || !source.enabled} aria-label={`${source.title} 更新周期`} onBlur={(event) => { const interval_sec = Number(event.target.value); if (interval_sec !== source.interval_sec) void updatePolicy(source, { interval_sec }) }} /><span className="text-xs text-muted-foreground">秒</span></div>}</TableCell>
                     <TableCell className="max-w-56 truncate font-mono text-xs">{source.resource_keys.join(', ') || '—'}</TableCell>
                     <TableCell className="font-mono text-xs">{formatTime(source.last_sync_at)}</TableCell>
                     <TableCell>

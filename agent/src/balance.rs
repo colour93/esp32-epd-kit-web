@@ -487,7 +487,15 @@ async fn collect(context: &ProducerContext, config: &BalanceConfig) -> bool {
 }
 
 async fn collect_inner(context: &ProducerContext, config: &BalanceConfig) -> Result<()> {
-    if !config.enabled {
+    if !context
+        .state
+        .snapshot()
+        .await
+        .sources
+        .iter()
+        .find(|source| source.id == config.id)
+        .is_some_and(|source| source.enabled)
+    {
         context
             .state
             .update_source(&config.id, |source| {
@@ -591,6 +599,7 @@ fn source_status(config: &BalanceConfig, secret_configured: bool) -> SourceStatu
         type_id: MANIFEST.id.into(),
         title: config.title.clone(),
         enabled: config.enabled,
+        interval_sec: Some(config.interval_sec),
         phase: if !config.enabled {
             "disabled"
         } else if !secret_configured {

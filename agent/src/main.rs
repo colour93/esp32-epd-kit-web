@@ -13,6 +13,7 @@ mod metrics;
 mod producer;
 mod protocol;
 mod publisher;
+mod settings;
 mod state;
 mod tray;
 mod web;
@@ -58,7 +59,9 @@ fn main() -> Result<()> {
 }
 
 async fn prepare_service() -> Result<Service> {
-    let state = state::SharedState::new();
+    let settings = settings::SettingsStore::load()?;
+    let state = state::SharedState::new(settings.policies().await);
+    state.set_page_presets(settings.presets().await).await;
     state
         .log(
             "info",
@@ -122,6 +125,7 @@ async fn prepare_service() -> Result<Service> {
         publisher.clone(),
         completion_rx,
     );
+    coordinator::spawn_source_scheduler(state.clone(), producers.clone());
     let context = web::WebContext::new(
         state.clone(),
         ble,
@@ -131,6 +135,7 @@ async fn prepare_service() -> Result<Service> {
         http,
         balance,
         publisher,
+        settings,
     )?;
     let port = configured_port()?;
     let launch_url = context.launch_url(port);

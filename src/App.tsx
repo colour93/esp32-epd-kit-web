@@ -33,6 +33,7 @@ import {
   type JsonObject,
   type PageCapability,
   type PageBinding,
+  type PagePreset,
   type PageSlotCapability,
   type PageWidgetCapability,
   type ResourceSummary,
@@ -224,7 +225,10 @@ const App = () => {
   const connected = snapshot?.device.phase === 'connected'
   const owner = snapshot?.device.role === 'owner'
   const pages = snapshot?.device.capabilities?.pages ?? []
-  const resources = snapshot?.device.resources ?? []
+  const resources = useMemo(() => {
+    const items = [...(snapshot?.resource_catalog ?? []), ...(snapshot?.device.resources ?? [])]
+    return Array.from(new Map(items.map((item) => [item.key, item])).values())
+  }, [snapshot?.resource_catalog, snapshot?.device.resources])
   const selectedPage = pages.find((item) => item.id === pageId)
   const requiredBindingsReady = selectedPage?.slots.every((slot) => (
     slot.status !== 'active' || !slot.required || Boolean(
@@ -304,6 +308,11 @@ const App = () => {
     }
     setPageId(id)
     setPageBindings(bindings)
+  }
+
+  const choosePreset = (preset: PagePreset) => {
+    setPageId(preset.page.id)
+    setPageBindings(Object.fromEntries(Object.entries(preset.page.bindings).map(([id, binding]) => [id, normalizedBinding(binding)])))
   }
 
   const publishEditedResource = async () => {
@@ -443,8 +452,10 @@ const App = () => {
             config={config}
             pages={pages}
             resources={resources}
+            storedResources={snapshot.device.resources}
             maxResources={snapshot.device.capabilities?.max_resources}
             sources={snapshot.sources}
+            presets={snapshot.page_presets ?? []}
             pageId={pageId}
             pageBindings={pageBindings}
             selectedPage={selectedPage}
@@ -455,6 +466,13 @@ const App = () => {
             busy={Boolean(operation)}
             requiredBindingsReady={requiredBindingsReady}
             onChoosePage={choosePage}
+            onChoosePreset={choosePreset}
+            onSavePreset={(title) => void perform('preset.save', () => agentApi.putPagePreset({
+              id: crypto.randomUUID(),
+              title,
+              page: { id: pageId, bindings: serializedBindings(selectedPage, pageBindings) },
+            }), '预设已保存', true)}
+            onDeletePreset={(id) => void perform('preset.delete', () => agentApi.deletePagePreset(id), '预设已删除', true)}
             onApplyPage={() => void perform('page', () => agentApi.setPage({ id: pageId, bindings: serializedBindings(selectedPage, pageBindings) }), '已应用', true)}
             onInspect={(resource) => void inspectResource(resource)}
             onEdit={(resource) => void editResource(resource)}

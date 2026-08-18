@@ -1,4 +1,8 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -22,6 +26,39 @@ impl SyncCoordinator {
     ) {
         tokio::spawn(run(state, ble, producers, publisher, completions));
     }
+}
+
+pub fn spawn_source_scheduler(state: Arc<SharedState>, producers: ProducerRegistry) {
+    tokio::spawn(async move {
+        let mut due = HashMap::<String, (u64, tokio::time::Instant)>::new();
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tick.tick().await;
+            let now = tokio::time::Instant::now();
+            let sources = state.snapshot().await.sources;
+            due.retain(|id, _| sources.iter().any(|source| source.id == *id));
+            for source in sources
+                .into_iter()
+                .filter(|source| source.enabled && !source.realtime)
+            {
+                let interval_sec = source.interval_sec.unwrap_or(60).max(10);
+                let interval = Duration::from_secs(interval_sec);
+                let schedule = due
+                    .entry(source.id.clone())
+                    .or_insert((interval_sec, now + interval));
+                if schedule.0 != interval_sec {
+                    *schedule = (interval_sec, now + interval);
+                }
+                if schedule.1 > now {
+                    continue;
+                }
+                schedule.1 = now + interval;
+                if let Err(error) = producers.refresh_source(&source.type_id, &source.id).await {
+                    state.log("warn", "scheduler", error.to_string()).await;
+                }
+            }
+        }
+    });
 }
 
 async fn run(

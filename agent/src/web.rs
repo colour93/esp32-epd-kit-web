@@ -29,6 +29,7 @@ use crate::{
     http::{HttpMetricControl, HttpMetricInput},
     producer::ProducerRegistry,
     publisher::ResourcePublisher,
+    settings::{PagePreset, SettingsStore, SourcePolicy},
     state::SharedState,
 };
 
@@ -44,6 +45,7 @@ pub struct WebContext {
     pub http: HttpMetricControl,
     pub balance: BalanceControl,
     pub publisher: ResourcePublisher,
+    pub settings: SettingsStore,
     auth: Arc<Auth>,
 }
 
@@ -62,6 +64,7 @@ impl WebContext {
         http: HttpMetricControl,
         balance: BalanceControl,
         publisher: ResourcePublisher,
+        settings: SettingsStore,
     ) -> Result<Self> {
         Ok(Self {
             state,
@@ -72,6 +75,7 @@ impl WebContext {
             http,
             balance,
             publisher,
+            settings,
             auth: Arc::new(Auth {
                 install_token: load_install_token()?,
                 session_token: random_token(),
@@ -104,6 +108,11 @@ pub fn router(context: WebContext) -> Router {
             get(resource_get).put(resource_put).delete(resource_delete),
         )
         .route("/api/v1/device/page", post(page_set))
+        .route("/api/v1/page-presets", get(page_presets_get))
+        .route(
+            "/api/v1/page-presets/{id}",
+            axum::routing::put(page_preset_put).delete(page_preset_delete),
+        )
         .route("/api/v1/device/refresh", post(display_refresh))
         .route("/api/v1/device/restart", post(device_restart))
         .route(
@@ -111,6 +120,7 @@ pub fn router(context: WebContext) -> Router {
             post(source_type_refresh),
         )
         .route("/api/v1/sources/{id}/refresh", post(source_refresh))
+        .route("/api/v1/sources/{id}/policy", patch(source_policy_patch))
         .route(
             "/api/v1/source-types/codex.oauth/sources",
             get(codex_oauth_sources_get),
@@ -457,14 +467,14 @@ async fn resource_delete(
     Query(input): Query<ResourceQuery>,
 ) -> ApiResult<Json<Value>> {
     mutation_auth(&context, &headers)?;
-    let result = context
-        .ble
-        .request("resource.delete", json!({ "key": input.key }))
+    context
+        .publisher
+        .delete(input.key)
         .await
         .map_err(ApiError::internal)?;
     reload_device(&context).await.map_err(ApiError::internal)?;
     context.state.log("info", "web", "resource deleted").await;
-    Ok(Json(json!({ "ok": true, "result": result })))
+    Ok(Json(json!({ "ok": true })))
 }
 
 #[derive(Deserialize)]
@@ -478,6 +488,11 @@ async fn page_set(
     Json(input): Json<PageInput>,
 ) -> ApiResult<Json<Value>> {
     mutation_auth(&context, &headers)?;
+    context
+        .publisher
+        .prepare_page(&input.page)
+        .await
+        .map_err(ApiError::internal)?;
     let result = context
         .ble
         .request("page.set", json!({ "page": input.page }))
@@ -485,10 +500,73 @@ async fn page_set(
         .map_err(ApiError::internal)?;
     reload_device(&context).await.map_err(ApiError::internal)?;
     context
+        .publisher
+        .reconcile()
+        .await
+        .map_err(ApiError::internal)?;
+    context
         .state
         .log("info", "web", "active page bindings updated")
         .await;
     Ok(Json(json!({ "ok": true, "result": result })))
+}
+
+async fn page_presets_get(State(context): State<WebContext>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!({ "presets": context.settings.presets().await })))
+}
+
+#[derive(Deserialize)]
+struct PagePresetInput {
+    title: String,
+    page: Value,
+}
+
+async fn page_preset_put(
+    State(context): State<WebContext>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<PagePresetInput>,
+) -> ApiResult<Json<Value>> {
+    mutation_auth(&context, &headers)?;
+    if id.trim().is_empty() || input.title.trim().is_empty() || !input.page.is_object() {
+        return Err(ApiError::invalid("预设名称与页面配置不能为空"));
+    }
+    let preset = PagePreset {
+        id,
+        title: input.title.trim().to_owned(),
+        page: input.page,
+    };
+    context
+        .settings
+        .put_preset(preset.clone())
+        .await
+        .map_err(ApiError::internal)?;
+    context
+        .state
+        .set_page_presets(context.settings.presets().await)
+        .await;
+    Ok(Json(json!({ "preset": preset })))
+}
+
+async fn page_preset_delete(
+    State(context): State<WebContext>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Value>> {
+    mutation_auth(&context, &headers)?;
+    if !context
+        .settings
+        .delete_preset(&id)
+        .await
+        .map_err(ApiError::internal)?
+    {
+        return Err(ApiError::invalid("页面预设不存在"));
+    }
+    context
+        .state
+        .set_page_presets(context.settings.presets().await)
+        .await;
+    Ok(Json(json!({ "ok": true })))
 }
 
 #[derive(Deserialize)]
@@ -577,6 +655,63 @@ async fn source_refresh(
         .log("info", "web", format!("source {id} refresh queued"))
         .await;
     Ok(Json(json!({ "ok": true, "queued": true })))
+}
+
+async fn source_policy_patch(
+    State(context): State<WebContext>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<SourcePolicy>,
+) -> ApiResult<Json<Value>> {
+    mutation_auth(&context, &headers)?;
+    let source = context
+        .state
+        .snapshot()
+        .await
+        .sources
+        .into_iter()
+        .find(|source| source.id == id)
+        .ok_or_else(|| ApiError::invalid(format!("unknown data source: {id}")))?;
+    if source.realtime && input.interval_sec.is_some() {
+        return Err(ApiError::invalid("被动实时数据源不设置轮询周期"));
+    }
+    if input
+        .interval_sec
+        .is_some_and(|value| !(10..=86_400).contains(&value))
+    {
+        return Err(ApiError::invalid("更新周期必须在 10-86400 秒之间"));
+    }
+    let enabled = input.enabled.unwrap_or(source.enabled);
+    let policy = SourcePolicy {
+        enabled: Some(enabled),
+        interval_sec: if source.realtime {
+            None
+        } else {
+            input.interval_sec.or(source.interval_sec)
+        },
+    };
+    context
+        .settings
+        .set_source_policy(id.clone(), policy.clone())
+        .await
+        .map_err(ApiError::internal)?;
+    context.state.set_source_policy(&id, policy).await;
+    if !enabled {
+        for key in source.resource_keys {
+            context
+                .publisher
+                .delete(key)
+                .await
+                .map_err(ApiError::internal)?;
+        }
+    } else {
+        context
+            .producers
+            .refresh_source(&source.type_id, &source.id)
+            .await
+            .map_err(ApiError::internal)?;
+    }
+    Ok(Json(json!({ "ok": true })))
 }
 
 async fn codex_oauth_sources_get(

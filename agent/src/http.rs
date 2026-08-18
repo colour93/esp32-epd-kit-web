@@ -822,7 +822,15 @@ async fn collect_and_publish(
         update_non_running(&context.state, "unconfigured", config, false).await;
         return Ok(());
     }
-    if !config.enabled {
+    if !context
+        .state
+        .snapshot()
+        .await
+        .sources
+        .iter()
+        .find(|source| source.id == config.id)
+        .is_some_and(|source| source.enabled)
+    {
         publish_status(&context.publisher, config, "disabled").await?;
         update_non_running(&context.state, "disabled", config, false).await;
         return Ok(());
@@ -936,6 +944,7 @@ fn source_status(config: &HttpMetricConfig, secret_configured: bool) -> SourceSt
             config.title.trim().to_owned()
         },
         enabled: config.enabled,
+        interval_sec: Some(config.interval_sec),
         phase: if !configured {
             "unconfigured".into()
         } else if !config.enabled {

@@ -35,6 +35,8 @@ pub static MANIFEST: ProducerManifest = ProducerManifest {
         id: SOURCE_ID,
         title: "Codex Usage",
         resource_keys: &["codex/default", "codex/metrics"],
+        default_interval_sec: 60,
+        realtime: false,
     }),
 };
 

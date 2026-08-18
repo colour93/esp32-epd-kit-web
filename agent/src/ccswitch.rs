@@ -34,6 +34,8 @@ pub static MANIFEST: ProducerManifest = ProducerManifest {
         id: SOURCE_ID,
         title: "CC Switch Usage",
         resource_keys: &[RESOURCE_KEY],
+        default_interval_sec: POLL_INTERVAL_SEC,
+        realtime: false,
     }),
 };
 

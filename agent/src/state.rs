@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -7,6 +7,8 @@ use std::{
 use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::{RwLock, broadcast};
+
+use crate::settings::SourcePolicy;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LogEntry {
@@ -82,6 +84,8 @@ pub struct SourceStatus {
     pub type_id: String,
     pub title: String,
     pub enabled: bool,
+    pub interval_sec: Option<u64>,
+    pub realtime: bool,
     pub phase: String,
     pub resource_keys: Vec<String>,
     pub last_sync_at: Option<u64>,
@@ -97,6 +101,8 @@ impl Default for SourceStatus {
             type_id: String::new(),
             title: String::new(),
             enabled: false,
+            interval_sec: None,
+            realtime: false,
             phase: String::new(),
             resource_keys: Vec::new(),
             last_sync_at: None,
@@ -113,16 +119,19 @@ pub struct Snapshot {
     pub device: DeviceStatus,
     pub source_types: Vec<SourceTypeStatus>,
     pub sources: Vec<SourceStatus>,
+    pub page_presets: Vec<crate::settings::PagePreset>,
+    pub resource_catalog: Vec<Value>,
     pub logs: Vec<LogEntry>,
 }
 
 pub struct SharedState {
     snapshot: RwLock<Snapshot>,
+    source_policies: RwLock<HashMap<String, SourcePolicy>>,
     events: broadcast::Sender<String>,
 }
 
 impl SharedState {
-    pub fn new() -> Arc<Self> {
+    pub fn new(source_policies: HashMap<String, SourcePolicy>) -> Arc<Self> {
         let (events, _) = broadcast::channel(64);
         Arc::new(Self {
             snapshot: RwLock::new(Snapshot {
@@ -139,8 +148,11 @@ impl SharedState {
                 },
                 source_types: Vec::new(),
                 sources: Vec::new(),
+                page_presets: Vec::new(),
+                resource_catalog: Vec::new(),
                 logs: Vec::new(),
             }),
+            source_policies: RwLock::new(source_policies),
             events,
         })
     }
@@ -170,7 +182,8 @@ impl SharedState {
         self.publish_locked(&snapshot);
     }
 
-    pub async fn register_source(&self, source: SourceStatus) {
+    pub async fn register_source(&self, mut source: SourceStatus) {
+        self.apply_source_policy(&mut source).await;
         let mut snapshot = self.snapshot.write().await;
         if let Some(current) = snapshot
             .sources
@@ -184,7 +197,8 @@ impl SharedState {
         self.publish_locked(&snapshot);
     }
 
-    pub async fn register_source_if_absent(&self, source: SourceStatus) -> bool {
+    pub async fn register_source_if_absent(&self, mut source: SourceStatus) -> bool {
+        self.apply_source_policy(&mut source).await;
         let mut snapshot = self.snapshot.write().await;
         if snapshot.sources.iter().any(|item| item.id == source.id) {
             return false;
@@ -198,6 +212,10 @@ impl SharedState {
         let mut snapshot = self.snapshot.write().await;
         if let Some(source) = snapshot.sources.iter_mut().find(|item| item.id == id) {
             update(source);
+            if !source.enabled {
+                source.phase = "disabled".into();
+                source.next_sync_at = None;
+            }
         }
         self.publish_locked(&snapshot);
     }
@@ -206,6 +224,69 @@ impl SharedState {
         let mut snapshot = self.snapshot.write().await;
         snapshot.sources.retain(|item| item.id != id);
         self.publish_locked(&snapshot);
+    }
+
+    pub async fn set_source_policy(&self, id: &str, policy: SourcePolicy) {
+        self.source_policies
+            .write()
+            .await
+            .insert(id.to_owned(), policy.clone());
+        self.update_source(id, |source| {
+            if let Some(enabled) = policy.enabled {
+                source.enabled = enabled;
+                if !enabled {
+                    source.phase = "disabled".into();
+                    source.next_sync_at = None;
+                }
+            }
+            if let Some(interval_sec) = policy.interval_sec {
+                source.interval_sec = Some(interval_sec);
+            }
+        })
+        .await;
+    }
+
+    pub async fn set_page_presets(&self, presets: Vec<crate::settings::PagePreset>) {
+        let mut snapshot = self.snapshot.write().await;
+        snapshot.page_presets = presets;
+        self.publish_locked(&snapshot);
+    }
+
+    pub async fn upsert_catalog_resource(&self, resource: Value) {
+        let key = resource
+            .get("key")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let mut snapshot = self.snapshot.write().await;
+        if let Some(current) = snapshot
+            .resource_catalog
+            .iter_mut()
+            .find(|item| item.get("key").and_then(Value::as_str) == Some(key))
+        {
+            *current = resource;
+        } else {
+            snapshot.resource_catalog.push(resource);
+        }
+        self.publish_locked(&snapshot);
+    }
+
+    pub async fn remove_catalog_resource(&self, key: &str) {
+        let mut snapshot = self.snapshot.write().await;
+        snapshot
+            .resource_catalog
+            .retain(|item| item.get("key").and_then(Value::as_str) != Some(key));
+        self.publish_locked(&snapshot);
+    }
+
+    async fn apply_source_policy(&self, source: &mut SourceStatus) {
+        if let Some(policy) = self.source_policies.read().await.get(&source.id) {
+            if let Some(enabled) = policy.enabled {
+                source.enabled = enabled;
+            }
+            if let Some(interval_sec) = policy.interval_sec {
+                source.interval_sec = Some(interval_sec);
+            }
+        }
     }
 
     pub async fn set_paused(&self, paused: bool) {
@@ -273,7 +354,7 @@ mod tests {
 
     #[tokio::test]
     async fn source_id_reservation_is_atomic() {
-        let state = SharedState::new();
+        let state = SharedState::new(Default::default());
         let source = SourceStatus {
             id: "shared-id".into(),
             ..Default::default()

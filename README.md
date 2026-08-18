@@ -39,6 +39,8 @@ Agent 是唯一 BLE 主机。React 不使用 Web Bluetooth，不直接访问云�
 | `GET /api/v1/snapshot` | Agent、设备、`source_types[]`、`sources[]` 和日志 |
 | `POST /api/v1/source-types/{id}/refresh` | 刷新某类型的全部实例 |
 | `POST /api/v1/sources/{id}/refresh` | 刷新单个数据源实例 |
+| `PATCH /api/v1/sources/{id}/policy` | 快速启停数据源或设置统一更新周期 |
+| `GET/PUT/DELETE /api/v1/page-presets[/{id}]` | 管理 agent 本地页面预设 |
 | `GET /api/v1/source-types/codex.oauth/sources` | 列出 Codex OAuth 账号 |
 | `POST /api/v1/source-types/codex.oauth/oauth/start` | 创建 OAuth PKCE 授权会话 |
 | `POST /api/v1/source-types/codex.oauth/oauth/complete` | 校验回调 URL、交换 token 并保存账号 |

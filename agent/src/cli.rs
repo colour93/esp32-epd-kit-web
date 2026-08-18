@@ -348,7 +348,14 @@ async fn collect_and_publish(
         update_non_running(state, "unconfigured", config).await;
         return Ok(());
     }
-    if !config.enabled {
+    if !state
+        .snapshot()
+        .await
+        .sources
+        .iter()
+        .find(|source| source.id == config.id)
+        .is_some_and(|source| source.enabled)
+    {
         publish_status(publisher, config, "disabled").await?;
         update_non_running(state, "disabled", config).await;
         return Ok(());
@@ -451,6 +458,7 @@ fn source_status(config: &CliMetricConfig) -> crate::state::SourceStatus {
             config.title.trim().to_owned()
         },
         enabled: config.enabled,
+        interval_sec: Some(POLL_SEC),
         phase: if !config.configured() {
             "unconfigured".into()
         } else if config.enabled {

@@ -38,6 +38,7 @@ enum Command {
     Delete(String, oneshot::Sender<Result<()>>),
     CycleComplete(CycleCompletion),
     Reconcile,
+    Prepare(Vec<String>, oneshot::Sender<Result<()>>),
     Flush(oneshot::Sender<()>),
 }
 
@@ -133,6 +134,28 @@ impl ResourcePublisher {
             .await
             .map_err(|_| anyhow!("publisher flush was cancelled"))
     }
+
+    pub async fn reconcile(&self) -> Result<()> {
+        self.commands
+            .send(Command::Reconcile)
+            .await
+            .map_err(|_| anyhow!("resource publisher stopped"))
+    }
+
+    pub async fn prepare_page(&self, page: &Value) -> Result<()> {
+        let keys = page_resource_keys(page)
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::Prepare(keys, reply))
+            .await
+            .map_err(|_| anyhow!("resource publisher stopped"))?;
+        response
+            .await
+            .map_err(|_| anyhow!("page resource preparation was cancelled"))?
+    }
 }
 
 async fn run(
@@ -146,6 +169,16 @@ async fn run(
     while let Some(command) = commands.recv().await {
         match command {
             Command::Publish(resource, reply) => {
+                let snapshot = state.snapshot().await;
+                let enabled = snapshot
+                    .sources
+                    .iter()
+                    .find(|source| source.id == resource.source_id)
+                    .is_none_or(|source| source.enabled);
+                if !enabled {
+                    let _ = reply.send(Ok(false));
+                    continue;
+                }
                 let payload_hash = match serde_json::to_vec(&resource.payload) {
                     Ok(encoded) => crc32fast::hash(&encoded),
                     Err(error) => {
@@ -163,6 +196,7 @@ async fn run(
                 });
                 entry.resource = resource;
                 entry.payload_hash = payload_hash;
+                state.upsert_catalog_resource(catalog_summary(entry)).await;
                 let result = publish_one(&state, &ble, entry, false).await;
                 let _ = reply.send(result);
             }
@@ -172,6 +206,7 @@ async fn run(
             }
             Command::Delete(key, reply) => {
                 cache.remove(&key);
+                state.remove_catalog_resource(&key).await;
                 pending_deletes.insert(key.clone());
                 match delete_one(&state, &ble, &key).await {
                     Ok(true) => {
@@ -191,6 +226,18 @@ async fn run(
                 let _ = reply.send(Ok(()));
             }
             Command::Reconcile => {
+                let snapshot = state.snapshot().await;
+                let desired = desired_resource_keys(&snapshot.device.config);
+                for key in snapshot
+                    .device
+                    .resources
+                    .iter()
+                    .filter_map(|item| item.get("key").and_then(Value::as_str))
+                {
+                    if !desired.contains(key) {
+                        pending_deletes.insert(key.to_owned());
+                    }
+                }
                 for key in pending_deletes.clone() {
                     match delete_one(&state, &ble, &key).await {
                         Ok(true) => {
@@ -210,12 +257,27 @@ async fn run(
                 }
                 for entry in cache.values_mut() {
                     entry.sent_hash = None;
+                    if !desired.contains(entry.resource.key.as_str()) {
+                        continue;
+                    }
                     if let Err(error) = publish_one(&state, &ble, entry, true).await {
                         state
                             .log("warn", "publisher", format!("reconcile failed: {error:#}"))
                             .await;
                     }
                 }
+            }
+            Command::Prepare(keys, reply) => {
+                let mut result = Ok(());
+                for key in keys {
+                    if let Some(entry) = cache.get_mut(&key) {
+                        if let Err(error) = publish_one(&state, &ble, entry, true).await {
+                            result = Err(error);
+                            break;
+                        }
+                    }
+                }
+                let _ = reply.send(result);
             }
             Command::CycleComplete(completion) => {
                 let _ = completions.send(completion).await;
@@ -278,6 +340,30 @@ async fn publish_one(
         return Ok(false);
     }
     let snapshot = state.snapshot().await;
+    if !force
+        && !desired_resource_keys(&snapshot.device.config).contains(entry.resource.key.as_str())
+    {
+        return Ok(false);
+    }
+    if let Some(source) = snapshot
+        .sources
+        .iter()
+        .find(|source| source.id == entry.resource.source_id)
+    {
+        if !source.enabled {
+            return Ok(false);
+        }
+        if !source.realtime
+            && !force
+            && source.interval_sec.is_some_and(|interval| {
+                entry
+                    .last_write_at
+                    .is_some_and(|last| now.saturating_sub(last) < interval)
+            })
+        {
+            return Ok(false);
+        }
+    }
     let existing =
         snapshot.device.resources.iter().any(|item| {
             item.get("key").and_then(Value::as_str) == Some(entry.resource.key.as_str())
@@ -343,4 +429,39 @@ async fn publish_one(
         )
         .await;
     Ok(true)
+}
+
+fn desired_resource_keys(config: &Option<Value>) -> HashSet<&str> {
+    config
+        .as_ref()
+        .and_then(|config| config.get("page"))
+        .map(page_resource_keys)
+        .unwrap_or_default()
+}
+
+fn page_resource_keys(page: &Value) -> HashSet<&str> {
+    page.get("bindings")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|bindings| bindings.values())
+        .filter_map(|binding| {
+            binding
+                .as_str()
+                .or_else(|| binding.get("resource_key").and_then(Value::as_str))
+        })
+        .filter(|key| !key.is_empty())
+        .collect()
+}
+
+fn catalog_summary(entry: &CachedResource) -> Value {
+    json!({
+        "key": entry.resource.key,
+        "schema_id": entry.resource.schema_id,
+        "schema_version": entry.resource.schema_version,
+        "revision": unix_now(),
+        "updated_at": unix_now(),
+        "ttl_sec": entry.resource.ttl_sec,
+        "persistence": entry.resource.persistence,
+        "content_crc": entry.payload_hash,
+    })
 }

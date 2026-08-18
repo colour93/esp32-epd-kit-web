@@ -85,9 +85,9 @@ export const ResourcesView = ({
       </CardHeader>
       <CardContent className="flex flex-col gap-4 px-0">
         <div className="grid gap-4 px-4 md:grid-cols-2">
-          <Field><FieldLabel>页面</FieldLabel><NativeSelect className="w-full" value={pageId === 'home.three' ? 'home' : pageId} onChange={(event) => onChoosePage(event.target.value)}>{pages.filter((page) => page.id !== 'home.three').map((page) => <NativeSelectOption key={page.id} value={page.id}>{page.title}</NativeSelectOption>)}</NativeSelect></Field>
+          <Field><FieldLabel>页面</FieldLabel><NativeSelect className="w-full" value={pageId.startsWith('home.') ? 'home' : pageId} onChange={(event) => onChoosePage(event.target.value)}>{pages.filter((page) => page.id !== 'home.three' && page.id !== 'home.six').map((page) => <NativeSelectOption key={page.id} value={page.id}>{page.title}</NativeSelectOption>)}</NativeSelect></Field>
           {pageId.startsWith('home') && pages.some((page) => page.id === 'home.three') ? (
-            <Field><FieldLabel>布局</FieldLabel><ToggleGroup value={[pageId]} onValueChange={(value) => value[0] && onChoosePage(value[0])} variant="outline" spacing={0}><ToggleGroupItem value="home"><LayoutGrid />2</ToggleGroupItem><ToggleGroupItem value="home.three"><LayoutGrid />3</ToggleGroupItem></ToggleGroup></Field>
+            <Field><FieldLabel>布局</FieldLabel><ToggleGroup value={[pageId]} onValueChange={(value) => value[0] && onChoosePage(value[0])} variant="outline" spacing={0}><ToggleGroupItem value="home"><LayoutGrid />2</ToggleGroupItem><ToggleGroupItem value="home.three"><LayoutGrid />3</ToggleGroupItem>{pages.some((page) => page.id === 'home.six') ? <ToggleGroupItem value="home.six"><LayoutGrid />2×3</ToggleGroupItem> : null}</ToggleGroup></Field>
           ) : null}
         </div>
         <div className="grid gap-3 border-t px-4 pt-4 md:grid-cols-[1fr_1fr_auto]">

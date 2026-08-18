@@ -48,6 +48,7 @@ export interface PageSlotCapability {
   status: 'active' | 'reserved'
   required: boolean
   widgets?: PageWidgetCapability[]
+  widget_ids?: string[]
   schema_id?: string
   schema_version?: number
 }
@@ -77,6 +78,7 @@ export interface DeviceStatus {
   mtu?: number
   config?: DeviceConfig
   capabilities?: {
+    widgets?: PageWidgetCapability[]
     pages?: PageCapability[]
     battery?: boolean
     io12?: boolean

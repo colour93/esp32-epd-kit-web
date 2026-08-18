@@ -17,6 +17,10 @@ const normalizeBinding = (binding?: PageBinding | string): PageBinding | undefin
   ? typeof binding === 'string' ? { resource_key: binding, widget_id: '' } : binding
   : undefined
 
+const homePreviewLimit = (pageId?: string) => pageId === 'home.six'
+  ? 6
+  : pageId === 'home.three' ? 3 : 2
+
 export const OverviewView = ({ snapshot, config, operation, bucket, onScan, onConnect, onDisconnect, onAutoConnect, onRefresh, onFullRefresh }: {
   snapshot: Snapshot
   config: DeviceConfig | undefined
@@ -54,8 +58,8 @@ export const OverviewView = ({ snapshot, config, operation, bucket, onScan, onCo
           </CardAction>
         </CardHeader>
         <CardContent>
-          <div className="grid gap-3 sm:grid-cols-2">
-            {(config?.page.id.startsWith('home') ? Object.values(config.page.bindings) : []).slice(0, config?.page.id === 'home.three' ? 3 : 2).map((binding, index) => (
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-2 2xl:grid-cols-3">
+            {(config?.page.id.startsWith('home') ? Object.values(config.page.bindings) : []).slice(0, homePreviewLimit(config?.page.id)).map((binding, index) => (
               <HomeWidgetPreview
                 key={index}
                 binding={normalizeBinding(binding)}

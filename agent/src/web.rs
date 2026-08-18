@@ -28,6 +28,7 @@ use crate::{
     },
     http::{HttpMetricControl, HttpMetricInput},
     producer::ProducerRegistry,
+    protocol,
     publisher::ResourcePublisher,
     settings::{PagePreset, SettingsStore, SourcePolicy},
     state::SharedState,
@@ -1227,7 +1228,8 @@ async fn factory_commit(
 
 async fn reload_device(context: &WebContext) -> Result<()> {
     let config = context.ble.request("config.get", json!({})).await?;
-    let capabilities = context.ble.request("capabilities.get", json!({})).await?;
+    let mut capabilities = context.ble.request("capabilities.get", json!({})).await?;
+    protocol::hydrate_capabilities(&mut capabilities);
     let resources = context.ble.request("resource.list", json!({})).await?;
     let bonds = context
         .ble

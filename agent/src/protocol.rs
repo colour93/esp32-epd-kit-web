@@ -2,6 +2,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use crc32fast::hash;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 pub const SERVICE_UUID: uuid::Uuid = uuid::uuid!("f0a40000-0451-4000-b000-000000000001");
@@ -51,6 +52,50 @@ pub struct Event {
     pub name: String,
     #[serde(default)]
     pub data: Value,
+}
+
+pub fn hydrate_capabilities(capabilities: &mut Value) {
+    let catalog: HashMap<String, Value> = capabilities
+        .get("widgets")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|widget| {
+            widget
+                .get("id")
+                .and_then(Value::as_str)
+                .map(|id| (id.to_owned(), widget.clone()))
+        })
+        .collect();
+    if catalog.is_empty() {
+        return;
+    }
+    let Some(pages) = capabilities.get_mut("pages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for page in pages {
+        let Some(slots) = page.get_mut("slots").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for slot in slots {
+            if slot.get("widgets").and_then(Value::as_array).is_some() {
+                continue;
+            }
+            let widget_ids = slot
+                .get("widget_ids")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let widgets = widget_ids
+                .iter()
+                .filter_map(Value::as_str)
+                .filter_map(|id| catalog.get(id).cloned())
+                .collect();
+            if let Some(slot) = slot.as_object_mut() {
+                slot.insert("widgets".into(), Value::Array(widgets));
+            }
+        }
+    }
 }
 
 pub fn encode_request(id: u32, op: &str, args: Value, frame_bytes: usize) -> Result<Vec<Vec<u8>>> {

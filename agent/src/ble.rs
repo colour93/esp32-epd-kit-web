@@ -1196,8 +1196,9 @@ async fn prime_session(
     )
     .await?;
     let config = transact(state, session, device_events, "config.get", json!({})).await?;
-    let capabilities =
+    let mut capabilities =
         transact(state, session, device_events, "capabilities.get", json!({})).await?;
+    protocol::hydrate_capabilities(&mut capabilities);
     let resources = transact(state, session, device_events, "resource.list", json!({})).await?;
     let bonds = transact(
         state,

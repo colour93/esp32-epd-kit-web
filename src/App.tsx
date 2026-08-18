@@ -293,12 +293,13 @@ const App = () => {
       if (slot.status !== 'active') continue
       const widgets = slotWidgets(slot, capability?.id)
       const current = normalizedBinding(config?.page.bindings[slot.id])
-      const layoutDefault = id === 'home.three' ? `generic.metric.value.${slotIndex + 1}` : undefined
+      const compactLayout = id === 'home.three' || id === 'home.six'
+      const layoutDefault = compactLayout ? `generic.metric.value.${slotIndex % 4 + 1}` : undefined
       const widget = widgets.find((item) => item.id === current.widget_id)
         ?? widgets.find((item) => item.id === layoutDefault)
         ?? widgets[0]
       const compatible = compatibleResources(widget, resources)
-      const autoBind = slot.required || id === 'home.three' || (id === 'home' && slot.id === 'primary')
+      const autoBind = slot.required || compactLayout || (id === 'home' && slot.id === 'primary')
       bindings[slot.id] = {
         widget_id: widget?.id ?? '',
         resource_key: compatible.some((resource) => resource.key === current.resource_key)

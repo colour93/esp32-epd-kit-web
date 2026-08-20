@@ -311,6 +311,9 @@ export const agentApi = {
   connectDevice: (transport: TransportKind, id: string, secret?: string) => request('/api/v1/device/connect', {
     method: 'POST', body: JSON.stringify({ transport, id, secret }),
   }),
+  connectLanEndpoint: (endpoint: string, secret?: string) => request('/api/v1/device/connect', {
+    method: 'POST', body: JSON.stringify({ transport: 'lan', endpoint, secret }),
+  }),
   disconnectDevice: () => request('/api/v1/device/disconnect', { method: 'POST', body: '{}' }),
   autoConnectDevice: (transport: TransportKind) => request('/api/v1/device/auto-connect', {
     method: 'POST', body: JSON.stringify({ transport }),

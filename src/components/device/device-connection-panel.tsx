@@ -3,6 +3,7 @@ import {
   BluetoothSearching,
   KeyRound,
   LoaderCircle,
+  Network,
   RefreshCw,
   ScanSearch,
   SignalHigh,
@@ -97,12 +98,13 @@ const CandidateRow = ({ candidate, selected, connecting, disabled, onConnect, on
   </div>
 )
 
-export const DeviceConnectionPanel = ({ device, operation, onTransportChange, onScan, onConnect, onDisconnect, onAutoConnect }: {
+export const DeviceConnectionPanel = ({ device, operation, onTransportChange, onScan, onConnect, onDirectConnect, onDisconnect, onAutoConnect }: {
   device: DeviceStatus
   operation: string | null
   onTransportChange: (transport: TransportKind) => void
   onScan: (transport: TransportKind) => void
   onConnect: (candidate: DeviceCandidate, requestSecret?: boolean) => void
+  onDirectConnect: () => void
   onDisconnect: () => void
   onAutoConnect: (transport: TransportKind) => void
 }) => {
@@ -137,6 +139,12 @@ export const DeviceConnectionPanel = ({ device, operation, onTransportChange, on
           </ToggleGroup>
         </div>
         <div className="flex flex-wrap gap-2">
+          {transport === 'lan' ? (
+            <Button variant="outline" size="sm" disabled={busy || connected || connecting} onClick={onDirectConnect}>
+              <Network data-icon="inline-start" />
+              IP 连接
+            </Button>
+          ) : null}
           <Button variant="outline" size="sm" disabled={busy || connected || connecting} onClick={() => onScan(transport)}>
             <ScanSearch data-icon="inline-start" />
             扫描

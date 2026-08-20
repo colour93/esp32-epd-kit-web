@@ -41,7 +41,7 @@ Agent 是唯一设备主机，BLE 与 LAN 会话互斥。React 不使用 Web Blu
 |---|---|
 | `GET /api/v1/snapshot` | Agent、设备、`source_types[]`、`sources[]` 和日志 |
 | `POST /api/v1/device/scan` | 按 `{transport: "ble" | "lan"}` 扫描设备 |
-| `POST /api/v1/device/connect` | 按 `{transport, id, secret?}` 连接；`secret` 仅用于首次 LAN 连接 |
+| `POST /api/v1/device/connect` | 按 `{transport, id, secret?}` 连接发现结果，或按 `{transport: "lan", endpoint, secret?}` 直接连接 IP |
 | `POST /api/v1/device/auto-connect` | 按 `{transport}` 自动连接已保存设备 |
 | `POST /api/v1/device/disconnect` | 停止当前 BLE 或 LAN 会话 |
 | `POST /api/v1/source-types/{id}/refresh` | 刷新某类型的全部实例 |
@@ -63,6 +63,10 @@ Agent 是唯一设备主机，BLE 与 LAN 会话互斥。React 不使用 Web Blu
 | `POST /api/v1/device/refresh` | 屏幕 auto/full 刷新 |
 
 生产端口为 `38473`；可用 `--port` 或 `EPD_AGENT_PORT` 修改。服务只监听 loopback。
+
+LAN 连接支持 mDNS 发现和私有 IP 直连。`endpoint` 可写为 `192.168.1.50` 或 `192.168.1.50:38474`；省略端口时使用 `38474`。直连时 Agent 从设备认证 greeting 获取稳定 device ID，优先读取系统凭据库中已保存的设备密钥，首次连接才需要提交 `secret`。
+
+Agent 将上次活动传输保存在 `device-transport.json`，将成功连接的 LAN 目标保存在 `lan-target.json`。重启后会自动启动上次使用的 BLE/LAN 传输并恢复目标；从没有传输记录的旧版本升级时，会比较已有 BLE/LAN 目标文件的修改时间，选择最近使用的目标。
 
 ## 开发
 

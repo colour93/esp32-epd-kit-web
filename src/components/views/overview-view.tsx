@@ -21,7 +21,7 @@ const homePreviewLimit = (pageId?: string) => pageId === 'home.six'
   ? 6
   : pageId === 'home.three' ? 3 : 2
 
-export const OverviewView = ({ snapshot, config, operation, bucket, onTransportChange, onScan, onConnect, onDisconnect, onAutoConnect, onRefresh, onFullRefresh }: {
+export const OverviewView = ({ snapshot, config, operation, bucket, onTransportChange, onScan, onConnect, onDirectConnect, onDisconnect, onAutoConnect, onRefresh, onFullRefresh }: {
   snapshot: Snapshot
   config: DeviceConfig | undefined
   operation: string | null
@@ -29,6 +29,7 @@ export const OverviewView = ({ snapshot, config, operation, bucket, onTransportC
   onTransportChange: (transport: TransportKind) => void
   onScan: (transport: TransportKind) => void
   onConnect: (candidate: DeviceCandidate, requestSecret?: boolean) => void
+  onDirectConnect: () => void
   onDisconnect: () => void
   onAutoConnect: (transport: TransportKind) => void
   onRefresh: () => void
@@ -41,6 +42,7 @@ export const OverviewView = ({ snapshot, config, operation, bucket, onTransportC
       onTransportChange={onTransportChange}
       onScan={onScan}
       onConnect={onConnect}
+      onDirectConnect={onDirectConnect}
       onDisconnect={onDisconnect}
       onAutoConnect={onAutoConnect}
     />

@@ -1,9 +1,12 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicU8, Ordering},
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+    },
 };
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::broadcast;
@@ -56,15 +59,17 @@ pub struct DeviceGateway {
 
 impl DeviceGateway {
     pub fn spawn(state: Arc<SharedState>) -> Self {
-        let ble = BleGateway::spawn(state.clone());
-        let lan = LanGateway::spawn(state.clone());
+        let active_transport = load_active_transport().unwrap_or_default();
+        let _ = save_active_transport(active_transport);
+        let ble = BleGateway::spawn(state.clone(), active_transport == TransportKind::Ble);
+        let lan = LanGateway::spawn(state.clone(), active_transport == TransportKind::Lan);
         let (device_events, _) = broadcast::channel(64);
         relay_events(ble.subscribe(), device_events.clone());
         relay_events(lan.subscribe(), device_events.clone());
         Self {
             ble,
             lan,
-            active: Arc::new(AtomicU8::new(TransportKind::Ble.code())),
+            active: Arc::new(AtomicU8::new(active_transport.code())),
             device_events,
             state,
         }
@@ -104,18 +109,35 @@ impl DeviceGateway {
     pub async fn connect_device(
         &self,
         transport: TransportKind,
-        id: String,
+        id: Option<String>,
+        endpoint: Option<String>,
         secret: Option<String>,
     ) -> Result<()> {
         self.activate(transport).await;
         match transport {
             TransportKind::Ble => {
-                if secret.is_some() {
-                    bail!("BLE connection does not accept a LAN device key");
+                if secret.is_some() || endpoint.is_some() {
+                    bail!("BLE connection does not accept LAN connection fields");
                 }
-                self.ble.connect_device(id).await
+                self.ble
+                    .connect_device(id.ok_or_else(|| anyhow!("BLE device id is required"))?)
+                    .await
             }
-            TransportKind::Lan => self.lan.connect_device(id, secret).await,
+            TransportKind::Lan => {
+                if let Some(endpoint) = endpoint {
+                    if id.is_some() {
+                        bail!("LAN connection must specify either id or endpoint, not both");
+                    }
+                    self.lan.connect_endpoint(endpoint, secret).await
+                } else {
+                    self.lan
+                        .connect_device(
+                            id.ok_or_else(|| anyhow!("LAN device id or endpoint is required"))?,
+                            secret,
+                        )
+                        .await
+                }
+            }
         }
     }
 
@@ -155,6 +177,15 @@ impl DeviceGateway {
             TransportKind::Lan => self.lan.disconnect().await,
         }
         self.active.store(transport.code(), Ordering::Release);
+        if let Err(error) = save_active_transport(transport) {
+            self.state
+                .log(
+                    "warn",
+                    "gateway",
+                    format!("cannot save active transport: {error:#}"),
+                )
+                .await;
+        }
         self.state
             .update_device(|device| {
                 device.transport = transport.as_str().into();
@@ -177,6 +208,41 @@ impl DeviceGateway {
             )
             .await;
     }
+}
+
+fn transport_path() -> Result<PathBuf> {
+    let directory = dirs::config_dir()
+        .ok_or_else(|| anyhow!("config directory unavailable"))?
+        .join("epd-agent");
+    std::fs::create_dir_all(&directory).context("create agent config directory")?;
+    Ok(directory.join("device-transport.json"))
+}
+
+fn load_active_transport() -> Result<TransportKind> {
+    let path = transport_path()?;
+    if !path.exists() {
+        let directory = path
+            .parent()
+            .ok_or_else(|| anyhow!("device transport path has no parent"))?;
+        let modified = |name: &str| {
+            std::fs::metadata(directory.join(name))
+                .and_then(|metadata| metadata.modified())
+                .ok()
+        };
+        return Ok(
+            match (modified("ble-target.json"), modified("lan-target.json")) {
+                (None, Some(_)) => TransportKind::Lan,
+                (Some(ble), Some(lan)) if lan > ble => TransportKind::Lan,
+                _ => TransportKind::Ble,
+            },
+        );
+    }
+    serde_json::from_slice(&std::fs::read(path)?).context("decode active device transport")
+}
+
+fn save_active_transport(transport: TransportKind) -> Result<()> {
+    let path = transport_path()?;
+    std::fs::write(path, serde_json::to_vec(&transport)?).context("write active device transport")
 }
 
 fn relay_events(mut source: broadcast::Receiver<String>, destination: broadcast::Sender<String>) {

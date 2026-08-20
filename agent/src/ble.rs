@@ -223,9 +223,14 @@ fn validate_pairing_pin(pin: &str) -> Result<()> {
 }
 
 impl BleGateway {
-    pub fn spawn(state: Arc<SharedState>) -> Self {
+    pub fn spawn(state: Arc<SharedState>, auto_connect: bool) -> Self {
         let (commands, receiver) = mpsc::channel(32);
-        let (intent, intent_receiver) = watch::channel(ConnectionIntent::Auto);
+        let initial_intent = if auto_connect {
+            ConnectionIntent::Auto
+        } else {
+            ConnectionIntent::Idle
+        };
+        let (intent, intent_receiver) = watch::channel(initial_intent);
         let (device_events, _) = broadcast::channel(32);
         let connected = Arc::new(AtomicBool::new(false));
         let pairing = PairingBroker::new(state.clone());

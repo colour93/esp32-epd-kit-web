@@ -273,7 +273,8 @@ async fn device_scan(
 struct DeviceConnectInput {
     #[serde(default)]
     transport: TransportKind,
-    id: String,
+    id: Option<String>,
+    endpoint: Option<String>,
     secret: Option<String>,
 }
 
@@ -291,7 +292,7 @@ async fn device_connect(
     mutation_auth(&context, &headers)?;
     context
         .gateway
-        .connect_device(input.transport, input.id, input.secret)
+        .connect_device(input.transport, input.id, input.endpoint, input.secret)
         .await
         .map_err(ApiError::internal)?;
     Ok(Json(json!({ "ok": true })))

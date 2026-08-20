@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    net::{Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -34,6 +34,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(18);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_FRAME_BYTES: usize = 2048;
+const DEFAULT_PORT: u16 = 38474;
 const SECRET_SERVICE: &str = "dev.epd-kit.agent.lan-device";
 
 type HmacSha256 = Hmac<Sha256>;
@@ -52,11 +53,24 @@ pub struct LanTarget {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct DirectTarget {
+    endpoint: SocketAddr,
+    secret: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum ConnectionIntent {
     Auto,
     Scan,
     Manual(LanTarget),
+    Direct(DirectTarget),
     Idle,
+}
+
+struct ConnectionAttempt {
+    target: LanTarget,
+    expected_device_id: Option<String>,
+    bootstrap_secret: Option<String>,
 }
 
 #[derive(Clone)]
@@ -69,9 +83,14 @@ pub struct LanGateway {
 }
 
 impl LanGateway {
-    pub fn spawn(state: Arc<SharedState>) -> Self {
+    pub fn spawn(state: Arc<SharedState>, auto_connect: bool) -> Self {
         let (commands, receiver) = mpsc::channel(32);
-        let (intent, intent_receiver) = watch::channel(ConnectionIntent::Idle);
+        let initial_intent = if auto_connect {
+            ConnectionIntent::Auto
+        } else {
+            ConnectionIntent::Idle
+        };
+        let (intent, intent_receiver) = watch::channel(initial_intent);
         let (device_events, _) = broadcast::channel(32);
         let connected = Arc::new(AtomicBool::new(false));
         let gateway = Self {
@@ -183,6 +202,36 @@ impl LanGateway {
                 "info",
                 "lan",
                 format!("manual LAN connection requested for {}", target.id),
+            )
+            .await;
+        Ok(())
+    }
+
+    pub async fn connect_endpoint(&self, endpoint: String, secret: Option<String>) -> Result<()> {
+        let endpoint = parse_endpoint(&endpoint)?;
+        let secret = secret
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        if let Some(secret) = secret.as_deref() {
+            validate_secret(secret)?;
+        }
+        self.state
+            .update_device(|device| {
+                device.phase = "connecting".into();
+                device.transport = "lan".into();
+                device.connection_mode = "manual".into();
+                device.selected_device_id = None;
+                device.name = Some(endpoint.to_string());
+                device.last_error = None;
+            })
+            .await;
+        self.intent
+            .send_replace(ConnectionIntent::Direct(DirectTarget { endpoint, secret }));
+        self.state
+            .log(
+                "info",
+                "lan",
+                format!("direct LAN connection requested for {endpoint}"),
             )
             .await;
         Ok(())
@@ -329,9 +378,26 @@ async fn supervisor(
             continue;
         }
 
-        let target = match &desired {
-            ConnectionIntent::Manual(target) => Some(target.clone()),
-            ConnectionIntent::Auto => preferred_target.clone(),
+        let attempt = match &desired {
+            ConnectionIntent::Manual(target) => Some(ConnectionAttempt {
+                target: target.clone(),
+                expected_device_id: Some(target.id.clone()),
+                bootstrap_secret: None,
+            }),
+            ConnectionIntent::Direct(target) => Some(ConnectionAttempt {
+                target: LanTarget {
+                    id: String::new(),
+                    name: target.endpoint.to_string(),
+                    endpoint: target.endpoint,
+                },
+                expected_device_id: None,
+                bootstrap_secret: target.secret.clone(),
+            }),
+            ConnectionIntent::Auto => preferred_target.clone().map(|target| ConnectionAttempt {
+                expected_device_id: Some(target.id.clone()),
+                target,
+                bootstrap_secret: None,
+            }),
             ConnectionIntent::Scan => {
                 match discover(&state, &desired, None, &mut intent).await {
                     Ok(_) => {}
@@ -357,8 +423,8 @@ async fn supervisor(
             }
             ConnectionIntent::Idle => None,
         };
-        let target = match target {
-            Some(target) => target,
+        let attempt = match attempt {
+            Some(attempt) => attempt,
             None => match discover(
                 &state,
                 &desired,
@@ -367,7 +433,11 @@ async fn supervisor(
             )
             .await
             {
-                Ok(Some(target)) => target,
+                Ok(Some(target)) => ConnectionAttempt {
+                    expected_device_id: Some(target.id.clone()),
+                    target,
+                    bootstrap_secret: None,
+                },
                 Ok(None) => continue,
                 Err(error) => {
                     state
@@ -386,7 +456,7 @@ async fn supervisor(
         };
 
         let connection = tokio::select! {
-            result = connect(&state, &target) => Some(result),
+            result = connect(&state, &attempt) => Some(result),
             changed = intent.changed() => {
                 if changed.is_err() { return; }
                 None
@@ -542,13 +612,25 @@ async fn supervisor(
                     } else {
                         "reconnecting".into()
                     };
+                    device.connection_mode = match next {
+                        ConnectionIntent::Idle => "idle",
+                        ConnectionIntent::Auto => "auto",
+                        ConnectionIntent::Scan => "scan",
+                        ConnectionIntent::Manual(_) | ConnectionIntent::Direct(_) => "manual",
+                    }
+                    .into();
                     device.role = None;
                     device.firmware = None;
                     device.mtu = None;
                 }
             })
             .await;
-        if !control_changed && matches!(next, ConnectionIntent::Manual(_)) {
+        if !control_changed
+            && matches!(
+                next,
+                ConnectionIntent::Manual(_) | ConnectionIntent::Direct(_)
+            )
+        {
             intent_sender.send_replace(ConnectionIntent::Auto);
             intent.borrow_and_update();
         }
@@ -575,7 +657,7 @@ async fn discover(
             device.connection_mode = match desired {
                 ConnectionIntent::Auto => "auto",
                 ConnectionIntent::Scan => "scan",
-                ConnectionIntent::Manual(_) => "manual",
+                ConnectionIntent::Manual(_) | ConnectionIntent::Direct(_) => "manual",
                 ConnectionIntent::Idle => "idle",
             }
             .into();
@@ -687,7 +769,8 @@ fn preferred_ipv4(addresses: std::collections::HashSet<Ipv4Addr>) -> Option<Ipv4
     addresses.into_iter().next()
 }
 
-async fn connect(state: &SharedState, target: &LanTarget) -> Result<LanSession> {
+async fn connect(state: &SharedState, attempt: &ConnectionAttempt) -> Result<LanSession> {
+    let target = &attempt.target;
     state
         .update_device(|device| {
             if device.transport == "lan" {
@@ -718,11 +801,20 @@ async fn connect(state: &SharedState, target: &LanTarget) -> Result<LanSession> 
         next_id: AtomicU32::new(1),
         frame_bytes: 1024,
     };
-    authenticate(&mut session).await?;
+    authenticate(
+        &mut session,
+        attempt.expected_device_id.as_deref(),
+        attempt.bootstrap_secret.as_deref(),
+    )
+    .await?;
     Ok(session)
 }
 
-async fn authenticate(session: &mut LanSession) -> Result<()> {
+async fn authenticate(
+    session: &mut LanSession,
+    expected_device_id: Option<&str>,
+    bootstrap_secret: Option<&str>,
+) -> Result<()> {
     let greeting = tokio::time::timeout(CONNECT_TIMEOUT, read_line(&mut session.stream))
         .await
         .map_err(|_| rpc::link_error("LAN authentication greeting timed out"))??;
@@ -736,18 +828,25 @@ async fn authenticate(session: &mut LanSession) -> Result<()> {
     let nonce = parts
         .next()
         .ok_or_else(|| anyhow!("LAN authentication greeting has no nonce"))?;
+    validate_device_id(device_id).context("LAN device sent an invalid authentication device id")?;
     if !is_hex_with_length(nonce, 32) {
         bail!("LAN device sent an invalid authentication nonce");
     }
     if parts.next().is_some() {
         bail!("LAN device sent an invalid authentication greeting");
     }
-    if device_id != session.device_id {
-        bail!("LAN device identity does not match mDNS discovery");
+    if expected_device_id.is_some_and(|expected| device_id != expected) {
+        bail!("LAN device identity does not match the selected device");
     }
-    let secret = credential_get(device_id.to_owned())
-        .await?
-        .ok_or_else(|| anyhow!("LAN device key is not configured"))?;
+    let secret = match bootstrap_secret {
+        Some(secret) => {
+            validate_secret(secret)?;
+            secret.to_owned()
+        }
+        None => credential_get(device_id.to_owned())
+            .await?
+            .ok_or_else(|| anyhow!("LAN device key is not configured"))?,
+    };
     let digest = authentication_digest(&secret, device_id, nonce)?;
     session
         .stream
@@ -766,6 +865,10 @@ async fn authenticate(session: &mut LanSession) -> Result<()> {
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(1024)
         .clamp(20, MAX_FRAME_BYTES);
+    session.device_id = device_id.to_owned();
+    if bootstrap_secret.is_some() {
+        credential_set(session.device_id.clone(), secret).await?;
+    }
     Ok(())
 }
 
@@ -867,6 +970,7 @@ async fn prime_session(
             device.phase = "connected".into();
             device.transport = "lan".into();
             device.name = Some(session.device_name.clone());
+            device.selected_device_id = Some(session.device_id.clone());
             device.role = hello.get("role").and_then(Value::as_str).map(str::to_owned);
             device.firmware = hello
                 .get("firmware")
@@ -895,6 +999,37 @@ async fn prime_session(
 fn chrono_offset() -> i16 {
     use chrono::Offset;
     (chrono::Local::now().offset().fix().local_minus_utc() / 60) as i16
+}
+
+fn parse_endpoint(value: &str) -> Result<SocketAddr> {
+    let value = value.trim();
+    if value.is_empty() {
+        bail!("LAN IP address is required");
+    }
+    let endpoint = match value.parse::<SocketAddr>() {
+        Ok(endpoint) => endpoint,
+        Err(_) => SocketAddr::new(
+            value
+                .parse::<IpAddr>()
+                .context("LAN endpoint must be an IP address with an optional port")?,
+            DEFAULT_PORT,
+        ),
+    };
+    if endpoint.port() == 0 {
+        bail!("LAN endpoint port must be between 1 and 65535");
+    }
+    let local = match endpoint.ip() {
+        IpAddr::V4(address) => {
+            address.is_private() || address.is_link_local() || address.is_loopback()
+        }
+        IpAddr::V6(address) => {
+            address.is_unique_local() || address.is_unicast_link_local() || address.is_loopback()
+        }
+    };
+    if !local {
+        bail!("LAN endpoint must use a private, link-local, or loopback IP address");
+    }
+    Ok(endpoint)
 }
 
 fn validate_secret(secret: &str) -> Result<()> {
@@ -1004,7 +1139,9 @@ fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{authentication_digest, decode_hex, validate_device_id, validate_secret};
+    use super::{
+        authentication_digest, decode_hex, parse_endpoint, validate_device_id, validate_secret,
+    };
 
     #[test]
     fn device_key_must_be_32_hex_bytes() {
@@ -1029,5 +1166,19 @@ mod tests {
             digest,
             "e3baf020fdcce5a13ed9836d3cc02de150db4cd7c4ad9974c14f17308c960004"
         );
+    }
+
+    #[test]
+    fn direct_endpoint_defaults_to_protocol_port_and_stays_local() {
+        assert_eq!(
+            parse_endpoint("192.168.1.42").unwrap().to_string(),
+            "192.168.1.42:38474"
+        );
+        assert_eq!(
+            parse_endpoint("10.0.0.8:40000").unwrap().to_string(),
+            "10.0.0.8:40000"
+        );
+        assert!(parse_endpoint("8.8.8.8").is_err());
+        assert!(parse_endpoint("epd-kit.local").is_err());
     }
 }

@@ -1,5 +1,5 @@
 import { useEffect, useEffectEvent, useMemo, useRef, useState } from 'react'
-import { KeyRound, LoaderCircle } from 'lucide-react'
+import { KeyRound, LoaderCircle, Network } from 'lucide-react'
 import { Toaster, toast } from 'sonner'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
@@ -13,7 +13,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import { Field, FieldLabel } from '@/components/ui/field'
+import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
 import { DashboardShell, type View } from '@/components/dashboard/dashboard-shell'
@@ -151,6 +151,9 @@ const App = () => {
   const [pairingPin, setPairingPin] = useState('')
   const [lanCandidate, setLanCandidate] = useState<DeviceCandidate | null>(null)
   const [lanDeviceKey, setLanDeviceKey] = useState('')
+  const [lanEndpointOpen, setLanEndpointOpen] = useState(false)
+  const [lanEndpoint, setLanEndpoint] = useState('')
+  const [lanEndpointKey, setLanEndpointKey] = useState('')
   const [logLevel, setLogLevel] = useState<LogLevel>('all')
   const [logScope, setLogScope] = useState('all')
   const [followLogs, setFollowLogs] = useState(true)
@@ -383,6 +386,29 @@ const App = () => {
     setLanDeviceKey('')
   }
 
+  const submitLanEndpoint = async () => {
+    const endpoint = lanEndpoint.trim()
+    const key = lanEndpointKey.trim()
+    if (!endpoint || (key.length > 0 && !/^[0-9a-fA-F]{64}$/.test(key))) return
+    const connected = await perform(
+      'device.connect:lan:endpoint',
+      () => agentApi.connectLanEndpoint(endpoint, key ? key.toLowerCase() : undefined),
+      `正在连接 ${endpoint}`,
+    )
+    if (connected) {
+      setLanEndpointOpen(false)
+      setLanEndpoint('')
+      setLanEndpointKey('')
+    }
+  }
+
+  const closeLanEndpoint = () => {
+    if (operation) return
+    setLanEndpointOpen(false)
+    setLanEndpoint('')
+    setLanEndpointKey('')
+  }
+
   const changeTransport = (transport: TransportKind) => {
     scanDevices(transport)
   }
@@ -473,6 +499,7 @@ const App = () => {
             onTransportChange={changeTransport}
             onScan={scanDevices}
             onConnect={connectDevice}
+            onDirectConnect={() => setLanEndpointOpen(true)}
             onDisconnect={disconnectDevice}
             onAutoConnect={autoConnectDevice}
             onRefresh={() => void perform('refresh.auto', () => agentApi.refreshDisplay('auto'), '已刷新')}
@@ -613,6 +640,61 @@ const App = () => {
             <Button disabled={lanDeviceKey.length !== 64 || Boolean(operation)} onClick={() => void submitLanDeviceKey()}>
               {operation?.startsWith('device.connect:lan:') ? <LoaderCircle className="animate-spin" data-icon="inline-start" /> : <KeyRound data-icon="inline-start" />}
               保存并连接
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={lanEndpointOpen} onOpenChange={(open) => { if (!open) closeLanEndpoint() }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>通过 IP 连接</DialogTitle>
+            <DialogDescription>
+              直接连接设备的局域网 IP。省略端口时使用 <code className="font-mono">38474</code>；首次连接需要设备密钥。
+            </DialogDescription>
+          </DialogHeader>
+          <FieldGroup>
+            <Field>
+              <FieldLabel htmlFor="lan-endpoint">设备 IP</FieldLabel>
+              <Input
+                id="lan-endpoint"
+                autoFocus
+                autoComplete="off"
+                spellCheck={false}
+                value={lanEndpoint}
+                onChange={(event) => setLanEndpoint(event.target.value)}
+                onKeyDown={(event) => { if (event.key === 'Enter') void submitLanEndpoint() }}
+                placeholder="192.168.1.50 或 192.168.1.50:38474"
+                className="font-mono"
+              />
+              <FieldDescription>仅允许私有、链路本地或回环 IP 地址。</FieldDescription>
+            </Field>
+            <Field data-invalid={lanEndpointKey.length > 0 && lanEndpointKey.length !== 64}>
+              <FieldLabel htmlFor="lan-endpoint-key">设备密钥（可选）</FieldLabel>
+              <Input
+                id="lan-endpoint-key"
+                autoComplete="off"
+                aria-invalid={lanEndpointKey.length > 0 && lanEndpointKey.length !== 64}
+                maxLength={64}
+                spellCheck={false}
+                value={lanEndpointKey}
+                onChange={(event) => setLanEndpointKey(event.target.value.replace(/[^0-9a-f]/gi, '').slice(0, 64))}
+                onKeyDown={(event) => { if (event.key === 'Enter') void submitLanEndpoint() }}
+                placeholder="已保存过该设备时可留空"
+                className="font-mono"
+              />
+              <FieldDescription>可从设备串口的 <code className="font-mono">wifi key</code> 输出获取。</FieldDescription>
+              {lanEndpointKey.length > 0 && lanEndpointKey.length !== 64 ? <FieldError>设备密钥必须为 64 位十六进制字符。</FieldError> : null}
+            </Field>
+          </FieldGroup>
+          <DialogFooter>
+            <Button variant="outline" disabled={Boolean(operation)} onClick={closeLanEndpoint}>取消</Button>
+            <Button
+              disabled={!lanEndpoint.trim() || (lanEndpointKey.length > 0 && lanEndpointKey.length !== 64) || Boolean(operation)}
+              onClick={() => void submitLanEndpoint()}
+            >
+              {operation === 'device.connect:lan:endpoint' ? <LoaderCircle className="animate-spin" data-icon="inline-start" /> : <Network data-icon="inline-start" />}
+              连接
             </Button>
           </DialogFooter>
         </DialogContent>

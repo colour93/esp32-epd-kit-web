@@ -1,16 +1,16 @@
 # EPD Agent 与设备工作台
 
-Rust Agent `0.2.x` 与内嵌 React 工作台，为 ESP32 E-Paper BLE Protocol v4 提供数据源、设备同步和本地管理。
+Rust Agent `0.2.x` 与内嵌 React 工作台，通过 BLE 或本地 WiFi 为 ESP32 E-Paper Protocol v4 提供数据源、设备同步和本地管理。
 
 ```text
-Browser -> 127.0.0.1 HTTP/SSE -> Rust Agent -> BLE v4 -> ESP32
-                                      |
+Browser -> 127.0.0.1 HTTP/SSE -> Rust Agent -> DeviceGateway -> BLE ----+
+                                      |                    -> LAN/TCP -+-> ESP32
                                       +-> Producer Registry
                                            -> ResourcePublisher
                                            -> SyncCoordinator
 ```
 
-Agent 是唯一 BLE 主机。React 不使用 Web Bluetooth，不直接访问云服务。数据源分为两层：`source_types[]` 是静态能力目录，`sources[]` 是具有独立 ID、配置、状态和资源键的实例。Codex 可通过本机 `codex app-server` 读取现有登录，也可用独立 OAuth 多账号直接采集并自动维护 token；CC Switch 内置源从本机数据库只读统计今日 Token；`cli.jmespath` 与 `http.jmespath` 可创建多个实例，把 CLI 或 HTTP JSON 分别投影为通用指标；`platform.balance` 独立查询 DeepSeek 与 Moonshot（Kimi）余额。
+Agent 是唯一设备主机，BLE 与 LAN 会话互斥。React 不使用 Web Bluetooth、不持有 LAN 设备密钥，也不直接访问云服务。数据源分为两层：`source_types[]` 是静态能力目录，`sources[]` 是具有独立 ID、配置、状态和资源键的实例。Codex 可通过本机 `codex app-server` 读取现有登录，也可用独立 OAuth 多账号直接采集并自动维护 token；CC Switch 内置源从本机数据库只读统计今日 Token；`cli.jmespath` 与 `http.jmespath` 可创建多个实例，把 CLI 或 HTTP JSON 分别投影为通用指标；`platform.balance` 独立查询 DeepSeek 与 Moonshot（Kimi）余额。
 
 ## 核心模块
 
@@ -24,7 +24,10 @@ Agent 是唯一 BLE 主机。React 不使用 Web Bluetooth，不直接访问云�
 - `agent/src/http.rs`：多实例 HTTP JSON 数据源、网络边界和系统凭据；
 - `agent/src/balance.rs`：DeepSeek、Moonshot 等平台余额数据源；
 - `agent/src/metrics.rs`：CLI/HTTP 共用的 JMESPath 校验与 `generic.metrics/v1` 投影；
-- `agent/src/ble.rs`：v4 扫描、重新配对、分帧、RPC 和重连；
+- `agent/src/gateway.rs`：业务层共用的设备网关、活动传输切换和事件汇聚；
+- `agent/src/rpc.rs`：BLE/LAN 共用的 v4 request、response assembly 与事件分发；
+- `agent/src/ble.rs`：BLE 扫描、系统配对、frame channel 和重连；
+- `agent/src/lan.rs`：mDNS 发现、TCP/HMAC 认证、系统凭据与重连；
 - `agent/src/web.rs`：loopback Axum API、SSE、本地 session 与静态资源；
 - `src/App.tsx`：动态 Page/Binding、Resource JSON、数据源类型与实例、安全和诊断界面。
 
@@ -37,6 +40,10 @@ Agent 是唯一 BLE 主机。React 不使用 Web Bluetooth，不直接访问云�
 | Route | 用途 |
 |---|---|
 | `GET /api/v1/snapshot` | Agent、设备、`source_types[]`、`sources[]` 和日志 |
+| `POST /api/v1/device/scan` | 按 `{transport: "ble" | "lan"}` 扫描设备 |
+| `POST /api/v1/device/connect` | 按 `{transport, id, secret?}` 连接；`secret` 仅用于首次 LAN 连接 |
+| `POST /api/v1/device/auto-connect` | 按 `{transport}` 自动连接已保存设备 |
+| `POST /api/v1/device/disconnect` | 停止当前 BLE 或 LAN 会话 |
 | `POST /api/v1/source-types/{id}/refresh` | 刷新某类型的全部实例 |
 | `POST /api/v1/sources/{id}/refresh` | 刷新单个数据源实例 |
 | `PATCH /api/v1/sources/{id}/policy` | 快速启停数据源或设置统一更新周期 |
@@ -103,9 +110,10 @@ bun run package:agent
 - mutation 校验 loopback Origin；
 - installation secret 保存于用户配置目录的私有文件；
 - URL fragment 一次性交换 `HttpOnly; SameSite=Strict` cookie；
-- HTTP source 密钥与 Codex OAuth token 只存系统凭据库，不进入配置文件、浏览器响应或 ESP32；
-- 浏览器无 BLE、Codex stdio 或云凭据访问能力。
+- HTTP source 密钥、Codex OAuth token 与 LAN 设备密钥只存系统凭据库，不进入普通配置文件或浏览器响应；
+- LAN 使用每台设备独立的 32 字节密钥进行 HMAC-SHA256 challenge-response，明文密钥只经 loopback 首次提交；
+- 浏览器无 BLE、LAN socket、Codex stdio 或云凭据访问能力。
 
-协议与数据契约见 [BLE Protocol v4](../esp32-epd-kit/docs/ble_protocol_v4.md)、[v4 架构](../esp32-epd-kit/docs/architecture_v4.md)、[Codex schema](../esp32-epd-kit/docs/openai_codex_usage.md)、[HTTP 数据源](../esp32-epd-kit/docs/generic_http.md)和 [CC Switch 今日用量源](docs/cc_switch_usage.md)。
+协议与数据契约见 [BLE Protocol v4](../esp32-epd-kit/docs/ble_protocol_v4.md)、[LAN Transport v4](../esp32-epd-kit/docs/lan_transport_v4.md)、[v4 架构](../esp32-epd-kit/docs/architecture_v4.md)、[Codex schema](../esp32-epd-kit/docs/openai_codex_usage.md)、[HTTP 数据源](../esp32-epd-kit/docs/generic_http.md)和 [CC Switch 今日用量源](docs/cc_switch_usage.md)。
 
 设备通过物理串口执行 `setup` 后会广播 setup 标志 120 秒。Windows 若保留了设备端已经丢失的旧配对，Agent 会在该窗口内首次安全握手失败后清除本机旧记录并重新触发系统配对；正常重连不会清除 bond。

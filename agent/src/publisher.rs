@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
-    ble::BleGateway,
+    gateway::DeviceGateway,
     state::{SharedState, unix_now},
 };
 
@@ -57,17 +57,17 @@ pub struct ResourcePublisher {
 impl ResourcePublisher {
     pub fn spawn(
         state: Arc<SharedState>,
-        ble: BleGateway,
+        gateway: DeviceGateway,
         completions: mpsc::Sender<CycleCompletion>,
     ) -> Self {
         let (commands, receiver) = mpsc::channel(32);
         let publisher = Self { commands };
-        tokio::spawn(run(state, ble.clone(), completions, receiver));
-        let mut events = ble.subscribe();
+        tokio::spawn(run(state, gateway.clone(), completions, receiver));
+        let mut events = gateway.subscribe();
         let reconcile = publisher.clone();
         tokio::spawn(async move {
             while let Ok(event) = events.recv().await {
-                if event == "ble.connected" {
+                if event == "device.connected" {
                     let _ = reconcile.commands.send(Command::Reconcile).await;
                 }
             }
@@ -160,7 +160,7 @@ impl ResourcePublisher {
 
 async fn run(
     state: Arc<SharedState>,
-    ble: BleGateway,
+    gateway: DeviceGateway,
     completions: mpsc::Sender<CycleCompletion>,
     mut commands: mpsc::Receiver<Command>,
 ) {
@@ -197,7 +197,7 @@ async fn run(
                 entry.resource = resource;
                 entry.payload_hash = payload_hash;
                 state.upsert_catalog_resource(catalog_summary(entry)).await;
-                let result = publish_one(&state, &ble, entry, false).await;
+                let result = publish_one(&state, &gateway, entry, false).await;
                 let _ = reply.send(result);
             }
             Command::Get(key, reply) => {
@@ -208,7 +208,7 @@ async fn run(
                 cache.remove(&key);
                 state.remove_catalog_resource(&key).await;
                 pending_deletes.insert(key.clone());
-                match delete_one(&state, &ble, &key).await {
+                match delete_one(&state, &gateway, &key).await {
                     Ok(true) => {
                         pending_deletes.remove(&key);
                     }
@@ -239,7 +239,7 @@ async fn run(
                     }
                 }
                 for key in pending_deletes.clone() {
-                    match delete_one(&state, &ble, &key).await {
+                    match delete_one(&state, &gateway, &key).await {
                         Ok(true) => {
                             pending_deletes.remove(&key);
                         }
@@ -260,7 +260,7 @@ async fn run(
                     if !desired.contains(entry.resource.key.as_str()) {
                         continue;
                     }
-                    if let Err(error) = publish_one(&state, &ble, entry, true).await {
+                    if let Err(error) = publish_one(&state, &gateway, entry, true).await {
                         state
                             .log("warn", "publisher", format!("reconcile failed: {error:#}"))
                             .await;
@@ -271,7 +271,7 @@ async fn run(
                 let mut result = Ok(());
                 for key in keys {
                     if let Some(entry) = cache.get_mut(&key) {
-                        if let Err(error) = publish_one(&state, &ble, entry, true).await {
+                        if let Err(error) = publish_one(&state, &gateway, entry, true).await {
                             result = Err(error);
                             break;
                         }
@@ -289,8 +289,8 @@ async fn run(
     }
 }
 
-async fn delete_one(state: &SharedState, ble: &BleGateway, key: &str) -> Result<bool> {
-    if !ble.is_connected() {
+async fn delete_one(state: &SharedState, gateway: &DeviceGateway, key: &str) -> Result<bool> {
+    if !gateway.is_connected() {
         state
             .log(
                 "info",
@@ -300,7 +300,8 @@ async fn delete_one(state: &SharedState, ble: &BleGateway, key: &str) -> Result<
             .await;
         return Ok(false);
     }
-    ble.request("resource.delete", json!({ "key": key }))
+    gateway
+        .request("resource.delete", json!({ "key": key }))
         .await
         .with_context(|| format!("delete resource {key}"))?;
     state
@@ -318,7 +319,7 @@ async fn delete_one(state: &SharedState, ble: &BleGateway, key: &str) -> Result<
 
 async fn publish_one(
     state: &SharedState,
-    ble: &BleGateway,
+    gateway: &DeviceGateway,
     entry: &mut CachedResource,
     force: bool,
 ) -> Result<bool> {
@@ -329,7 +330,7 @@ async fn publish_one(
     if !force && entry.sent_hash == Some(entry.payload_hash) && !heartbeat_due {
         return Ok(false);
     }
-    if !ble.is_connected() {
+    if !gateway.is_connected() {
         state
             .log(
                 "debug",
@@ -402,12 +403,13 @@ async fn publish_one(
         "persistence": entry.resource.persistence,
         "payload": entry.resource.payload,
     });
-    ble.request("resource.put", json!({ "resource": resource }))
+    gateway
+        .request("resource.put", json!({ "resource": resource }))
         .await
         .with_context(|| format!("publish resource {}", entry.resource.key))?;
     entry.sent_hash = Some(entry.payload_hash);
     entry.last_write_at = Some(now);
-    if let Ok(resources) = ble.request("resource.list", json!({})).await {
+    if let Ok(resources) = gateway.request("resource.list", json!({})).await {
         state
             .update_device(|device| {
                 device.resources = resources

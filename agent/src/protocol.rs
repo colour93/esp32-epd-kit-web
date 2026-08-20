@@ -110,10 +110,10 @@ pub fn encode_message(
     frame_bytes: usize,
 ) -> Result<Vec<Vec<u8>>> {
     if payload.is_empty() || payload.len() > MAX_MESSAGE_BYTES {
-        bail!("message length is outside BLE v4 limits");
+        bail!("message length is outside protocol v4 limits");
     }
     if frame_bytes < HEADER_BYTES + START_METADATA_BYTES {
-        bail!("GATT frame is too small");
+        bail!("transport frame is too small");
     }
     let checksum = hash(payload);
     let mut sequence = 0u16;

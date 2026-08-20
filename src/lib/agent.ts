@@ -18,6 +18,8 @@ export interface AgentStatus {
   autostart_enabled: boolean
 }
 
+export type TransportKind = 'ble' | 'lan'
+
 export interface DeviceConfig {
   version: number
   revision: number
@@ -66,10 +68,11 @@ export interface PageCapability {
 
 export interface DeviceStatus {
   phase: string
+  transport: TransportKind
   connection_mode: 'auto' | 'scan' | 'manual' | 'idle'
   preferred_device_id?: string
   selected_device_id?: string
-  candidates: BleCandidate[]
+  candidates: DeviceCandidate[]
   scan_observed: number
   scan_started_at?: number
   name?: string
@@ -99,9 +102,12 @@ export interface PairingStatus {
   expires_at: number
 }
 
-export interface BleCandidate {
+export interface DeviceCandidate {
   id: string
   name: string
+  transport: TransportKind
+  endpoint?: string
+  paired?: boolean
   rssi?: number
   advertises_service: boolean
   protocol_major?: number
@@ -299,12 +305,16 @@ export async function establishSession() {
 
 export const agentApi = {
   snapshot: () => request<Snapshot>('/api/v1/snapshot'),
-  scanDevices: () => request('/api/v1/device/scan', { method: 'POST', body: '{}' }),
-  connectDevice: (id: string) => request('/api/v1/device/connect', {
-    method: 'POST', body: JSON.stringify({ id }),
+  scanDevices: (transport: TransportKind) => request('/api/v1/device/scan', {
+    method: 'POST', body: JSON.stringify({ transport }),
+  }),
+  connectDevice: (transport: TransportKind, id: string, secret?: string) => request('/api/v1/device/connect', {
+    method: 'POST', body: JSON.stringify({ transport, id, secret }),
   }),
   disconnectDevice: () => request('/api/v1/device/disconnect', { method: 'POST', body: '{}' }),
-  autoConnectDevice: () => request('/api/v1/device/auto-connect', { method: 'POST', body: '{}' }),
+  autoConnectDevice: (transport: TransportKind) => request('/api/v1/device/auto-connect', {
+    method: 'POST', body: JSON.stringify({ transport }),
+  }),
   submitPairingPin: (requestId: string, pin: string) => request('/api/v1/device/pairing', {
     method: 'POST', body: JSON.stringify({ request_id: requestId, pin }),
   }),

@@ -28,7 +28,7 @@ import {
   agentApi,
   establishSession,
   subscribeSnapshots,
-  type BleCandidate,
+  type DeviceCandidate,
   type DeviceConfig,
   type JsonObject,
   type PageCapability,
@@ -38,6 +38,7 @@ import {
   type PageWidgetCapability,
   type ResourceSummary,
   type Snapshot,
+  type TransportKind,
 } from '@/lib/agent'
 
 const errorText = (error: unknown) => {
@@ -148,6 +149,8 @@ const App = () => {
   const [resetOpen, setResetOpen] = useState(false)
   const [resetCode, setResetCode] = useState('')
   const [pairingPin, setPairingPin] = useState('')
+  const [lanCandidate, setLanCandidate] = useState<DeviceCandidate | null>(null)
+  const [lanDeviceKey, setLanDeviceKey] = useState('')
   const [logLevel, setLogLevel] = useState<LogLevel>('all')
   const [logScope, setLogScope] = useState('all')
   const [followLogs, setFollowLogs] = useState(true)
@@ -342,30 +345,68 @@ const App = () => {
     }, '确认码已显示在设备上')
   }
 
-  const scanDevices = () => {
-    void perform('ble.scan', agentApi.scanDevices, '设备扫描已开始')
-  }
-
-  const connectDevice = (candidate: BleCandidate) => {
+  const scanDevices = (transport: TransportKind) => {
     void perform(
-      `ble.connect:${candidate.id}`,
-      () => agentApi.connectDevice(candidate.id),
-      `正在连接 ${candidate.name}`,
+      'device.scan',
+      () => agentApi.scanDevices(transport),
+      transport === 'lan' ? '正在通过 mDNS 查找设备' : '蓝牙扫描已开始',
     )
   }
 
-  const disconnectDevice = () => {
-    void perform('ble.disconnect', agentApi.disconnectDevice, '设备连接已停止')
+  const startDeviceConnection = (candidate: DeviceCandidate, secret?: string) => perform(
+    `device.connect:${candidate.transport}:${candidate.id}`,
+    () => agentApi.connectDevice(candidate.transport, candidate.id, secret),
+    `正在通过 ${candidate.transport === 'lan' ? 'WiFi' : 'BLE'} 连接 ${candidate.name}`,
+  )
+
+  const connectDevice = (candidate: DeviceCandidate, requestSecret = false) => {
+    if (candidate.transport === 'lan' && (candidate.paired !== true || requestSecret)) {
+      setLanCandidate(candidate)
+      setLanDeviceKey('')
+      return
+    }
+    void startDeviceConnection(candidate)
   }
 
-  const autoConnectDevice = () => {
-    void perform('ble.auto', agentApi.autoConnectDevice, '自动连接已启动')
+  const submitLanDeviceKey = async () => {
+    if (!lanCandidate || !/^[0-9a-fA-F]{64}$/.test(lanDeviceKey)) return
+    const connected = await startDeviceConnection(lanCandidate, lanDeviceKey.toLowerCase())
+    if (connected) {
+      setLanCandidate(null)
+      setLanDeviceKey('')
+    }
+  }
+
+  const closeLanDeviceKey = () => {
+    if (operation) return
+    setLanCandidate(null)
+    setLanDeviceKey('')
+  }
+
+  const changeTransport = (transport: TransportKind) => {
+    scanDevices(transport)
+  }
+
+  const disconnectDevice = () => {
+    void perform(
+      'device.disconnect',
+      agentApi.disconnectDevice,
+      '设备连接已停止',
+    )
+  }
+
+  const autoConnectDevice = (transport: TransportKind) => {
+    void perform(
+      'device.auto',
+      () => agentApi.autoConnectDevice(transport),
+      transport === 'lan' ? 'LAN 自动连接已启动' : 'BLE 自动连接已启动',
+    )
   }
 
   const submitPairingPin = () => {
     if (!pairing || pairingPin.length !== 6) return
     void perform(
-      'ble.pairing.submit',
+      'device.pairing.submit',
       () => agentApi.submitPairingPin(pairing.request_id, pairingPin),
       '配对码已提交，正在完成安全连接',
     )
@@ -375,7 +416,7 @@ const App = () => {
     if (!pairing || operation) return
     setPairingPin('')
     void perform(
-      'ble.pairing.cancel',
+      'device.pairing.cancel',
       () => agentApi.cancelPairing(pairing.request_id),
       '蓝牙配对已取消',
     )
@@ -429,6 +470,7 @@ const App = () => {
             config={config}
             operation={operation}
             bucket={bucket}
+            onTransportChange={changeTransport}
             onScan={scanDevices}
             onConnect={connectDevice}
             onDisconnect={disconnectDevice}
@@ -540,6 +582,42 @@ const App = () => {
         </DialogContent>
       </Dialog>
 
+      <Dialog open={Boolean(lanCandidate)} onOpenChange={(open) => { if (!open) closeLanDeviceKey() }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>连接局域网设备</DialogTitle>
+            <DialogDescription>
+              在设备串口执行 <code className="font-mono">wifi key</code>，输入输出中的 64 位 <code className="font-mono">device_key</code>。密钥只会保存在系统凭据库中。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="rounded-lg border bg-muted/30 p-3">
+            <div className="text-sm font-medium">{lanCandidate?.name}</div>
+            <div className="mt-1 truncate font-mono text-xs text-muted-foreground">{lanCandidate?.endpoint ?? lanCandidate?.id}</div>
+          </div>
+          <Field>
+            <FieldLabel>设备密钥</FieldLabel>
+            <Input
+              autoFocus
+              autoComplete="off"
+              maxLength={64}
+              spellCheck={false}
+              value={lanDeviceKey}
+              onChange={(event) => setLanDeviceKey(event.target.value.replace(/[^0-9a-f]/gi, '').slice(0, 64))}
+              onKeyDown={(event) => { if (event.key === 'Enter') void submitLanDeviceKey() }}
+              placeholder="64 位十六进制密钥"
+              className="font-mono"
+            />
+          </Field>
+          <DialogFooter>
+            <Button variant="outline" disabled={Boolean(operation)} onClick={closeLanDeviceKey}>取消</Button>
+            <Button disabled={lanDeviceKey.length !== 64 || Boolean(operation)} onClick={() => void submitLanDeviceKey()}>
+              {operation?.startsWith('device.connect:lan:') ? <LoaderCircle className="animate-spin" data-icon="inline-start" /> : <KeyRound data-icon="inline-start" />}
+              保存并连接
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       <Dialog open={Boolean(pairing)} onOpenChange={(open) => { if (!open) cancelPairing() }}>
         <DialogContent>
           <DialogHeader><DialogTitle>蓝牙配对</DialogTitle><DialogDescription className="sr-only">{pairing?.device_name ?? 'EPD-KIT'}</DialogDescription></DialogHeader>
@@ -548,7 +626,7 @@ const App = () => {
           <DialogFooter>
             <Button variant="outline" disabled={Boolean(operation)} onClick={cancelPairing}>取消</Button>
             <Button disabled={pairingPin.length !== 6 || Boolean(operation)} onClick={submitPairingPin}>
-              {operation === 'ble.pairing.submit' ? <LoaderCircle className="animate-spin" data-icon="inline-start" /> : <KeyRound data-icon="inline-start" />}
+              {operation === 'device.pairing.submit' ? <LoaderCircle className="animate-spin" data-icon="inline-start" /> : <KeyRound data-icon="inline-start" />}
               配对
             </Button>
           </DialogFooter>

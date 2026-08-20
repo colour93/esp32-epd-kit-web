@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use crate::{
-    ble::BleGateway,
+    gateway::DeviceGateway,
     producer::ProducerRegistry,
     publisher::{CycleCompletion, ResourcePublisher},
     state::SharedState,
@@ -19,12 +19,12 @@ pub struct SyncCoordinator;
 impl SyncCoordinator {
     pub fn spawn(
         state: Arc<SharedState>,
-        ble: BleGateway,
+        gateway: DeviceGateway,
         producers: ProducerRegistry,
         publisher: ResourcePublisher,
         completions: mpsc::Receiver<CycleCompletion>,
     ) {
-        tokio::spawn(run(state, ble, producers, publisher, completions));
+        tokio::spawn(run(state, gateway, producers, publisher, completions));
     }
 }
 
@@ -63,19 +63,19 @@ pub fn spawn_source_scheduler(state: Arc<SharedState>, producers: ProducerRegist
 
 async fn run(
     state: Arc<SharedState>,
-    ble: BleGateway,
+    gateway: DeviceGateway,
     producers: ProducerRegistry,
     publisher: ResourcePublisher,
     mut completions: mpsc::Receiver<CycleCompletion>,
 ) {
-    let mut events = ble.subscribe();
+    let mut events = gateway.subscribe();
     let mut active: Option<(u64, HashSet<&'static str>, bool)> = None;
     let mut next_cycle_id = 1u64;
     loop {
         tokio::select! {
             event = events.recv() => {
                 let Ok(event) = event else { continue };
-                if event != "ble.connected" { continue; }
+                if event != "device.connected" { continue; }
                 let snapshot = state.snapshot().await;
                 let automatic_battery = snapshot.device.connection_mode == "auto"
                     && snapshot.device.config.as_ref()
@@ -87,7 +87,7 @@ async fn run(
                 next_cycle_id = next_cycle_id.wrapping_add(1).max(1);
                 let expected = producers.auto_sync_ids().into_iter().collect::<HashSet<_>>();
                 if expected.is_empty() {
-                    complete_device_sync(&state, &ble, &publisher).await;
+                    complete_device_sync(&state, &gateway, &publisher).await;
                     continue;
                 }
                 active = Some((cycle_id, expected, true));
@@ -108,7 +108,7 @@ async fn run(
                     let finished_success = *success;
                     active = None;
                     state.log("info", "coordinator", format!("sync cycle {finished_id} producers complete; success={finished_success}")).await;
-                    complete_device_sync(&state, &ble, &publisher).await;
+                    complete_device_sync(&state, &gateway, &publisher).await;
                 }
             }
         }
@@ -117,14 +117,14 @@ async fn run(
 
 async fn complete_device_sync(
     state: &SharedState,
-    ble: &BleGateway,
+    gateway: &DeviceGateway,
     publisher: &ResourcePublisher,
 ) {
     if let Err(error) = publisher.flush().await {
         state.log("warn", "coordinator", error.to_string()).await;
         return;
     }
-    match ble.request("system.sync.complete", json!({})).await {
+    match gateway.request("system.sync.complete", json!({})).await {
         Ok(result) => {
             state
                 .log(

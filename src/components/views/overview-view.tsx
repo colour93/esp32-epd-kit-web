@@ -1,5 +1,5 @@
 import { Activity, Cpu, Database, Radio, RefreshCw, RotateCcw } from 'lucide-react'
-import type { BleCandidate, DeviceConfig, PageBinding, Snapshot } from '@/lib/agent'
+import type { DeviceCandidate, DeviceConfig, PageBinding, Snapshot, TransportKind } from '@/lib/agent'
 import { Button } from '@/components/ui/button'
 import { Card, CardAction, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { DeviceConnectionPanel } from '@/components/device/device-connection-panel'
@@ -21,15 +21,16 @@ const homePreviewLimit = (pageId?: string) => pageId === 'home.six'
   ? 6
   : pageId === 'home.three' ? 3 : 2
 
-export const OverviewView = ({ snapshot, config, operation, bucket, onScan, onConnect, onDisconnect, onAutoConnect, onRefresh, onFullRefresh }: {
+export const OverviewView = ({ snapshot, config, operation, bucket, onTransportChange, onScan, onConnect, onDisconnect, onAutoConnect, onRefresh, onFullRefresh }: {
   snapshot: Snapshot
   config: DeviceConfig | undefined
   operation: string | null
   bucket: LimitBucket | null
-  onScan: () => void
-  onConnect: (candidate: BleCandidate) => void
+  onTransportChange: (transport: TransportKind) => void
+  onScan: (transport: TransportKind) => void
+  onConnect: (candidate: DeviceCandidate, requestSecret?: boolean) => void
   onDisconnect: () => void
-  onAutoConnect: () => void
+  onAutoConnect: (transport: TransportKind) => void
   onRefresh: () => void
   onFullRefresh: () => void
 }) => (
@@ -37,6 +38,7 @@ export const OverviewView = ({ snapshot, config, operation, bucket, onScan, onCo
     <DeviceConnectionPanel
       device={snapshot.device}
       operation={operation}
+      onTransportChange={onTransportChange}
       onScan={onScan}
       onConnect={onConnect}
       onDisconnect={onDisconnect}

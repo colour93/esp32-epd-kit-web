@@ -1,12 +1,11 @@
 use std::{
     collections::{HashMap, HashSet},
-    fmt,
     path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU32, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -23,8 +22,9 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot, watch};
 
 use crate::{
-    protocol::{self, FrameAssembler, MessageKind},
-    state::{BleCandidate, PairingStatus, SharedState, unix_now},
+    protocol::{self, FrameAssembler},
+    rpc::{self, FrameChannel},
+    state::{DeviceCandidate, PairingStatus, SharedState, unix_now},
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
@@ -33,25 +33,6 @@ const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(18);
 const PAIRING_PIN_TIMEOUT: Duration = Duration::from_secs(90);
 const INTERNAL_COMPANY_ID: u16 = 0xffff;
-
-#[derive(Debug)]
-struct BleLinkError(String);
-
-impl fmt::Display for BleLinkError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for BleLinkError {}
-
-fn link_error(message: impl Into<String>) -> anyhow::Error {
-    anyhow::Error::new(BleLinkError(message.into()))
-}
-
-fn is_link_error(error: &anyhow::Error) -> bool {
-    error.downcast_ref::<BleLinkError>().is_some()
-}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct SavedTarget {
@@ -299,6 +280,7 @@ impl BleGateway {
         self.state
             .update_device(|device| {
                 device.phase = "scanning".into();
+                device.transport = "ble".into();
                 device.connection_mode = "scan".into();
                 device.selected_device_id = None;
                 device.candidates.clear();
@@ -331,6 +313,7 @@ impl BleGateway {
         self.state
             .update_device(|device| {
                 device.phase = "connecting".into();
+                device.transport = "ble".into();
                 device.connection_mode = "manual".into();
                 device.selected_device_id = Some(id.clone());
                 device.last_error = None;
@@ -353,6 +336,7 @@ impl BleGateway {
         self.state
             .update_device(|device| {
                 device.phase = "scanning".into();
+                device.transport = "ble".into();
                 device.connection_mode = "auto".into();
                 device.selected_device_id = None;
                 device.scan_started_at = Some(unix_now());
@@ -405,6 +389,39 @@ struct Session {
     next_id: AtomicU32,
     frame_bytes: usize,
     pairing_repair_allowed: bool,
+}
+
+impl FrameChannel for Session {
+    fn transport_name(&self) -> &'static str {
+        "ble"
+    }
+
+    fn frame_bytes(&self) -> usize {
+        self.frame_bytes
+    }
+
+    fn next_request_id(&self) -> u32 {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn assembler(&mut self) -> &mut FrameAssembler {
+        &mut self.assembler
+    }
+
+    async fn write_frame(&mut self, frame: &[u8]) -> Result<()> {
+        self.peripheral
+            .write(&self.rx, frame, WriteType::WithResponse)
+            .await
+            .context("write BLE frame")
+    }
+
+    async fn read_frame(&mut self) -> Result<Vec<u8>> {
+        self.notifications
+            .next()
+            .await
+            .map(|notification| notification.value)
+            .ok_or_else(|| anyhow!("BLE notification stream closed"))
+    }
 }
 
 struct ScanCleanup {
@@ -506,7 +523,7 @@ async fn supervisor(
                     state.log("error", "ble", format!("{error:#}")).await;
                     disconnect_peripheral(&session.peripheral).await;
                     let should_repair = session.pairing_repair_allowed
-                        && is_link_error(&error)
+                        && rpc::is_link_error(&error)
                         && repaired_pairing_for.as_deref() != Some(&session.device_id);
                     if should_repair {
                         repaired_pairing_for = Some(session.device_id.clone());
@@ -569,7 +586,7 @@ async fn supervisor(
                         .await;
                 }
                 connected.store(true, Ordering::Release);
-                let _ = device_events.send("ble.connected".into());
+                let _ = device_events.send("device.connected".into());
                 state
                     .log(
                         "info",
@@ -591,7 +608,7 @@ async fn supervisor(
                         command = commands.recv() => {
                             let Some(command) = command else { return };
                             let result = transact(&state, &mut session, &device_events, &command.op, command.args).await;
-                            let link_failed = result.as_ref().err().is_some_and(is_link_error);
+                            let link_failed = result.as_ref().err().is_some_and(rpc::is_link_error);
                             let _ = command.reply.send(result);
                             if link_failed {
                                 state.log("warn", "ble", "BLE RPC detected a stale session").await;
@@ -600,7 +617,7 @@ async fn supervisor(
                         }
                         notification = session.notifications.next() => {
                             let Some(notification) = notification else { break };
-                            if let Err(error) = handle_notification(&state, &mut session.assembler, &device_events, &notification.value).await {
+                            if let Err(error) = rpc::handle_frame(&state, &mut session.assembler, &device_events, &notification.value).await {
                                 state.log("warn", "ble", error.to_string()).await;
                             }
                         }
@@ -662,7 +679,7 @@ async fn supervisor(
                         device.mtu = None;
                     })
                     .await;
-                let _ = device_events.send("ble.disconnected".into());
+                let _ = device_events.send("device.disconnected".into());
                 disconnect_peripheral(&session.peripheral).await;
                 if control_changed {
                     state
@@ -917,6 +934,7 @@ async fn discover(
     state
         .update_device(|device| {
             device.phase = "scanning".into();
+            device.transport = "ble".into();
             device.connection_mode = connection_mode.into();
             if matches!(desired, ConnectionIntent::Auto) {
                 device.selected_device_id = preferred_target.map(|target| target.id.clone());
@@ -943,7 +961,7 @@ async fn discover(
     let auto_select_at = tokio::time::Instant::now() + Duration::from_secs(2);
     let mut seen = HashSet::new();
     let mut observed = HashSet::new();
-    let mut candidates = HashMap::<String, BleCandidate>::new();
+    let mut candidates = HashMap::<String, DeviceCandidate>::new();
     let mut candidate_peripherals = HashMap::<String, Peripheral>::new();
     let mut candidate_advertisements = HashMap::<String, AdvertisementState>::new();
     loop {
@@ -1000,9 +1018,12 @@ async fn discover(
                 }
                 candidates.insert(
                     identity.clone(),
-                    BleCandidate {
+                    DeviceCandidate {
                         id: identity.clone(),
                         name: name.into(),
+                        transport: "ble".into(),
+                        endpoint: None,
+                        paired: None,
                         rssi: properties.rssi,
                         advertises_service: matches_service,
                         protocol_major: advertisement.protocol_major,
@@ -1215,6 +1236,7 @@ async fn prime_session(
     state
         .update_device(|device| {
             device.phase = "connected".into();
+            device.transport = "ble".into();
             device.name = Some(session.device_name.clone());
             device.role = hello.get("role").and_then(Value::as_str).map(str::to_owned);
             device.firmware = hello
@@ -1312,7 +1334,7 @@ async fn transact(
     op: &str,
     args: Value,
 ) -> Result<Value> {
-    transact_with_timeout(state, session, device_events, op, args, REQUEST_TIMEOUT).await
+    rpc::transact(state, session, device_events, op, args, REQUEST_TIMEOUT).await
 }
 
 async fn transact_with_timeout(
@@ -1323,111 +1345,7 @@ async fn transact_with_timeout(
     args: Value,
     timeout: Duration,
 ) -> Result<Value> {
-    let id = session.next_id.fetch_add(1, Ordering::Relaxed);
-    let frames = protocol::encode_request(id, op, args, session.frame_bytes)?;
-    let frame_count = frames.len();
-    let encoded_bytes = frames.iter().map(Vec::len).sum::<usize>();
-    let started = Instant::now();
-    state
-        .log(
-            "debug",
-            "ble.rpc",
-            format!("request id={id} op={op} frames={frame_count} bytes={encoded_bytes}"),
-        )
-        .await;
-    for frame in frames {
-        tokio::time::timeout(
-            timeout,
-            session
-                .peripheral
-                .write(&session.rx, &frame, WriteType::WithResponse),
-        )
-        .await
-        .map_err(|_| link_error(format!("BLE write timed out for {op}")))?
-        .map_err(|error| link_error(format!("write BLE request {op}: {error}")))?;
-    }
-    let response = tokio::time::timeout(timeout, async {
-        loop {
-            let notification = session
-                .notifications
-                .next()
-                .await
-                .ok_or_else(|| anyhow!("BLE notification stream closed"))?;
-            let Some(message) = session.assembler.feed(&notification.value)? else {
-                continue;
-            };
-            match message.kind {
-                MessageKind::Response if message.id == id => {
-                    return Ok::<protocol::Response, anyhow::Error>(protocol::decode_response(
-                        &message.payload,
-                    )?);
-                }
-                MessageKind::Event => {
-                    dispatch_event(state, device_events, &message.payload).await?
-                }
-                _ => {}
-            }
-        }
-    })
-    .await
-    .map_err(|_| link_error(format!("BLE response timed out for {op}")))?
-    .map_err(|error| link_error(format!("BLE response failed for {op}: {error:#}")))?;
-    if response.ok {
-        state
-            .log(
-                "debug",
-                "ble.rpc",
-                format!(
-                    "response id={id} op={op} elapsed_ms={}",
-                    started.elapsed().as_millis()
-                ),
-            )
-            .await;
-        return Ok(response.result);
-    }
-    let error = response
-        .error
-        .ok_or_else(|| anyhow!("BLE request failed without error payload"))?;
-    state
-        .log(
-            "warn",
-            "ble.rpc",
-            format!(
-                "response id={id} op={op} code={} elapsed_ms={}",
-                error.code,
-                started.elapsed().as_millis()
-            ),
-        )
-        .await;
-    Err(anyhow!("{}: {}", error.code, error.message))
-}
-
-async fn handle_notification(
-    state: &SharedState,
-    assembler: &mut FrameAssembler,
-    device_events: &broadcast::Sender<String>,
-    value: &[u8],
-) -> Result<()> {
-    let Some(message) = assembler.feed(value)? else {
-        return Ok(());
-    };
-    if message.kind == MessageKind::Event {
-        dispatch_event(state, device_events, &message.payload).await?;
-    }
-    Ok(())
-}
-
-async fn dispatch_event(
-    state: &SharedState,
-    device_events: &broadcast::Sender<String>,
-    payload: &[u8],
-) -> Result<()> {
-    let event = protocol::decode_event(payload)?;
-    state
-        .log("info", "device", format!("{} {}", event.name, event.data))
-        .await;
-    let _ = device_events.send(event.name);
-    Ok(())
+    rpc::transact(state, session, device_events, op, args, timeout).await
 }
 
 fn chrono_offset() -> i16 {

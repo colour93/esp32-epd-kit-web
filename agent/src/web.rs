@@ -21,11 +21,11 @@ use tokio_stream::wrappers::BroadcastStream;
 use crate::{
     autostart,
     balance::{BalanceControl, BalanceInput},
-    ble::BleGateway,
     cli::{CliMetricConfig, CliMetricControl},
     codex_oauth::{
         CodexOAuthCompleteInput, CodexOAuthControl, CodexOAuthStartInput, CodexOAuthUpdateInput,
     },
+    gateway::{DeviceGateway, TransportKind},
     http::{HttpMetricControl, HttpMetricInput},
     producer::ProducerRegistry,
     protocol,
@@ -39,7 +39,7 @@ include!(concat!(env!("OUT_DIR"), "/embedded_assets.rs"));
 #[derive(Clone)]
 pub struct WebContext {
     pub state: Arc<SharedState>,
-    pub ble: BleGateway,
+    pub gateway: DeviceGateway,
     pub producers: ProducerRegistry,
     pub codex_oauth: CodexOAuthControl,
     pub cli: CliMetricControl,
@@ -58,7 +58,7 @@ struct Auth {
 impl WebContext {
     pub fn new(
         state: Arc<SharedState>,
-        ble: BleGateway,
+        gateway: DeviceGateway,
         producers: ProducerRegistry,
         codex_oauth: CodexOAuthControl,
         cli: CliMetricControl,
@@ -69,7 +69,7 @@ impl WebContext {
     ) -> Result<Self> {
         Ok(Self {
             state,
-            ble,
+            gateway,
             producers,
             codex_oauth,
             cli,
@@ -262,15 +262,25 @@ async fn device_reload(
 async fn device_scan(
     State(context): State<WebContext>,
     headers: HeaderMap,
+    Json(input): Json<DeviceTransportInput>,
 ) -> ApiResult<Json<Value>> {
     mutation_auth(&context, &headers)?;
-    context.ble.scan().await;
+    context.gateway.scan(input.transport).await;
     Ok(Json(json!({ "ok": true })))
 }
 
 #[derive(Deserialize)]
 struct DeviceConnectInput {
+    #[serde(default)]
+    transport: TransportKind,
     id: String,
+    secret: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DeviceTransportInput {
+    #[serde(default)]
+    transport: TransportKind,
 }
 
 async fn device_connect(
@@ -280,8 +290,8 @@ async fn device_connect(
 ) -> ApiResult<Json<Value>> {
     mutation_auth(&context, &headers)?;
     context
-        .ble
-        .connect_device(input.id)
+        .gateway
+        .connect_device(input.transport, input.id, input.secret)
         .await
         .map_err(ApiError::internal)?;
     Ok(Json(json!({ "ok": true })))
@@ -292,16 +302,17 @@ async fn device_disconnect(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     mutation_auth(&context, &headers)?;
-    context.ble.disconnect().await;
+    context.gateway.disconnect().await;
     Ok(Json(json!({ "ok": true })))
 }
 
 async fn device_auto_connect(
     State(context): State<WebContext>,
     headers: HeaderMap,
+    Json(input): Json<DeviceTransportInput>,
 ) -> ApiResult<Json<Value>> {
     mutation_auth(&context, &headers)?;
-    context.ble.auto_connect().await;
+    context.gateway.auto_connect(input.transport).await;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -319,7 +330,7 @@ async fn device_pairing_submit(
 ) -> ApiResult<Json<Value>> {
     mutation_auth(&context, &headers)?;
     context
-        .ble
+        .gateway
         .submit_pairing_pin(&input.request_id, input.pin)
         .await
         .map_err(ApiError::invalid)?;
@@ -333,7 +344,7 @@ async fn device_pairing_cancel(
 ) -> ApiResult<Json<Value>> {
     mutation_auth(&context, &headers)?;
     context
-        .ble
+        .gateway
         .cancel_pairing(&input.request_id)
         .await
         .map_err(ApiError::invalid)?;
@@ -362,18 +373,18 @@ async fn config_patch(
         .and_then(Value::as_u64)
         .unwrap_or(0);
     context
-        .ble
+        .gateway
         .request("config.patch", json!({ "patch": input.patch }))
         .await
         .map_err(ApiError::internal)?;
     let result = match context
-        .ble
+        .gateway
         .request("config.commit", json!({ "expected_revision": revision }))
         .await
     {
         Ok(result) => result,
         Err(error) => {
-            let _ = context.ble.request("config.discard", json!({})).await;
+            let _ = context.gateway.request("config.discard", json!({})).await;
             return Err(ApiError::internal(error));
         }
     };
@@ -419,7 +430,7 @@ async fn resource_put(
         return Err(ApiError::forbidden("owner role is required"));
     }
     let result = context
-        .ble
+        .gateway
         .request("resource.put", json!({ "resource": input.resource }))
         .await
         .map_err(ApiError::internal)?;
@@ -455,7 +466,7 @@ async fn resource_get(
         })));
     }
     let result = context
-        .ble
+        .gateway
         .request("resource.get", json!({ "key": input.key }))
         .await
         .map_err(ApiError::internal)?;
@@ -495,7 +506,7 @@ async fn page_set(
         .await
         .map_err(ApiError::internal)?;
     let result = context
-        .ble
+        .gateway
         .request("page.set", json!({ "page": input.page }))
         .await
         .map_err(ApiError::internal)?;
@@ -586,7 +597,7 @@ async fn display_refresh(
 ) -> ApiResult<Json<Value>> {
     mutation_auth(&context, &headers)?;
     let result = context
-        .ble
+        .gateway
         .request("display.refresh", json!({ "mode": input.mode }))
         .await
         .map_err(ApiError::internal)?;
@@ -603,7 +614,7 @@ async fn device_restart(
 ) -> ApiResult<Json<Value>> {
     mutation_auth(&context, &headers)?;
     let result = context
-        .ble
+        .gateway
         .request("system.restart", json!({}))
         .await
         .map_err(ApiError::internal)?;
@@ -1130,7 +1141,7 @@ async fn enrollment(
         "security.enrollment.close"
     };
     let result = context
-        .ble
+        .gateway
         .request(op, json!({}))
         .await
         .map_err(ApiError::internal)?;
@@ -1156,7 +1167,7 @@ async fn revoke_bond(
 ) -> ApiResult<Json<Value>> {
     mutation_auth(&context, &headers)?;
     let result = context
-        .ble
+        .gateway
         .request("security.bonds.revoke", json!({ "bond_id": id }))
         .await
         .map_err(ApiError::internal)?;
@@ -1175,7 +1186,7 @@ async fn transfer_owner(
 ) -> ApiResult<Json<Value>> {
     mutation_auth(&context, &headers)?;
     let result = context
-        .ble
+        .gateway
         .request("security.owner.transfer", json!({ "bond_id": id }))
         .await
         .map_err(ApiError::internal)?;
@@ -1192,7 +1203,7 @@ async fn factory_prepare(
 ) -> ApiResult<Json<Value>> {
     mutation_auth(&context, &headers)?;
     let result = context
-        .ble
+        .gateway
         .request("factory_reset.prepare", json!({}))
         .await
         .map_err(ApiError::internal)?;
@@ -1215,7 +1226,7 @@ async fn factory_commit(
 ) -> ApiResult<Json<Value>> {
     mutation_auth(&context, &headers)?;
     let result = context
-        .ble
+        .gateway
         .request("factory_reset.commit", json!({ "code": input.code }))
         .await
         .map_err(ApiError::internal)?;
@@ -1227,15 +1238,22 @@ async fn factory_commit(
 }
 
 async fn reload_device(context: &WebContext) -> Result<()> {
-    let config = context.ble.request("config.get", json!({})).await?;
-    let mut capabilities = context.ble.request("capabilities.get", json!({})).await?;
+    let config = context.gateway.request("config.get", json!({})).await?;
+    let mut capabilities = context
+        .gateway
+        .request("capabilities.get", json!({}))
+        .await?;
     protocol::hydrate_capabilities(&mut capabilities);
-    let resources = context.ble.request("resource.list", json!({})).await?;
+    let resources = context.gateway.request("resource.list", json!({})).await?;
     let bonds = context
-        .ble
+        .gateway
         .request("security.bonds.list", json!({}))
         .await?;
-    let diagnostics = context.ble.request("diagnostics.get", json!({})).await.ok();
+    let diagnostics = context
+        .gateway
+        .request("diagnostics.get", json!({}))
+        .await
+        .ok();
     context
         .state
         .update_device(|device| {

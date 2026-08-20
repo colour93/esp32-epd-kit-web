@@ -7,12 +7,15 @@ mod codex;
 mod codex_oauth;
 mod codex_tasks;
 mod coordinator;
+mod gateway;
 mod http;
 mod instance;
+mod lan;
 mod metrics;
 mod producer;
 mod protocol;
 mod publisher;
+mod rpc;
 mod settings;
 mod state;
 mod tray;
@@ -73,9 +76,10 @@ async fn prepare_service() -> Result<Service> {
             ),
         )
         .await;
-    let ble = ble::BleGateway::spawn(state.clone());
+    let gateway = gateway::DeviceGateway::spawn(state.clone());
     let (completion_tx, completion_rx) = tokio::sync::mpsc::channel(16);
-    let publisher = publisher::ResourcePublisher::spawn(state.clone(), ble.clone(), completion_tx);
+    let publisher =
+        publisher::ResourcePublisher::spawn(state.clone(), gateway.clone(), completion_tx);
     let codex = codex::CodexControl::spawn(producer::ProducerContext {
         state: state.clone(),
         publisher: publisher.clone(),
@@ -120,7 +124,7 @@ async fn prepare_service() -> Result<Service> {
     ccswitch.control().refresh().await?;
     coordinator::SyncCoordinator::spawn(
         state.clone(),
-        ble.clone(),
+        gateway.clone(),
         producers.clone(),
         publisher.clone(),
         completion_rx,
@@ -128,7 +132,7 @@ async fn prepare_service() -> Result<Service> {
     coordinator::spawn_source_scheduler(state.clone(), producers.clone());
     let context = web::WebContext::new(
         state.clone(),
-        ble,
+        gateway,
         producers,
         codex_oauth,
         cli,

@@ -27,9 +27,12 @@ pub struct AgentStatus {
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
-pub struct BleCandidate {
+pub struct DeviceCandidate {
     pub id: String,
     pub name: String,
+    pub transport: String,
+    pub endpoint: Option<String>,
+    pub paired: Option<bool>,
     pub rssi: Option<i16>,
     pub advertises_service: bool,
     pub protocol_major: Option<u8>,
@@ -42,10 +45,11 @@ pub struct BleCandidate {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct DeviceStatus {
     pub phase: String,
+    pub transport: String,
     pub connection_mode: String,
     pub preferred_device_id: Option<String>,
     pub selected_device_id: Option<String>,
-    pub candidates: Vec<BleCandidate>,
+    pub candidates: Vec<DeviceCandidate>,
     pub scan_observed: usize,
     pub scan_started_at: Option<u64>,
     pub name: Option<String>,
@@ -143,6 +147,7 @@ impl SharedState {
                 },
                 device: DeviceStatus {
                     phase: "scanning".into(),
+                    transport: "ble".into(),
                     connection_mode: "auto".into(),
                     ..Default::default()
                 },
